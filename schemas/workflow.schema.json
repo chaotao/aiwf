@@ -1,0 +1,134 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://aiwf/schemas/workflow.schema.json",
+  "title": "AIWorkflow",
+  "description": "Schema-driven AI workflow definition. Storage: a single JSON file per workflow. The engine is a pure state machine; task nodes are executed by an external AI agent.",
+  "type": "object",
+  "required": ["schema_version", "id", "name", "nodes"],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": { "type": "string", "const": "1.0" },
+    "id": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9_-]*$",
+      "description": "Globally unique workflow id, also the definition file name."
+    },
+    "name": { "type": "string", "minLength": 1 },
+    "description": { "type": "string" },
+    "default_model": {
+      "type": "string",
+      "description": "Hint for the executing agent about which model to use. The engine itself never calls a model."
+    },
+    "max_steps": {
+      "type": "integer", "minimum": 1, "default": 50,
+      "description": "Hard guard against infinite branch loops."
+    },
+    "input_schema": {
+      "type": "object",
+      "description": "JSON Schema (draft-07) validated against run inputs at startup; required keys MUST be provided."
+    },
+    "nodes": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/node" }
+    },
+    "edges": {
+      "type": "array",
+      "description": "Connections between nodes. If omitted, nodes are chained in array order.",
+      "items": {
+        "type": "object",
+        "required": ["from", "to"],
+        "additionalProperties": false,
+        "properties": {
+          "from": { "type": "string" },
+          "to": { "type": "string" }
+        }
+      }
+    }
+  },
+  "$defs": {
+    "review_config": {
+      "type": "object",
+      "description": "Embedded human acceptance check attached to a task node.",
+      "required": ["requirements"],
+      "additionalProperties": false,
+      "properties": {
+        "requirements": {
+          "oneOf": [
+            { "type": "string" },
+            { "type": "array", "items": { "type": "string" }, "minItems": 1 }
+          ],
+          "description": "Acceptance criteria shown to the reviewer. Templates allowed: ${var}."
+        },
+        "routes": {
+          "type": "object",
+          "description": "Optional verdict routing: APPROVE/REJECT -> node id. Defaults: APPROVE follows edges (null), REJECT redoes this node.",
+          "additionalProperties": { "type": ["string", "null"] }
+        }
+      }
+    },
+    "node": {
+      "type": "object",
+      "required": ["id", "type"],
+      "additionalProperties": false,
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "type": {
+          "type": "string",
+          "enum": ["start", "task", "branch", "review", "end"]
+        },
+        "name": { "type": "string", "description": "Human readable name shown in audit records." },
+        "prompt": {
+          "type": "string",
+          "description": "[task|branch] Prompt template referencing context via ${var}. Rendered by the engine before served."
+        },
+        "model": {
+          "type": "string",
+          "description": "[task|branch] Model hint for the executing agent; overrides default_model. The engine never calls it."
+        },
+        "input_schema": {
+          "type": "object",
+          "description": "[task] JSON Schema (draft-07) for information collected FROM THE USER at this node. Missing required keys pause the run until provided."
+        },
+        "output_key": {
+          "type": "string",
+          "description": "[task] Context key storing the result. Defaults to node id."
+        },
+        "review": {
+          "$ref": "#/$defs/review_config",
+          "description": "[task] Require human acceptance after execution before advancing."
+        },
+        "routes": {
+          "type": "object",
+          "description": "[branch] answer label -> target node id; [review standalone] verdict -> target node id.",
+          "additionalProperties": { "type": "string" }
+        },
+        "default": {
+          "type": "string",
+          "description": "[branch] Target node id when the answer matches no route."
+        },
+        "requirements": {
+          "oneOf": [
+            { "type": "string" },
+            { "type": "array", "items": { "type": "string" }, "minItems": 1 }
+          ],
+          "description": "[review standalone] Acceptance criteria. Templates allowed: ${var}."
+        }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "type": { "const": "task" } }, "required": ["type"] },
+          "then": { "required": ["prompt"] }
+        },
+        {
+          "if": { "properties": { "type": { "const": "branch" } }, "required": ["type"] },
+          "then": { "required": ["prompt", "routes"] }
+        },
+        {
+          "if": { "properties": { "type": { "const": "review" } }, "required": ["type"] },
+          "then": { "required": ["requirements", "routes"] }
+        }
+      ]
+    }
+  }
+}

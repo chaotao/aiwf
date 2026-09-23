@@ -1,0 +1,228 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://aiwf/schemas/run_record.schema.json",
+  "title": "AIWorkflowRunRecord",
+  "description": "Audit record for one workflow run. One JSON file per run. The engine is a state machine driven by an external AI agent: user input, task output, review verdicts and revisions are all recorded as append-only events plus per-node runs.",
+  "type": "object",
+  "required": [
+    "schema_version", "run_id", "workflow_id", "status", "phase",
+    "started_at", "inputs", "context", "node_runs", "events",
+    "next_node", "node_started_at", "revision", "pending_review", "last_feedback"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": { "type": "string", "const": "1.0" },
+    "run_id": { "type": "string" },
+    "workflow_id": { "type": "string" },
+    "status": {
+      "type": "string",
+      "enum": ["running", "completed", "failed"]
+    },
+    "phase": {
+      "type": "string",
+      "enum": ["executing", "awaiting_input", "awaiting_review"],
+      "description": "Sub-state within status=running: executing normally, waiting for user input, or waiting for human review."
+    },
+    "started_at": { "type": "string" },
+    "ended_at": { "type": ["string", "null"] },
+    "duration_ms": { "type": ["integer", "null"] },
+    "inputs": { "type": "object", "description": "Raw inputs of this run." },
+    "context": {
+      "type": "object",
+      "description": "Latest shared context snapshot. Source for resume and template rendering. Values are small: large artifacts are stored as file references {\"$file\": \"path\"} (single node output <= 2000 chars)."
+    },
+    "next_node": {
+      "type": ["string", "null"],
+      "description": "Current node when running; null once completed."
+    },
+    "node_started_at": {
+      "type": ["string", "null"],
+      "description": "When next_node became active. Used for node duration on completion."
+    },
+    "error": {
+      "type": ["string", "null"],
+      "description": "Failure reason when status=failed."
+    },
+    "last_feedback": {
+      "type": ["string", "null"],
+      "description": "Most recent reviewer feedback; served with the redone task spec."
+    },
+    "pending_review": {
+      "description": "State of the current acceptance gate when phase=awaiting_review; null otherwise.",
+      "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/pending_review" }]
+    },
+    "revision": {
+      "description": "Current/last revision (runtime out-of-plan jump). null until one happens; replaced on each new revision, history stays in events.",
+      "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/revision" }]
+    },
+    "node_runs": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/node_run" }
+    },
+    "events": {
+      "type": "array",
+      "description": "Append-only event stream: user input, input changes, review gates/verdicts, revision lifecycle.",
+      "items": { "$ref": "#/$defs/event" }
+    }
+  },
+  "$defs": {
+    "pending_review": {
+      "type": "object",
+      "required": ["kind", "node_id", "requirements", "routes", "attempt"],
+      "additionalProperties": false,
+      "properties": {
+        "kind": { "type": "string", "enum": ["embedded", "standalone"] },
+        "node_id": {
+          "type": "string",
+          "description": "embedded: the task node under review; standalone: the review checkpoint node."
+        },
+        "requirements": {
+          "oneOf": [
+            { "type": "string" },
+            { "type": "array", "items": { "type": "string" } }
+          ],
+          "description": "Rendered acceptance criteria."
+        },
+        "routes": {
+          "type": "object",
+          "description": "Rendered verdict routes: APPROVE/REJECT -> node id or null (null = follow edges / redo subject)."
+        },
+        "attempt": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "revision": {
+      "type": "object",
+      "required": [
+        "seq", "target", "requested_from", "reason", "mode", "scope",
+        "stale_nodes", "reused_nodes", "redone_nodes", "status", "started_at"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "seq": { "type": "integer", "minimum": 1 },
+        "target": { "type": "string", "description": "Node being revised (a task node)." },
+        "requested_from": { "type": "string", "description": "Node where the revision was requested." },
+        "reason": { "type": "string" },
+        "mode": {
+          "type": "string", "enum": ["cascade", "return"],
+          "description": "cascade: redoes propagate along data flow; return: jump back to requested_from after target."
+        },
+        "scope": {
+          "type": "string", "enum": ["auto", "all", "manual"],
+          "description": "auto: dependency-graph closure; all: every downstream node; manual: explicitly listed."
+        },
+        "stale_nodes": { "type": "array", "items": { "type": "string" } },
+        "reused_nodes": { "type": "array", "items": { "type": "string" } },
+        "redone_nodes": { "type": "array", "items": { "type": "string" } },
+        "return_to": { "type": ["string", "null"] },
+        "status": { "type": "string", "enum": ["active", "completed"] },
+        "started_at": { "type": "string" },
+        "ended_at": { "type": ["string", "null"] }
+      }
+    },
+    "event": {
+      "type": "object",
+      "required": ["type", "at"],
+      "additionalProperties": false,
+      "properties": {
+        "type": {
+          "type": "string",
+          "enum": [
+            "run_started", "input_provided", "input_changed",
+            "review_requested", "review_decided",
+            "revise_requested", "node_reused", "revision_completed",
+            "run_resumed", "run_failed"
+          ]
+        },
+        "at": { "type": "string" },
+        "seq": { "type": "integer" },
+        "node_id": { "type": "string" },
+        "values": { "type": "object" },
+        "fields": { "type": "array", "items": { "type": "string" } },
+        "verdict": { "type": "string" },
+        "feedback": { "type": "string" },
+        "requirements": {
+          "oneOf": [
+            { "type": "string" },
+            { "type": "array", "items": { "type": "string" } }
+          ]
+        },
+        "target": { "type": "string" },
+        "requested_from": { "type": "string" },
+        "return_to": { "type": "string" },
+        "reason": { "type": "string" },
+        "mode": { "type": "string" },
+        "scope": { "type": "string" },
+        "stale_nodes": { "type": "array", "items": { "type": "string" } },
+        "reused_nodes": { "type": "array", "items": { "type": "string" } },
+        "redone_nodes": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "node_run": {
+      "type": "object",
+      "required": [
+        "node_id", "node_name", "type", "status",
+        "started_at", "ended_at", "duration_ms",
+        "input", "summary", "output"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "node_id": { "type": "string" },
+        "node_name": { "type": "string" },
+        "type": {
+          "type": "string",
+          "enum": ["start", "task", "branch", "review", "end"]
+        },
+        "status": {
+          "type": "string",
+          "enum": ["success", "failed", "skipped"],
+          "description": "skipped = prior output reused during a cascade revision."
+        },
+        "started_at": { "type": "string" },
+        "ended_at": { "type": "string" },
+        "duration_ms": { "type": "integer" },
+        "model": {
+          "type": ["string", "null"],
+          "description": "Model used by the executing agent, self-reported at completion. Null if not reported."
+        },
+        "tokens": {
+          "type": ["object", "null"],
+          "description": "Token usage of the agent's LLM call, self-reported if available.",
+          "required": ["prompt_tokens", "completion_tokens", "total_tokens"],
+          "additionalProperties": false,
+          "properties": {
+            "prompt_tokens": { "type": "integer" },
+            "completion_tokens": { "type": "integer" },
+            "total_tokens": { "type": "integer" }
+          }
+        },
+        "decision": {
+          "type": ["object", "null"],
+          "description": "[branch] The agent's answer and the engine-selected route.",
+          "required": ["answer", "route"],
+          "properties": {
+            "answer": { "type": "string" },
+            "route": { "type": "string" }
+          }
+        },
+        "feedback": {
+          "type": ["string", "null"],
+          "description": "Reviewer feedback that drove this (re)execution."
+        },
+        "revision_seq": {
+          "type": ["integer", "null"],
+          "description": "Revision sequence when this run belongs to a revision."
+        },
+        "input": {
+          "description": "Rendered execution spec actually served: prompt for task/branch; null for start/end/skipped."
+        },
+        "summary": {
+          "type": "string",
+          "description": "Short auto-generated summary of the output (<=160 chars)."
+        },
+        "output": {
+          "description": "Output reported by the agent (<= 2000 chars serialized); prior output for skipped nodes. Large content is a file reference {\"$file\": \"path\"}, not inline text."
+        }
+      }
+    }
+  }
+}

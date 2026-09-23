@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "aiwf"
+version = "0.1.0"
+description = "AI workflow engine: schema-driven JSON workflows, audited runs, CLI + agent skills"
+readme = { "type" = "text/plain", "content" = "Run engine/bin/aiwf, or see skills/ for agent usage." }
+requires-python = ">=3.9"
+license = { "text" = "MIT" }
+dependencies = [
+    "jsonschema>=4.0",
+]
+
+[project.scripts]
+aiwf = "aiwf.cli:main"
+
+[tool.setuptools]
+package-dir = { "" = "engine" }
+
+[tool.setuptools.packages.find]
+where = ["engine"]

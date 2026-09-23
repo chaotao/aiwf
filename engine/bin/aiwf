@@ -1,0 +1,10 @@
+#!/bin/sh
+# aiwf - CLI launcher for the AI workflow engine.
+# Resolves paths relative to this file so the repo can live anywhere.
+set -e
+
+BIN_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+ENGINE_DIR=$(dirname "$BIN_DIR")
+
+export PYTHONPATH="$ENGINE_DIR${PYTHONPATH:+:$PYTHONPATH}"
+exec python3 -m aiwf "$@"

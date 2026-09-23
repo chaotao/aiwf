@@ -1,0 +1,92 @@
+# 审计 / 检索工作流运行记录
+
+所有执行记录都在 `.aiwf/runs/<workflow_id>/<run_id>/` 下：**每次运行一个独立
+文件夹**，含 `record.json`（审计记录）与 `context.md`（自动生成的共享上下文）。
+同一工作流多次执行各自成目录，每次状态变更立即落盘。记录分两层：**events
+事件流**（用户输入、验收、修订的全过程）和 **node_runs 节点执行记录**。
+
+## 1. 列出运行
+
+```bash
+aiwf runs list                      # 全部工作流的运行
+aiwf runs list short-drama          # 某个工作流的运行
+aiwf runs list --status failed      # 只看失败
+```
+
+每行显示：开始时间、run_id、workflow、状态、总耗时、节点数。
+
+## 2. 查看单次运行
+
+```bash
+aiwf runs show <run_id>                       # 概览：节点耗时与摘要
+aiwf runs show <run_id> --node <node_id>      # 某节点的完整记录
+aiwf runs show <run_id> --json                # 整条记录原始 JSON
+aiwf runs events <run_id>                     # 只看事件流时间线
+```
+
+### node_run 字段含义
+
+| 字段 | 说明 |
+|------|------|
+| `status` | `success` / `failed` / `skipped`（修订中复用旧产物） |
+| `started_at` / `ended_at` / `duration_ms` | 节点级时间，毫秒 |
+| `model` | 执行 agent 实际上报的模型；未上报为 null |
+| `tokens` | agent 上报的 prompt/completion/total token；未上报 null |
+| `input` | 实际消费的渲染后 prompt；start/end/skipped 为 null |
+| `output` | 短结果或文件引用 `{"$file": "路径"}`（单输出 ≤2000 字符）；skipped 节点为复用的旧输出 |
+| `summary` | 输出自动生成的 <=160 字摘要 |
+| `decision` | branch 专用：answer + 实际选中的 route |
+| `feedback` | 驱动本次（重）执行的验收反馈 |
+| `revision_seq` | 所属修订的序号；非修订为 null |
+
+### 运行级字段
+
+`inputs`（启动输入）、`context`（最新上下文）、`phase`、`last_feedback`、
+`error`（失败原因）、`pending_review`（验收门状态）、`revision`（当前/最近修订）。
+
+## 3. events 事件流
+
+事件不可变、只追加，按发生顺序记录。类型：
+
+| event | 含义 |
+|-------|------|
+| `run_started` / `run_resumed` / `run_failed` | 运行生命周期 |
+| `input_provided` | 节点执行前用户提供的信息（values 为本次回答快照） |
+| `input_changed` | 修改已完成节点的输入，自动开启修订 |
+| `review_requested` | 进入验收门（含渲染后 requirements） |
+| `review_decided` | 人的验收结论（verdict + feedback） |
+| `revise_requested` | 发起计划外回跳（含 stale/reused 清单、mode、scope） |
+| `node_reused` | 级联修订中某节点跳过、复用旧产物 |
+| `revision_completed` | 修订关闭 |
+
+context 始终只存最新值；输入与决策的演变历史只在 events 中。
+
+## 4. 关键词检索
+
+```bash
+aiwf runs search "赛博"
+aiwf runs search "revision"
+```
+
+检索范围含 workflow、状态、error、inputs、events、各节点 id/名称/摘要。
+命中后打印 run_id 与状态；细节用 `runs show`。
+
+## 5. 共享上下文 context.md
+
+与 `record.json` 同目录的 `context.md` 由引擎在每次落盘时自动重写（确定性、
+无 LLM），含：运行状态与当前节点、输入、共享上下文内联短值、**产物索引**
+（每个 `$file` 路径 + 来源节点）。用途：
+
+- 给人看进度：不用翻 JSON，读 context.md 即知当前在哪、产物在哪；
+- 交接给另一个 agent：先读它再用 `current` 接管；
+- 审计产物时，用产物索引核对是否有漏产出或路径失效。
+
+## 审计要点（回答用户时按需覆盖）
+
+- **时间线**：events 还原交互顺序，node_runs 还原耗时分布，指出最慢节点。
+- **数据流**：task 输出经 output_key 进 context，后续节点用 `${key}` 消费；
+  大产物经 `$file` 引用、正文留在文件；结合 context.md 产物索引核对数据是否符合预期。
+- **失败回溯**：定位第一个 failed 节点，结合 error 与该节点记录给原因。
+- **修订审计**：检查 revision 与 revise_requested 的 stale/reused 清单是否合理，
+  skipped 节点复用的输出是否确实不受影响，有无异常重做或漏改。
+- **验收审计**：检查 review_requested/decided，确认验收轮次、结论与反馈。
