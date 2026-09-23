@@ -6,8 +6,5 @@ __pycache__/
 .venv/
 venv/
 
-# aiwf runtime records (workflow definitions under .aiwf/workflows/ are kept)
-**/.aiwf/runs/
-
 # OS / editor
 .DS_Store
