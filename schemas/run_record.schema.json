@@ -7,21 +7,30 @@
   "required": [
     "schema_version", "run_id", "workflow_id", "status", "phase",
     "started_at", "inputs", "context", "node_runs", "events",
-    "next_node", "node_started_at", "revision", "pending_review", "last_feedback"
+    "next_node", "node_started_at", "revision", "pending_review", "last_feedback",
+    "parent", "subflow_state"
   ],
   "additionalProperties": false,
   "properties": {
     "schema_version": { "type": "string", "const": "1.0" },
     "run_id": { "type": "string" },
     "workflow_id": { "type": "string" },
+    "parent": {
+      "description": "Linkage to the parent run when this record is a subflow child; null for top-level runs.",
+      "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/parent_link" }]
+    },
+    "subflow_state": {
+      "description": "State of the active/completed subflow or foreach node; null otherwise.",
+      "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/subflow_state" }]
+    },
     "status": {
       "type": "string",
       "enum": ["running", "completed", "failed"]
     },
     "phase": {
       "type": "string",
-      "enum": ["executing", "awaiting_input", "awaiting_review"],
-      "description": "Sub-state within status=running: executing normally, waiting for user input, or waiting for human review."
+      "enum": ["executing", "awaiting_input", "awaiting_review", "awaiting_items"],
+      "description": "Sub-state within status=running: executing normally, waiting for user input, waiting for human review, or (dynamic foreach) waiting for more items."
     },
     "started_at": { "type": "string" },
     "ended_at": { "type": ["string", "null"] },
@@ -66,6 +75,69 @@
     }
   },
   "$defs": {
+    "parent_link": {
+      "type": "object",
+      "required": ["workflow_id", "run_id", "node_id", "instance"],
+      "additionalProperties": false,
+      "properties": {
+        "workflow_id": { "type": "string", "description": "Immediate parent workflow id." },
+        "run_id": { "type": "string", "description": "Immediate parent run id." },
+        "node_id": { "type": "string", "description": "Parent node owning this child." },
+        "instance": { "type": "string", "description": "Instance key ('0' for single subflow)." }
+      }
+    },
+    "instance": {
+      "type": "object",
+      "required": ["key", "index", "status", "run_id", "started_at", "ended_at", "error", "exports"],
+      "additionalProperties": false,
+      "properties": {
+        "key": { "type": "string" },
+        "index": { "type": "integer", "minimum": 0 },
+        "status": {
+          "type": "string",
+          "enum": ["pending", "running", "success", "failed"]
+        },
+        "run_id": { "type": ["string", "null"] },
+        "started_at": { "type": ["string", "null"] },
+        "ended_at": { "type": ["string", "null"] },
+        "error": { "type": ["string", "null"] },
+        "exports": { "type": "object" }
+      }
+    },
+    "subflow_state": {
+      "type": "object",
+      "required": [
+        "node_id", "status", "kind", "subflow_id", "inline",
+        "items_mode", "items_source", "as", "index_as", "id_field",
+        "cursor", "total_seen", "done", "returning", "on_fail",
+        "output_key", "instances"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "node_id": { "type": "string" },
+        "status": { "type": "string", "enum": ["active", "completed"] },
+        "kind": { "type": "string", "enum": ["single", "foreach"] },
+        "subflow_id": { "type": "string", "description": "Resolved workflow id; synthetic id for inline foreach." },
+        "inline": { "type": "boolean" },
+        "items_mode": {
+          "oneOf": [{ "type": "null" }, { "type": "string", "enum": ["static", "dynamic"] }]
+        },
+        "items_source": { "description": "Original items spec; null for single calls." },
+        "as": { "type": "string" },
+        "index_as": { "type": "string" },
+        "id_field": { "oneOf": [{ "type": "null" }, { "type": "string" }] },
+        "cursor": { "type": "integer", "minimum": 0, "description": "Next instance position to process." },
+        "total_seen": { "type": "integer", "minimum": 0, "description": "Items length at last boundary read." },
+        "done": { "type": "boolean", "description": "Dynamic source done marker." },
+        "returning": { "type": "boolean", "description": "redo mode: finish the node right after the current instance." },
+        "on_fail": { "type": "string", "enum": ["abort", "continue"] },
+        "output_key": { "type": "string", "description": "Parent context key: output_key (single) or outputs_key (foreach)." },
+        "instances": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/instance" }
+        }
+      }
+    },
     "pending_review": {
       "type": "object",
       "required": ["kind", "node_id", "requirements", "routes", "attempt"],
@@ -130,6 +202,9 @@
             "run_started", "input_provided", "input_changed",
             "review_requested", "review_decided",
             "revise_requested", "node_reused", "revision_completed",
+            "output_rejected",
+            "subflow_started", "instance_completed", "instance_failed",
+            "instance_redone",
             "run_resumed", "run_failed"
           ]
         },
@@ -154,7 +229,9 @@
         "scope": { "type": "string" },
         "stale_nodes": { "type": "array", "items": { "type": "string" } },
         "reused_nodes": { "type": "array", "items": { "type": "string" } },
-        "redone_nodes": { "type": "array", "items": { "type": "string" } }
+        "redone_nodes": { "type": "array", "items": { "type": "string" } },
+        "instance": { "type": "string" },
+        "child_run_id": { "type": "string" }
       }
     },
     "node_run": {
@@ -170,12 +247,12 @@
         "node_name": { "type": "string" },
         "type": {
           "type": "string",
-          "enum": ["start", "task", "branch", "review", "end"]
+          "enum": ["start", "task", "branch", "review", "end", "subflow", "foreach"]
         },
         "status": {
           "type": "string",
-          "enum": ["success", "failed", "skipped"],
-          "description": "skipped = prior output reused during a cascade revision."
+          "enum": ["success", "failed", "skipped", "rejected"],
+          "description": "skipped = prior output reused during a cascade revision; rejected = output failed output_schema and the node stayed open."
         },
         "started_at": { "type": "string" },
         "ended_at": { "type": "string" },

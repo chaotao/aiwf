@@ -98,15 +98,44 @@ def print_spec(spec_envelope: Dict[str, Any], as_json: bool) -> None:
         print("--- prompt (execute with your own model/tools, then: aiwf complete ...) ---")
         print(node["prompt"])
         print(f"output_key: {node['output_key']}")
+        if node.get("output_schema"):
+            print("output contract (output MUST satisfy):")
+            print("  " + json.dumps(node["output_schema"], ensure_ascii=False))
     elif ntype == "branch":
         print(f"model    : {node.get('model_hint') or '(agent default)'}")
-        print("--- decision prompt: answer with one route label ---")
-        print(node["prompt"])
+        if node.get("deterministic"):
+            print("--- deterministic condition: engine evaluates it, then: aiwf complete <run_id> --empty ---")
+            print(json.dumps(node["when"], ensure_ascii=False))
+        else:
+            print("--- decision prompt: answer with one route label ---")
+            print(node["prompt"])
         print("routes:")
         for label, target in node.get("routes", {}).items():
             print(f"  {label} -> {target}")
         if node.get("default"):
             print(f"  default -> {node['default']}")
+    elif ntype in ("subflow", "foreach"):
+        ref = node.get("subflow_ref")
+        print(f"subflow  : {ref if ref else '(inline nodes)'}")
+        if ntype == "foreach":
+            print(f"items    : {node.get('items')}")
+            print(f"bind     : {node.get('as_')} / {node.get('index_as')}"
+                  f" -> outputs_key {node.get('outputs_key')}"
+                  f" (on_fail {node.get('on_fail')})")
+        else:
+            print(f"output_key: {node.get('output_key')}")
+        sstate = node.get("subflow_state")
+        if sstate:
+            print(f"state    : {sstate['status']} {sstate['progress']}"
+                  f" ({sstate['subflow_id']})")
+        child = node.get("child")
+        if child:
+            print(f"child    : run {child['run_id']} instance {child['instance']}"
+                  f" — drive it with `aiwf current {child['run_id']}`")
+        if node.get("message"):
+            print(node["message"])
+        if not child:
+            print("action   : drive the child run; it is created/advanced automatically")
     else:  # start / end: agent just advances
         print("action   : no execution needed; run `aiwf complete <run_id> --empty`")
 
@@ -122,7 +151,7 @@ def _print_record_table(record: Dict[str, Any]) -> None:
         print(f"duration   : {record.get('duration_ms')} ms")
     if record.get("error"):
         print(f"error      : {record['error']}")
-    print(f"record file: {Storage().run_path(wf, record['run_id'])}")
+    print(f"record dir : {Storage().run_dir_for_record(record)}")
     if record["node_runs"]:
         print("nodes:")
         for nr in record["node_runs"]:
@@ -130,12 +159,34 @@ def _print_record_table(record: Dict[str, Any]) -> None:
                 mark = "ok "
             elif nr["status"] == "skipped":
                 mark = "reuse"
+            elif nr["status"] == "rejected":
+                mark = "rej"
             else:
                 mark = "ERR"
             print(
                 f"  [{mark}] {nr['node_id']:<16} {nr['duration_ms']:>7} ms  "
                 f"{nr['node_name']}  -- {nr['summary']}"
             )
+    _print_subflow_table(record)
+
+
+def _print_subflow_table(record: Dict[str, Any]) -> None:
+    state = record.get("subflow_state")
+    if not state:
+        return
+    kind = state["kind"]
+    print(f"subflow    : node {state['node_id']} -> {state['subflow_id']}"
+          f" ({'inline' if state['inline'] else 'external'}, {state['status']})")
+    if kind == "foreach":
+        print("instances:")
+        for inst in state["instances"]:
+            row = (
+                f"  [{inst['status']:<7}] {inst['key']:<12} "
+                f"run {inst.get('run_id')}"
+            )
+            if inst.get("error"):
+                row += f"  -- {inst['error'][:80]}"
+            print(row)
 
 
 def _parse_param(raw: str) -> Dict[str, Any]:
@@ -176,7 +227,7 @@ def _collect_inputs(args) -> Dict[str, Any]:
 
 
 def _load_workflow_for_record(storage: Storage, record: Dict[str, Any]):
-    return storage.load_workflow(record["workflow_id"])
+    return storage.load_workflow_for_record(record)
 
 
 # ---- command handlers ----------------------------------------------------
@@ -189,6 +240,14 @@ def cmd_init(args, storage: Storage) -> int:
 
 
 def cmd_validate(args, storage: Storage) -> int:
+    if args.project:
+        result = WorkflowEngine(storage).validate_project()
+        print(f"valid project: {len(result['workflows'])} workflow(s)")
+        for src, targets in result["edges"].items():
+            print(f"  {src} -> {', '.join(targets)}")
+        return 0
+    if not args.path:
+        raise SystemExit("validate needs a PATH, or use --project")
     with open(args.path, "r", encoding="utf-8") as f:
         workflow = json.load(f)
     validate_workflow(workflow)
@@ -256,6 +315,8 @@ def cmd_complete(args, storage: Storage) -> int:
         model=args.model,
         tokens=_read_tokens(args),
     )
+    # completing a child end propagates into the (possibly parent) record
+    workflow = _load_workflow_for_record(storage, record)
     print_spec(engine.node_spec(workflow, record), args.json)
     return 0 if record["status"] != "failed" else 1
 
@@ -305,6 +366,7 @@ def cmd_fail(args, storage: Storage) -> int:
     workflow = _load_workflow_for_record(storage, record)
     engine = WorkflowEngine(storage)
     record = engine.fail(workflow, args.run_id, args.error)
+    workflow = _load_workflow_for_record(storage, record)
     print_spec(engine.node_spec(workflow, record), args.json)
     return 1
 
@@ -317,20 +379,38 @@ def cmd_resume(args, storage: Storage) -> int:
     return 0
 
 
+def cmd_redo(args, storage: Storage) -> int:
+    record = storage.find_run(args.run_id)
+    workflow = _load_workflow_for_record(storage, record)
+    engine = WorkflowEngine(storage)
+    record = engine.redo(
+        workflow, args.run_id, args.node, args.instance,
+        reason=args.reason,
+    )
+    workflow = _load_workflow_for_record(storage, record)
+    print_spec(engine.node_spec(workflow, record), args.json)
+    return 0
+
+
 def cmd_runs_list(args, storage: Storage) -> int:
     rows = []
-    for wf, rid, path in storage.iter_run_files(getattr(args, "workflow_id", None)):
+    for wf, rid, path, parent_run in storage.iter_run_files(
+        getattr(args, "workflow_id", None)
+    ):
+        if not getattr(args, "all", False) and parent_run is not None:
+            continue
         with open(path, "r", encoding="utf-8") as f:
             r = json.load(f)
         if getattr(args, "status", None) and r["status"] != args.status:
             continue
         rows.append((r["started_at"], rid, wf, r["status"], r.get("duration_ms"),
-                     len(r["node_runs"])))
+                     len(r["node_runs"]), parent_run))
     if not rows:
         print("(no runs)")
         return 0
-    for started, rid, wf, status, dur, n in sorted(rows, reverse=True):
-        print(f"{started}  {rid}  {wf:<20} {status:<9} {str(dur):>9} ms  {n} nodes")
+    for started, rid, wf, status, dur, n, parent_run in sorted(rows, reverse=True):
+        tag = f" (of {parent_run})" if parent_run else ""
+        print(f"{started}  {rid}  {wf:<20} {status:<9} {str(dur):>9} ms  {n} nodes{tag}")
     return 0
 
 
@@ -367,7 +447,7 @@ def cmd_runs_events(args, storage: Storage) -> int:
 def cmd_runs_search(args, storage: Storage) -> int:
     query = args.query.lower()
     hits = 0
-    for wf, rid, path in storage.iter_run_files():
+    for wf, rid, path, _parent in storage.iter_run_files():
         with open(path, "r", encoding="utf-8") as f:
             r = json.load(f)
         haystack = json.dumps(
@@ -439,8 +519,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser("init", help="create .aiwf storage dirs").set_defaults(func=cmd_init)
 
-    pv = sub.add_parser("validate", help="validate a workflow definition JSON file")
-    pv.add_argument("path")
+    pv = sub.add_parser("validate", help="validate a workflow definition JSON file, or the whole project")
+    pv.add_argument("path", nargs="?")
+    pv.add_argument("--project", action="store_true",
+                    help="validate all definitions and the subflow call graph")
     pv.set_defaults(func=cmd_validate)
 
     sub.add_parser("workflows", help="list saved workflows").set_defaults(func=cmd_workflows)
@@ -508,12 +590,21 @@ def build_parser() -> argparse.ArgumentParser:
     pres.add_argument("--json", action="store_true")
     pres.set_defaults(func=cmd_resume)
 
+    prd = sub.add_parser("redo", help="redo one subflow/foreach instance")
+    prd.add_argument("run_id")
+    prd.add_argument("--node", required=True, help="subflow/foreach node id")
+    prd.add_argument("--instance", required=True, help="instance key (index or id_field)")
+    prd.add_argument("--reason", help="why this instance is redone (audit)")
+    prd.add_argument("--json", action="store_true")
+    prd.set_defaults(func=cmd_redo)
+
     pruns = sub.add_parser("runs", help="run record operations")
     rsub = pruns.add_subparsers(dest="runs_command", required=True)
 
-    rl = rsub.add_parser("list", help="list runs")
+    rl = rsub.add_parser("list", help="list runs (top-level only; --all includes children)")
     rl.add_argument("workflow_id", nargs="?")
     rl.add_argument("--status", choices=["running", "completed", "failed"])
+    rl.add_argument("--all", action="store_true", help="include nested child runs")
     rl.set_defaults(func=cmd_runs_list)
 
     rs = rsub.add_parser("show", help="show one run record")

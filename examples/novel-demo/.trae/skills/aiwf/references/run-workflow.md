@@ -18,7 +18,7 @@ aiwf current <run_id> --json              # 中断后重新查看
 ```json
 { "run_id": "...", "workflow_id": "...",
   "status": "running|completed|failed",
-  "phase": "executing|awaiting_input|awaiting_review",
+  "phase": "executing|awaiting_input|awaiting_review|awaiting_items",
   "revision": { "...当前修订信息，无则 null" },
   "node": { "..." }, "input_request": null, "review_request": null }
 ```
@@ -79,6 +79,32 @@ aiwf review <run_id> --verdict REJECT --feedback "需要改什么" --json
 - REJECT：指针回到 routes 指定节点（缺省重做被验收的 task），反馈随下次 spec
   下发（`node.feedback`），按意见修改。
 
+### 子工作流节点：转去驱动子级
+
+当前节点是 `subflow` / `foreach` 时，引擎已自动建好子运行；信封的 `node.child`
+给出子 `run_id`（foreach 还带进度 `node.subflow_state.progress`）：
+
+- **不要 complete 父节点**——子级进行中父级会拒绝。直接用现有命令驱动子级：
+  ```bash
+  aiwf current <child_run_id> --json
+  # 按子级自己的 phase 行动（多为普通 task），直到子级走到 end
+  aiwf complete <child_run_id> --empty --json
+  ```
+- 子级 end 的那次 complete 会被引擎**自动传播**：校验子级 exports 快照；foreach
+  重读 items、创建下一实例或写结果清单收尾。返回的信封已经是**父级的下一规格**
+  （foreach 会显示新的 `node.child`，继续驱动即可）。
+- foreach 的结果清单位于父运行目录 `foreach-<node>-results.json`，父 context 只有
+  `{"$file":路径}`，需要汇总时读该清单。
+- **动态 items**：父级进入 `awaiting_items` 表示当前条目已跑完、源里还没有新条目。
+  外部追加条目（或设 `done=true`）后执行 `aiwf resume <wf_id> <run_id>` 继续。
+- 父节点已完成后只想重做某一实例：
+  ```bash
+  aiwf redo <run_id> --node chapters --instance 0 --reason "重写第一章" --json
+  ```
+  子级沿用原目录与 run_id；完成后清单整体刷新、其余实例保留。
+- 子级失败（含 exports 契约不满足）：abort 时父级 failed，`aiwf resume` 会同时
+  重开该子级；on_fail=continue 时 foreach 自动推进下一条，失败留在清单。
+
 ## 3. 计划外回跳修订（revise）
 
 执行中途发现某个**已完成的 task** 内容需要调整（而非验收打回），无需改定义：
@@ -88,7 +114,8 @@ aiwf revise <run_id> --target worldview --reason "补充一条设定规则" \
   [--mode cascade] [--scope auto] --json
 ```
 
-**重做范围如何确定**：引擎静态扫描所有节点的 `${var}` 引用，构建数据依赖图。
+**重做范围如何确定**：引擎根据节点 prompt/requirements 中的 `${var}` 引用及 task
+显式声明的 `consumes`（context key 或按 `$file` 路径匹配的 glob）构建数据依赖图。
 
 - `--scope auto`（默认）：从 target 的输出键沿依赖图求传递闭包——引用了变更内容
   的节点标 stale 重做；其余已完成的下游节点自动复用（审计记 skipped），不重做。

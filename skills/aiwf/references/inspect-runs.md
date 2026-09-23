@@ -5,13 +5,28 @@
 同一工作流多次执行各自成目录，每次状态变更立即落盘。记录分两层：**events
 事件流**（用户输入、验收、修订的全过程）和 **node_runs 节点执行记录**。
 
+**子工作流记录嵌套在父运行目录内**，不另开顶层目录：
+
+```
+runs/<父wf>/<父rid>/
+  record.json, context.md
+  foreach-<node>-results.json              # foreach 实例结果清单
+  children/<node>/subflow.json             # 内联 nodes 合成的子流程定义
+  children/<node>/<instance>/record.json   # 每个实例一份子记录（single 固定 "0"）
+```
+
+子记录的 `parent` 字段指向父 run 与节点；查找时引擎沿该链定位。
+
 ## 1. 列出运行
 
 ```bash
 aiwf runs list                      # 全部工作流的运行
 aiwf runs list short-drama          # 某个工作流的运行
 aiwf runs list --status failed      # 只看失败
+aiwf runs list --all                # 含子工作流实例（标注 "(of <父run_id>)"）
 ```
+
+`runs list` 默认只列顶层运行；子级用 `--all` 显示。
 
 每行显示：开始时间、run_id、workflow、状态、总耗时、节点数。
 
@@ -24,25 +39,31 @@ aiwf runs show <run_id> --json                # 整条记录原始 JSON
 aiwf runs events <run_id>                     # 只看事件流时间线
 ```
 
+父运行含 subflow/foreach 节点时，概览额外列出**实例表**：实例 key、状态、
+exports 摘要、子 run_id 与记录目录；单实例细节用 `runs show <child_run_id>`。
+
 ### node_run 字段含义
 
 | 字段 | 说明 |
 |------|------|
-| `status` | `success` / `failed` / `skipped`（修订中复用旧产物） |
+| `status` | `success` / `failed` / `skipped`（修订中复用旧产物）/ `rejected`（产物不符 output_schema，节点未关闭） |
 | `started_at` / `ended_at` / `duration_ms` | 节点级时间，毫秒 |
 | `model` | 执行 agent 实际上报的模型；未上报为 null |
 | `tokens` | agent 上报的 prompt/completion/total token；未上报 null |
 | `input` | 实际消费的渲染后 prompt；start/end/skipped 为 null |
-| `output` | 短结果或文件引用 `{"$file": "路径"}`（单输出 ≤2000 字符）；skipped 节点为复用的旧输出 |
+| `output` | 短结果或文件引用 `{"$file": "路径"}`（单输出 ≤2000 字符）；skipped 节点为复用的旧输出；rejected 节点保留被驳回的产物 |
 | `summary` | 输出自动生成的 <=160 字摘要 |
 | `decision` | branch 专用：answer + 实际选中的 route |
+| `subflow` | subflow/foreach 专用：子工作流 id、实例进度（success/failed/pending） |
 | `feedback` | 驱动本次（重）执行的验收反馈 |
 | `revision_seq` | 所属修订的序号；非修订为 null |
 
 ### 运行级字段
 
 `inputs`（启动输入）、`context`（最新上下文）、`phase`、`last_feedback`、
-`error`（失败原因）、`pending_review`（验收门状态）、`revision`（当前/最近修订）。
+`error`（失败原因）、`pending_review`（验收门状态）、`revision`（当前/最近修订）、
+`parent`（子记录专用：父 workflow/run/node/instance）、`subflow_state`（父记录
+专用：每个 subflow/foreach 节点的 kind、items_mode、done、instances 列表）。
 
 ## 3. events 事件流
 
@@ -58,6 +79,9 @@ aiwf runs events <run_id>                     # 只看事件流时间线
 | `revise_requested` | 发起计划外回跳（含 stale/reused 清单、mode、scope） |
 | `node_reused` | 级联修订中某节点跳过、复用旧产物 |
 | `revision_completed` | 修订关闭 |
+| `subflow_started` | 实例启动（含 instance、child_run_id） |
+| `instance_completed` / `instance_failed` | 实例结束（含 exports 快照 / error） |
+| `instance_redone` | redo 重开单个实例（含 reason） |
 
 context 始终只存最新值；输入与决策的演变历史只在 events 中。
 
@@ -90,3 +114,5 @@ aiwf runs search "revision"
 - **修订审计**：检查 revision 与 revise_requested 的 stale/reused 清单是否合理，
   skipped 节点复用的输出是否确实不受影响，有无异常重做或漏改。
 - **验收审计**：检查 review_requested/decided，确认验收轮次、结论与反馈。
+- **子流程审计**：核对实例表与结果清单（成功/失败/待办数、exports），失败实例
+  结合子记录回溯；确认 redo/整体重做后清单已刷新、无悬挂 pending。

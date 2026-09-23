@@ -120,6 +120,112 @@ def node_input_workflow():
     }
 
 
+def branch_switch_workflow():
+    """a -> qc; qc PASS -> b (REVISE -> fix) -> c -> end; fix -> qc."""
+    return {
+        "schema_version": "1.0",
+        "id": "branch-switch-wf",
+        "name": "分支切换",
+        "nodes": [
+            {"id": "start", "type": "start"},
+            {"id": "a", "type": "task", "prompt": "a step"},
+            {"id": "qc", "type": "branch",
+             "prompt": "check ${a}",
+             "routes": {"PASS": "b", "REVISE": "fix"}, "default": "b"},
+            {"id": "fix", "type": "task", "prompt": "fix ${a}"},
+            {"id": "b", "type": "task", "prompt": "use ${a}"},
+            {"id": "c", "type": "task", "prompt": "brand new step"},
+            {"id": "end", "type": "end"},
+        ],
+        "edges": [
+            {"from": "start", "to": "a"},
+            {"from": "a", "to": "qc"},
+            {"from": "b", "to": "c"},
+            {"from": "c", "to": "end"},
+            {"from": "fix", "to": "qc"},
+        ],
+    }
+
+
+def loop_revision_workflow():
+    """a -> gate: CONTINUE -> a, DONE -> tail -> end.
+
+    fix references ${a} so it is stale by closure, but no edge routes to it:
+    after gate=CONTINUE the path loops back to a (a new iteration).
+    """
+    return {
+        "schema_version": "1.0",
+        "id": "loop-rev-wf",
+        "name": "循环修订",
+        "nodes": [
+            {"id": "start", "type": "start"},
+            {"id": "a", "type": "task", "prompt": "a step"},
+            {"id": "gate", "type": "branch",
+             "prompt": "check ${a}",
+             "routes": {"CONTINUE": "a", "DONE": "tail"}, "default": "tail"},
+            {"id": "fix", "type": "task", "prompt": "fix ${a}"},
+            {"id": "tail", "type": "task", "prompt": "tail step"},
+            {"id": "end", "type": "end"},
+        ],
+        "edges": [
+            {"from": "start", "to": "a"},
+            {"from": "a", "to": "gate"},
+            {"from": "tail", "to": "end"},
+        ],
+    }
+
+
+def batch_consumers_workflow():
+    """writer produces a $file under novel/chapters/; assembler consumes the
+    whole batch solely via a glob (its prompt has no ${var} refs)."""
+    return {
+        "schema_version": "1.0",
+        "id": "batch-wf",
+        "name": "批量消费",
+        "nodes": [
+            {"id": "start", "type": "start"},
+            {"id": "writer", "type": "task", "prompt": "写出章节文件"},
+            {"id": "assembler", "type": "task",
+             "consumes": [{"glob": "novel/chapters/*.md"}],
+             "prompt": "汇总全部章节"},
+            {"id": "end", "type": "end"},
+        ],
+        "edges": [
+            {"from": "start", "to": "writer"},
+            {"from": "writer", "to": "assembler"},
+            {"from": "assembler", "to": "end"},
+        ],
+    }
+
+
+def when_branch_workflow(routes=None):
+    """gate deterministically compares input count >= 2."""
+    return {
+        "schema_version": "1.0",
+        "id": "when-wf",
+        "name": "确定性分支",
+        "input_schema": {
+            "type": "object",
+            "required": ["count"],
+            "properties": {"count": {"type": "integer"}},
+        },
+        "nodes": [
+            {"id": "start", "type": "start"},
+            {"id": "gate", "type": "branch",
+             "when": {"gte": [{"var": "count"}, 2]},
+             "routes": routes or {"TRUE": "big", "FALSE": "small"}},
+            {"id": "big", "type": "task", "prompt": "大分支"},
+            {"id": "small", "type": "task", "prompt": "小分支"},
+            {"id": "end", "type": "end"},
+        ],
+        "edges": [
+            {"from": "start", "to": "gate"},
+            {"from": "big", "to": "end"},
+            {"from": "small", "to": "end"},
+        ],
+    }
+
+
 # ---- small agent helpers -------------------------------------------------
 def drive_to_completion(engine, wf, record):
     while True:
@@ -382,6 +488,71 @@ class EngineTest(unittest.TestCase):
         self.assertEqual(record["context"]["p2"], "p2 v1")
         self.assertEqual(record["context"]["p1"], "p1 v2")
 
+    def test_cascade_revision_closes_when_path_leaves_stale(self):
+        wf = branch_switch_workflow()
+        e = self.engine
+        record = e.start(wf)
+        record = e.complete(wf, record["run_id"])                    # start
+        record = e.complete(wf, record["run_id"], output="a v1")     # a
+        record = e.complete(wf, record["run_id"], output="PASS")     # qc -> b
+        self.assertEqual(record["next_node"], "b")
+
+        record = e.revise(wf, record["run_id"], "a", "调整 a")
+        # fix is stale only by dependency closure; reachable solely via qc=REVISE
+        self.assertEqual(
+            sorted(record["revision"]["stale_nodes"]),
+            ["a", "b", "fix", "qc"],
+        )
+
+        record = e.complete(wf, record["run_id"], output="a v2")     # a -> qc
+        record = e.complete(wf, record["run_id"], output="PASS")     # qc -> b
+        record = e.complete(wf, record["run_id"], output="b v2")     # b -> c
+
+        # entering the brand-new node c the unreachable fix is forgiven:
+        # the revision is over and c is a normal node
+        self.assertEqual(record["next_node"], "c")
+        self.assertEqual(record["revision"]["status"], "completed")
+        self.assertFalse(e.node_spec(wf, record)["node"]["under_revision"])
+
+        record = e.complete(wf, record["run_id"], output="c out")
+        record = e.complete(wf, record["run_id"])                    # end
+        self.assertEqual(record["status"], "completed")
+        self.assertEqual(record["revision"]["status"], "completed")
+        self.assertIsNone(
+            next(n for n in record["node_runs"] if n["node_id"] == "c")["revision_seq"]
+        )
+
+    def test_cascade_loop_revisits_stale_node_instead_of_skipping(self):
+        wf = loop_revision_workflow()
+        e = self.engine
+        record = e.start(wf)
+        record = e.complete(wf, record["run_id"])                    # start
+        record = e.complete(wf, record["run_id"], output="a v1")     # a
+        record = e.complete(wf, record["run_id"], output="CONTINUE")  # gate -> a
+
+        record = e.revise(wf, record["run_id"], "a", "调整 a")
+        self.assertEqual(
+            sorted(record["revision"]["stale_nodes"]),
+            ["a", "fix", "gate"],
+        )
+
+        record = e.complete(wf, record["run_id"], output="a v2")     # a redo
+        record = e.complete(wf, record["run_id"], output="CONTINUE")  # gate -> a
+
+        # back at a on a new loop iteration: executed again, not skipped;
+        # the unreachable fix is forgiven so the revision is over
+        self.assertEqual(record["next_node"], "a")
+        self.assertEqual(record["revision"]["status"], "completed")
+        a_runs = [n for n in record["node_runs"] if n["node_id"] == "a"]
+        self.assertEqual(len(a_runs), 2)
+        self.assertTrue(all(n["status"] == "success" for n in a_runs))
+
+        record = e.complete(wf, record["run_id"], output="a v3")     # a -> gate
+        record = e.complete(wf, record["run_id"], output="DONE")     # gate -> tail
+        record = e.complete(wf, record["run_id"], output="tail out")
+        record = e.complete(wf, record["run_id"])                    # end
+        self.assertEqual(record["status"], "completed")
+
     # ---- provide on completed node -> revision -----------------------
     def test_change_completed_node_input_opens_revision(self):
         wf = node_input_workflow()
@@ -494,7 +665,9 @@ class EngineTest(unittest.TestCase):
         wf = linear_workflow()
         record = self.engine.start(wf, {"topic": "T"})
         self.assertTrue(
-            os.path.isfile(self.storage.run_path("test-wf", record["run_id"]))
+            os.path.isfile(os.path.join(
+                self.storage.runs_dir, "test-wf", record["run_id"], "record.json"
+            ))
         )
 
         record = self.engine.complete(wf, record["run_id"])  # start
@@ -502,7 +675,9 @@ class EngineTest(unittest.TestCase):
             wf, record["run_id"], output={"$file": "novel/chapter-1.md"}
         )  # draft
 
-        path = self.storage.context_doc_path("test-wf", record["run_id"])
+        path = os.path.join(
+            self.storage.runs_dir, "test-wf", record["run_id"], "context.md"
+        )
         self.assertTrue(os.path.isfile(path))
         with open(path, "r", encoding="utf-8") as f:
             md = f.read()
@@ -510,6 +685,648 @@ class EngineTest(unittest.TestCase):
         self.assertIn("## 产物索引", md)
         self.assertIn("novel/chapter-1.md", md)
         self.assertIn("draft", md)
+
+    # ---- consumes explicit dependencies ------------------------------
+    def test_consumes_string_adds_dependency_beyond_prompt(self):
+        wf = {
+            "schema_version": "1.0", "id": "cons-wf", "name": "显式依赖",
+            "nodes": [
+                {"id": "start", "type": "start"},
+                {"id": "src", "type": "task", "prompt": "源节点"},
+                {"id": "down", "type": "task",
+                 "consumes": ["src"], "prompt": "下游（prompt 无引用）"},
+                {"id": "end", "type": "end"},
+            ],
+            "edges": [
+                {"from": "start", "to": "src"},
+                {"from": "src", "to": "down"},
+                {"from": "down", "to": "end"},
+            ],
+        }
+        e = self.engine
+        record = e.start(wf)
+        record = drive_to_node(e, wf, record, "end")
+        record = e.revise(wf, record["run_id"], "src", "源改动")
+        self.assertEqual(record["revision"]["stale_nodes"], ["down", "src"])
+
+    def test_consumes_glob_marks_batch_consumer_stale_and_reruns(self):
+        wf = batch_consumers_workflow()
+        e = self.engine
+        record = e.start(wf)
+        record = e.complete(wf, record["run_id"])                       # start
+        record = e.complete(
+            wf, record["run_id"], output={"$file": "novel/chapters/chapter-3.md"}
+        )                                                                # writer
+        record = e.complete(
+            wf, record["run_id"], output={"$file": "novel/full.md"}
+        )                                                                # assembler
+        self.assertEqual(record["next_node"], "end")
+
+        record = e.revise(wf, record["run_id"], "writer", "章节改动")
+        self.assertIn("assembler", record["revision"]["stale_nodes"])
+
+        # writer redone -> assembler must really execute, not be skipped
+        record = e.complete(
+            wf, record["run_id"], output={"$file": "novel/chapters/chapter-3.md"}
+        )
+        self.assertEqual(record["next_node"], "assembler")
+        assembler_runs = [
+            n for n in record["node_runs"] if n["node_id"] == "assembler"
+        ]
+        self.assertEqual(len(assembler_runs), 1)  # original run; now current
+
+        record = e.complete(
+            wf, record["run_id"], output={"$file": "novel/full-v2.md"}
+        )
+        assembler_runs = [
+            n for n in record["node_runs"] if n["node_id"] == "assembler"
+        ]
+        self.assertEqual([n["status"] for n in assembler_runs],
+                         ["success", "success"])
+        self.assertFalse(
+            any(n["node_id"] == "assembler" and n["status"] == "skipped"
+                for n in record["node_runs"])
+        )
+
+    def test_consumes_glob_does_not_match_unrelated_file(self):
+        wf = batch_consumers_workflow()
+        e = self.engine
+        record = e.start(wf)
+        record = drive_to_node(e, wf, record, "end",
+                               outputs={"writer": {"$file": "notes/scratch.md"},
+                                        "assembler": {"$file": "novel/full.md"}})
+        record = e.revise(wf, record["run_id"], "writer", "无关文件改动")
+        self.assertNotIn("assembler", record["revision"]["stale_nodes"])
+
+    # ---- output_schema -----------------------------------------------
+    def test_output_schema_rejects_bad_output_then_accepts(self):
+        wf = {
+            "schema_version": "1.0", "id": "oschema-wf", "name": "产物契约",
+            "nodes": [
+                {"id": "start", "type": "start"},
+                {"id": "t", "type": "task", "prompt": "产出结构化结果",
+                 "output_schema": {
+                     "type": "object",
+                     "required": ["status"],
+                     "properties": {"status": {"type": "string"}},
+                 }},
+                {"id": "end", "type": "end"},
+            ],
+        }
+        e = self.engine
+        record = e.start(wf)
+        record = e.complete(wf, record["run_id"])  # start -> t
+
+        record = e.complete(wf, record["run_id"], output="not-an-object")
+        self.assertEqual(record["status"], "running")
+        self.assertEqual(record["next_node"], "t")
+        self.assertEqual(record["phase"], "executing")
+        self.assertEqual(record["node_runs"][-1]["status"], "rejected")
+        self.assertNotIn("t", record["context"])
+        self.assertIn("output_schema", record["last_feedback"])
+
+        spec = e.node_spec(wf, record)["node"]
+        self.assertEqual(spec["feedback"], record["last_feedback"])
+        self.assertEqual(
+            spec["output_schema"]["required"], ["status"]
+        )
+
+        record = e.complete(
+            wf, record["run_id"], output={"status": "ok"}
+        )  # t -> end
+        self.assertEqual(record["context"]["t"], {"status": "ok"})
+        record = e.complete(wf, record["run_id"])
+        self.assertEqual(record["status"], "completed")
+        self.assertIn(
+            "output_rejected",
+            [ev["type"] for ev in record["events"]],
+        )
+
+    # ---- deterministic when branch -----------------------------------
+    def test_when_branch_true_route(self):
+        wf = when_branch_workflow()
+        e = self.engine
+        record = e.start(wf, {"count": 3})
+        record = e.complete(wf, record["run_id"])  # start -> gate
+
+        spec = e.node_spec(wf, record)["node"]
+        self.assertTrue(spec["deterministic"])
+        self.assertEqual(spec["when"], {"gte": [{"var": "count"}, 2]})
+
+        record = e.complete(wf, record["run_id"])  # empty: engine evaluates
+        self.assertEqual(record["next_node"], "big")
+        self.assertEqual(
+            record["node_runs"][-1]["decision"],
+            {"answer": "TRUE", "route": "big"},
+        )
+
+    def test_when_branch_false_route(self):
+        wf = when_branch_workflow()
+        e = self.engine
+        record = e.start(wf, {"count": 1})
+        record = drive_to_node(e, wf, record, "gate")
+        record = e.complete(wf, record["run_id"])
+        self.assertEqual(record["next_node"], "small")
+        self.assertEqual(
+            record["node_runs"][-1]["decision"]["answer"], "FALSE"
+        )
+
+    def test_when_branch_needs_true_false_routes(self):
+        wf = when_branch_workflow(routes={"TRUE": "big"})
+        with self.assertRaises(ValueError):
+            self.engine.start(wf, {"count": 1})
+
+    def test_unknown_when_operator_rejected_at_start(self):
+        wf = when_branch_workflow()
+        wf["nodes"][1]["when"] = {"frobnicate": [1, 2]}
+        with self.assertRaises(Exception):
+            self.engine.start(wf, {"count": 1})
+
+    # ---- subflow / foreach -------------------------------------------
+    def _save_child(self):
+        self.storage.save_workflow(chapter_child_workflow())
+
+    def test_subflow_exports_returned_under_output_key(self):
+        self._save_child()
+        e, parent = self.engine, subflow_parent_workflow()
+        self.storage.save_workflow(parent)
+        record = e.start(parent)
+        record = e.complete(parent, record["run_id"])  # start -> call
+        state = record["subflow_state"]
+        inst = state["instances"][0]
+        self.assertEqual(inst["status"], "running")
+        child_dir = self.storage.child_dir(record, "call", "0")
+        self.assertTrue(
+            os.path.isfile(os.path.join(child_dir, "record.json"))
+        )
+        record = _run_child_success(
+            e, self.storage.find_run(inst["run_id"]), "章节摘要"
+        )
+        self.assertEqual(record["workflow_id"], "book-wf")
+        self.assertEqual(
+            record["context"]["chapter"], {"summary": "章节摘要"}
+        )
+        record = e.complete(parent, record["run_id"])  # end
+        self.assertEqual(record["status"], "completed")
+
+    def test_parent_blocks_complete_while_child_running(self):
+        self._save_child()
+        e, parent = self.engine, subflow_parent_workflow()
+        record = e.start(parent)
+        record = e.complete(parent, record["run_id"])
+        with self.assertRaises(RuntimeError):
+            e.complete(parent, record["run_id"])
+
+    def test_foreach_external_static_manifest(self):
+        self._save_child()
+        e, parent = self.engine, foreach_parent_workflow()
+        self.storage.save_workflow(parent)
+        record = e.start(parent)
+        record = e.complete(parent, record["run_id"])  # first instance
+        state = record["subflow_state"]
+        self.assertEqual(len(state["instances"]), 2)
+        record = _run_child_success(
+            e, self.storage.find_run(state["instances"][0]["run_id"]), "S1"
+        )
+        second = next(
+            i for i in record["subflow_state"]["instances"] if i["key"] == "1"
+        )
+        self.assertEqual(second["status"], "running")
+        record = _run_child_success(
+            e, self.storage.find_run(second["run_id"]), "S2"
+        )
+        self.assertEqual(
+            record["subflow_state"]["status"], "completed"
+        )
+        manifest = self.storage.read_json_file(
+            record["context"]["results"]["$file"]
+        )
+        self.assertEqual(
+            [i["status"] for i in manifest["items"]],
+            ["success", "success"],
+        )
+        self.assertEqual(
+            manifest["items"][0]["exports"], {"summary": "S1"}
+        )
+
+    def test_foreach_inline_body_materialized(self):
+        e, parent = self.engine, foreach_inline_parent_workflow()
+        self.storage.save_workflow(parent)
+        record = e.start(parent)
+        record = e.complete(parent, record["run_id"])
+        state = record["subflow_state"]
+        self.assertTrue(state["inline"])
+        synth = self.storage.read_json_file(
+            self.storage.inline_subflow_path(record, "batch")
+        )
+        self.assertEqual(synth["id"], "inline-book-wf.batch")
+        record = _run_child_success(
+            e, self.storage.find_run(state["instances"][0]["run_id"]), "A"
+        )
+        inst2 = next(
+            i for i in record["subflow_state"]["instances"]
+            if i["key"] == "1"
+        )
+        record = _run_child_success(
+            e, self.storage.find_run(inst2["run_id"]), "B"
+        )
+        manifest = self.storage.read_json_file(
+            record["context"]["results"]["$file"]
+        )
+        self.assertEqual(
+            [i["exports"] for i in manifest["items"]],
+            [{"summary": "A"}, {"summary": "B"}],
+        )
+
+    def test_foreach_dynamic_items_waits_appends_and_done(self):
+        import json as _json
+        self._save_child()
+        source = os.path.join(self.tmp, "items.json")
+        with open(source, "w", encoding="utf-8") as f:
+            _json.dump({"done": False, "items": []}, f)
+        parent = foreach_parent_workflow()
+        parent["nodes"][1]["items"] = {"$file": source}
+        e = self.engine
+        self.storage.save_workflow(parent)
+        record = e.start(parent)
+        record = e.complete(parent, record["run_id"])
+        self.assertEqual(record["phase"], "awaiting_items")
+
+        with open(source, "w", encoding="utf-8") as f:
+            _json.dump({"done": False, "items": [{"outline": "一"}]}, f)
+        record = e.resume(parent, record["run_id"])
+        self.assertEqual(record["subflow_state"]["total_seen"], 1)
+        record = _run_child_success(
+            e, self.storage.find_run(
+                record["subflow_state"]["instances"][0]["run_id"]
+            ),
+            "D1",
+        )
+        self.assertEqual(record["phase"], "awaiting_items")
+
+        with open(source, "w", encoding="utf-8") as f:
+            _json.dump(
+                {"done": True,
+                 "items": [{"outline": "一"}, {"outline": "二"}]},
+                f,
+            )
+        record = e.resume(parent, record["run_id"])
+        inst2 = next(
+            i for i in record["subflow_state"]["instances"]
+            if i["key"] == "1"
+        )
+        record = _run_child_success(
+            e, self.storage.find_run(inst2["run_id"]), "D2"
+        )
+        manifest = self.storage.read_json_file(
+            record["context"]["results"]["$file"]
+        )
+        self.assertEqual(
+            [i["status"] for i in manifest["items"]],
+            ["success", "success"],
+        )
+
+    def test_subflow_abort_fails_parent_and_resume_retries(self):
+        self._save_child()
+        e, parent = self.engine, subflow_parent_workflow()
+        self.storage.save_workflow(parent)
+        record = e.start(parent)
+        record = e.complete(parent, record["run_id"])
+        child = self.storage.find_run(
+            record["subflow_state"]["instances"][0]["run_id"]
+        )
+        cwf = self.storage.load_workflow("chapter-wf")
+        crid = child["run_id"]
+        e.complete(cwf, crid)  # start -> write
+        record = e.fail(cwf, crid, "模型爆炸")
+        self.assertEqual(record["workflow_id"], "book-wf")
+        self.assertEqual(record["status"], "failed")
+
+        record = e.resume(parent, record["run_id"])
+        inst = record["subflow_state"]["instances"][0]
+        self.assertEqual(inst["status"], "running")
+        child_record = self.storage.find_run(inst["run_id"])
+        self.assertEqual(child_record["status"], "running")
+        cwf = self.storage.load_workflow("chapter-wf")
+        # child resumed at its write node: complete it -> end
+        record = e.complete(
+            cwf, inst["run_id"], output="恢复后摘要"
+        )
+        record = e.complete(cwf, inst["run_id"])  # end -> parent
+        record = e.complete(parent, record["run_id"])
+        self.assertEqual(record["status"], "completed")
+
+    def test_foreach_on_fail_continue_skips_failed_item(self):
+        self._save_child()
+        parent = foreach_parent_workflow()
+        parent["nodes"][1]["on_fail"] = "continue"
+        self.storage.save_workflow(parent)
+        e = self.engine
+        record = e.start(parent)
+        record = e.complete(parent, record["run_id"])
+        first = record["subflow_state"]["instances"][0]
+        child = self.storage.find_run(first["run_id"])
+        cwf = self.storage.load_workflow("chapter-wf")
+        crid = child["run_id"]
+        e.complete(cwf, crid)
+        record = e.fail(cwf, crid, "坏数据")
+        # second instance started despite the first failure
+        second = next(
+            i for i in record["subflow_state"]["instances"]
+            if i["key"] == "1"
+        )
+        self.assertEqual(second["status"], "running")
+        record = _run_child_success(
+            e, self.storage.find_run(second["run_id"]), "S2"
+        )
+        manifest = self.storage.read_json_file(
+            record["context"]["results"]["$file"]
+        )
+        self.assertEqual(
+            [i["status"] for i in manifest["items"]],
+            ["failed", "success"],
+        )
+
+    def test_redo_single_foreach_instance(self):
+        self._save_child()
+        e, parent = self.engine, foreach_parent_workflow()
+        self.storage.save_workflow(parent)
+        record = e.start(parent)
+        record = e.complete(parent, record["run_id"])
+        first = record["subflow_state"]["instances"][0]
+        record = _run_child_success(
+            e, self.storage.find_run(first["run_id"]), "OLD1"
+        )
+        second = next(
+            i for i in record["subflow_state"]["instances"]
+            if i["key"] == "1"
+        )
+        record = _run_child_success(
+            e, self.storage.find_run(second["run_id"]), "S2"
+        )
+        record = e.complete(parent, record["run_id"])  # end
+        self.assertEqual(record["status"], "completed")
+
+        record = e.redo(
+            parent, record["run_id"], node_id="chapters",
+            instance="0", reason="第一章重写",
+        )
+        self.assertEqual(record["next_node"], "chapters")
+        child = self.storage.find_run(
+            record["subflow_state"]["instances"][0]["run_id"]
+        )
+        record = _run_child_success(e, child, "NEW1")
+        manifest = self.storage.read_json_file(
+            record["context"]["results"]["$file"]
+        )
+        self.assertEqual(
+            manifest["items"][0]["exports"], {"summary": "NEW1"}
+        )
+        self.assertEqual(
+            manifest["items"][1]["exports"], {"summary": "S2"}
+        )
+
+    def test_validate_project_rejects_missing_subflow(self):
+        parent = subflow_parent_workflow()
+        self.storage.save_workflow(parent)
+        with self.assertRaises(ValueError):
+            self.engine.validate_project()
+
+    def test_validate_project_rejects_call_cycle(self):
+        self._save_child()
+        self.storage.save_workflow(subflow_parent_workflow())
+        cyc = {
+            "schema_version": "1.0", "id": "loop-wf", "name": "自环",
+            "nodes": [
+                {"id": "start", "type": "start"},
+                {"id": "call", "type": "subflow", "workflow": "loop-wf",
+                 "inputs": {}, "output_key": "r"},
+                {"id": "end", "type": "end"},
+            ],
+            "edges": [
+                {"from": "start", "to": "call"},
+                {"from": "call", "to": "end"},
+            ],
+        }
+        self.storage.save_workflow(cyc)
+        with self.assertRaises(ValueError):
+            self.engine.validate_project()
+
+    def test_validate_project_rejects_unmapped_required(self):
+        self._save_child()
+        parent = subflow_parent_workflow()
+        parent["nodes"][1]["inputs"] = {}
+        self.storage.save_workflow(parent)
+        with self.assertRaises(ValueError):
+            self.engine.validate_project()
+
+    def test_subflow_depth_guard(self):
+        for i in range(10):
+            self.storage.save_workflow(chain_wf(i))
+        e = self.engine
+        wf0 = self.storage.load_workflow("c0")
+        record = e.start(wf0)
+        record = e.complete(wf0, record["run_id"])  # c1 created
+        for depth in range(1, 8):
+            inst = record["subflow_state"]["instances"][0]
+            crec = self.storage.find_run(inst["run_id"])
+            cwf = self.storage.load_workflow_for_record(crec)
+            record = e.complete(cwf, crec["run_id"])
+        # completing start of c8 would create c9 -> depth limit
+        inst = record["subflow_state"]["instances"][0]
+        crec = self.storage.find_run(inst["run_id"])
+        cwf = self.storage.load_workflow_for_record(crec)
+        with self.assertRaises(RuntimeError):
+            e.complete(cwf, crec["run_id"])
+
+    def test_upstream_revision_redoes_foreach_wholly(self):
+        self._save_child()
+        e, parent = self.engine, foreach_feeder_workflow()
+        self.storage.save_workflow(parent)
+        record = e.start(parent, {"topic": "T"})
+        record = e.complete(parent, record["run_id"])  # start -> prep
+        record = e.complete(
+            parent, record["run_id"],
+            output=[{"outline": "a"}, {"outline": "b"}],
+        )  # prep -> chapters, first instance
+        first_id = record["subflow_state"]["instances"][0]["run_id"]
+        record = _run_child_success(
+            e, self.storage.find_run(first_id), "S1"
+        )
+        second = next(
+            i for i in record["subflow_state"]["instances"]
+            if i["key"] == "1"
+        )
+        record = _run_child_success(
+            e, self.storage.find_run(second["run_id"]), "S2"
+        )
+        # parent is parked at the end node, still running
+
+        # change the feeder task -> foreach node becomes stale
+        record = e.provide(
+            parent, record["run_id"],
+            values={"topic": "新主题"},
+            node_id="prep",
+        )
+        self.assertIn(
+            "chapters", record["revision"]["stale_nodes"]
+        )
+        # redo prep with a fresh list -> foreach node re-entered wholesale
+        record = e.complete(
+            parent, record["run_id"],
+            output=[{"outline": "x"}, {"outline": "y"}],
+        )
+        state = record["subflow_state"]
+        self.assertEqual(
+            [i["status"] for i in state["instances"]],
+            ["running", "pending"],
+        )
+        self.assertNotEqual(
+            state["instances"][0]["run_id"], first_id
+        )
+
+
+# ---- subflow / foreach module-level fixtures ------------------------------
+def chapter_child_workflow():
+    return {
+        "schema_version": "1.0",
+        "id": "chapter-wf",
+        "name": "章节子流程",
+        "input_schema": {
+            "type": "object",
+            "required": ["outline"],
+            "properties": {"outline": {"type": "string"}},
+        },
+        "exports": {"summary": {"type": "string"}},
+        "nodes": [
+            {"id": "start", "type": "start"},
+            {"id": "write", "type": "task", "output_key": "summary",
+             "prompt": "扩写：${outline}"},
+            {"id": "end", "type": "end"},
+        ],
+    }
+
+
+def subflow_parent_workflow():
+    return {
+        "schema_version": "1.0",
+        "id": "book-wf",
+        "name": "分卷",
+        "nodes": [
+            {"id": "start", "type": "start"},
+            {"id": "call", "type": "subflow",
+             "workflow": "chapter-wf",
+             "inputs": {"outline": "主线：革命"},
+             "output_key": "chapter"},
+            {"id": "end", "type": "end"},
+        ],
+        "edges": [
+            {"from": "start", "to": "call"},
+            {"from": "call", "to": "end"},
+        ],
+    }
+
+
+def foreach_parent_workflow():
+    wf = subflow_parent_workflow()
+    wf["nodes"][1] = {
+        "id": "chapters", "type": "foreach",
+        "workflow": "chapter-wf",
+        "items": [{"outline": "第一章"}, {"outline": "第二章"}],
+        "inputs": {"outline": "${item.outline}"},
+        "outputs_key": "results",
+    }
+    wf["edges"] = [
+        {"from": "start", "to": "chapters"},
+        {"from": "chapters", "to": "end"},
+    ]
+    return wf
+
+
+def foreach_inline_parent_workflow():
+    return {
+        "schema_version": "1.0",
+        "id": "inline-book-wf",
+        "name": "内联循环",
+        "nodes": [
+            {"id": "start", "type": "start"},
+            {"id": "batch", "type": "foreach",
+             "items": ["甲", "乙"],
+             "inputs": {"topic": "${item}"},
+             "nodes": [
+                 {"id": "write", "type": "task", "output_key": "summary",
+                  "prompt": "写：${topic}"}
+             ],
+             "exports": ["summary"],
+             "outputs_key": "results"},
+            {"id": "end", "type": "end"},
+        ],
+        "edges": [
+            {"from": "start", "to": "batch"},
+            {"from": "batch", "to": "end"},
+        ],
+    }
+
+
+def chain_wf(i: int):
+    """c0 -> c1 -> ... -> c9 (c9 is plain)."""
+    nodes = [{"id": "start", "type": "start"}]
+    edges = []
+    if i < 9:
+        nodes.append({
+            "id": "call", "type": "subflow",
+            "workflow": f"c{i + 1}",
+            "inputs": {}, "output_key": "r",
+        })
+        edges += [
+            {"from": "start", "to": "call"},
+            {"from": "call", "to": "end"},
+        ]
+    else:
+        edges.append({"from": "start", "to": "end"})
+    nodes.append({"id": "end", "type": "end"})
+    return {
+        "schema_version": "1.0",
+        "id": f"c{i}",
+        "name": f"chain {i}",
+        "nodes": nodes,
+        "edges": edges,
+    }
+
+
+def foreach_feeder_workflow():
+    """start -> prep(task producing the items list) -> chapters(foreach) -> end."""
+    wf = foreach_parent_workflow()
+    wf["nodes"][1]["items"] = {"var": "prep"}
+    wf["nodes"] = [
+        wf["nodes"][0],
+        {"id": "prep", "type": "task", "prompt": "规划：${topic}"},
+        wf["nodes"][1],
+        wf["nodes"][2],
+    ]
+    wf["edges"] = [
+        {"from": "start", "to": "prep"},
+        {"from": "prep", "to": "chapters"},
+        {"from": "chapters", "to": "end"},
+    ]
+    wf["input_schema"] = {
+        "type": "object",
+        "required": ["topic"],
+        "properties": {"topic": {"type": "string"}},
+    }
+    return wf
+
+
+def _run_child_success(engine, child_record, summary_text="摘要"):
+    """Drive a chapter-wf child (start -> write -> end); completing the
+    child end propagates into the parent, which is returned."""
+    child_wf = engine.storage.load_workflow_for_record(child_record)
+    crid = child_record["run_id"]
+    child_record = engine.complete(child_wf, crid)  # start -> write
+    child_record = engine.complete(
+        child_wf, crid, output=summary_text
+    )  # write -> end
+    return engine.complete(child_wf, crid)  # end -> parent
 
 
 if __name__ == "__main__":

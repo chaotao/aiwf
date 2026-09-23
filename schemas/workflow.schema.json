@@ -10,7 +10,7 @@
     "schema_version": { "type": "string", "const": "1.0" },
     "id": {
       "type": "string",
-      "pattern": "^[a-z0-9][a-z0-9_-]*$",
+      "pattern": "^[a-z0-9][a-z0-9_.-]*$",
       "description": "Globally unique workflow id, also the definition file name."
     },
     "name": { "type": "string", "minLength": 1 },
@@ -26,6 +26,10 @@
     "input_schema": {
       "type": "object",
       "description": "JSON Schema (draft-07) validated against run inputs at startup; required keys MUST be provided."
+    },
+    "exports": {
+      "$ref": "#/$defs/exports_map",
+      "description": "Context keys (with optional JSON Schema snippets) returned to the parent when this workflow runs as a subflow. Absent = parent gets status only."
     },
     "nodes": {
       "type": "array",
@@ -47,6 +51,52 @@
     }
   },
   "$defs": {
+    "glob_ref": {
+      "type": "object",
+      "required": ["glob"],
+      "additionalProperties": false,
+      "properties": {
+        "glob": {
+          "type": "string",
+          "minLength": 1,
+          "description": "fnmatch pattern matched against $file output paths, e.g. novel/chapters/*.md"
+        }
+      }
+    },
+    "condition_value": {
+      "oneOf": [
+        { "type": ["string", "number", "boolean", "null"] },
+        {
+          "type": "object",
+          "required": ["var"],
+          "additionalProperties": false,
+          "properties": {
+            "var": { "type": "string", "minLength": 1 },
+            "default": { "description": "Used when the context key is absent." }
+          }
+        }
+      ]
+    },
+    "condition": {
+      "type": "object",
+      "minProperties": 1,
+      "maxProperties": 1,
+      "additionalProperties": false,
+      "patternProperties": {
+        "^(eq|ne|gt|gte|lt|lte)$": {
+          "type": "array",
+          "minItems": 2,
+          "maxItems": 2,
+          "items": { "$ref": "#/$defs/condition_value" }
+        },
+        "^(and|or)$": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/condition" }
+        },
+        "^not$": { "$ref": "#/$defs/condition" }
+      }
+    },
     "review_config": {
       "type": "object",
       "description": "Embedded human acceptance check attached to a task node.",
@@ -67,6 +117,34 @@
         }
       }
     },
+    "inputs_mapping": {
+      "type": "object",
+      "description": "Mapping of child input keys to values; string values support ${var} templates rendered in the parent context.",
+      "additionalProperties": true
+    },
+    "items_source": {
+      "description": "foreach items: a literal array, {var} from parent context, or {$file}. An array means static mode; an object {\"done\":bool,\"items\":[...]} means dynamic mode.",
+      "oneOf": [
+        { "type": "array" },
+        {
+          "type": "object",
+          "required": ["var"],
+          "additionalProperties": false,
+          "properties": { "var": { "type": "string", "minLength": 1 } }
+        },
+        {
+          "type": "object",
+          "required": ["$file"],
+          "additionalProperties": false,
+          "properties": { "$file": { "type": "string", "minLength": 1 } }
+        }
+      ]
+    },
+    "exports_map": {
+      "type": "object",
+      "description": "Export key -> optional JSON Schema snippet used to validate the export at completion.",
+      "additionalProperties": { "type": "object" }
+    },
     "node": {
       "type": "object",
       "required": ["id", "type"],
@@ -75,7 +153,7 @@
         "id": { "type": "string", "minLength": 1 },
         "type": {
           "type": "string",
-          "enum": ["start", "task", "branch", "review", "end"]
+          "enum": ["start", "task", "branch", "review", "end", "subflow", "foreach"]
         },
         "name": { "type": "string", "description": "Human readable name shown in audit records." },
         "prompt": {
@@ -90,9 +168,23 @@
           "type": "object",
           "description": "[task] JSON Schema (draft-07) for information collected FROM THE USER at this node. Missing required keys pause the run until provided."
         },
+        "consumes": {
+          "type": "array",
+          "description": "[task] Explicit data dependencies for cascade revisions: context keys, or {glob} matched against $file paths. Needed when consumption happens by reading files rather than ${var} in the prompt.",
+          "items": {
+            "oneOf": [
+              { "type": "string", "minLength": 1 },
+              { "$ref": "#/$defs/glob_ref" }
+            ]
+          }
+        },
         "output_key": {
           "type": "string",
-          "description": "[task] Context key storing the result. Defaults to node id."
+          "description": "[task|subflow] Context key storing the result. Defaults to node id."
+        },
+        "output_schema": {
+          "type": "object",
+          "description": "[task] JSON Schema (draft-07) the reported output MUST satisfy; non-conforming output is rejected and the node stays open."
         },
         "review": {
           "$ref": "#/$defs/review_config",
@@ -100,12 +192,16 @@
         },
         "routes": {
           "type": "object",
-          "description": "[branch] answer label -> target node id; [review standalone] verdict -> target node id.",
+          "description": "[branch] answer label -> target node id (TRUE/FALSE for when branches); [review standalone] verdict -> target node id.",
           "additionalProperties": { "type": "string" }
         },
         "default": {
           "type": "string",
           "description": "[branch] Target node id when the answer matches no route."
+        },
+        "when": {
+          "$ref": "#/$defs/condition",
+          "description": "[branch] Deterministic condition evaluated by the engine against context; result routes via TRUE/FALSE. No LLM call."
         },
         "requirements": {
           "oneOf": [
@@ -113,6 +209,73 @@
             { "type": "array", "items": { "type": "string" }, "minItems": 1 }
           ],
           "description": "[review standalone] Acceptance criteria. Templates allowed: ${var}."
+        },
+        "workflow": {
+          "type": "string",
+          "minLength": 1,
+          "description": "[subflow|foreach] Id of the workflow definition to invoke. foreach: mutually exclusive with nodes."
+        },
+        "inputs": {
+          "$ref": "#/$defs/inputs_mapping",
+          "description": "[subflow|foreach] Values passed into the child; rendered against parent context (foreach also exposes item/index)."
+        },
+        "items": {
+          "$ref": "#/$defs/items_source",
+          "description": "[foreach] Items to iterate."
+        },
+        "nodes": {
+          "type": "array",
+          "minItems": 1,
+          "description": "[foreach inline] Body nodes; mutually exclusive with workflow. Edges optional (chained if omitted); start/end are added automatically.",
+          "items": { "$ref": "#/$defs/node" }
+        },
+        "edges": {
+          "type": "array",
+          "description": "[foreach inline] Internal edges of the body. Overrides order chaining.",
+          "items": {
+            "type": "object",
+            "required": ["from", "to"],
+            "additionalProperties": false,
+            "properties": {
+              "from": { "type": "string" },
+              "to": { "type": "string" }
+            }
+          }
+        },
+        "as": {
+          "type": "string",
+          "description": "[foreach] Child context key receiving the current item. Defaults: item."
+        },
+        "index_as": {
+          "type": "string",
+          "description": "[foreach] Child context key receiving the current index. Defaults: index."
+        },
+        "outputs_key": {
+          "type": "string",
+          "description": "[foreach] Context key receiving the {$file} results manifest. Defaults to node id."
+        },
+        "exports": {
+          "description": "[foreach inline] Exports: array of keys or key->schema map.",
+          "oneOf": [
+            { "type": "array", "items": { "type": "string" }, "minItems": 1 },
+            { "$ref": "#/$defs/exports_map" }
+          ]
+        },
+        "on_fail": {
+          "type": "string",
+          "enum": ["abort", "continue"],
+          "default": "abort",
+          "description": "[foreach] abort: parent fails on a failed instance (resume retries); continue: keep going, failures stay in the manifest."
+        },
+        "max_instances": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 1000,
+          "description": "[foreach] Fan-out cap to protect dynamic sources."
+        },
+        "id_field": {
+          "type": "string",
+          "description": "[foreach] For object items: field providing the stable instance key."
         }
       },
       "allOf": [
@@ -121,12 +284,34 @@
           "then": { "required": ["prompt"] }
         },
         {
+          "if": {
+            "properties": { "type": { "const": "branch" } },
+            "not": { "required": ["when"] },
+            "required": ["type"]
+          },
+          "then": { "required": ["prompt"] }
+        },
+        {
           "if": { "properties": { "type": { "const": "branch" } }, "required": ["type"] },
-          "then": { "required": ["prompt", "routes"] }
+          "then": { "required": ["routes"] }
         },
         {
           "if": { "properties": { "type": { "const": "review" } }, "required": ["type"] },
           "then": { "required": ["requirements", "routes"] }
+        },
+        {
+          "if": { "properties": { "type": { "const": "subflow" } }, "required": ["type"] },
+          "then": { "required": ["workflow"] }
+        },
+        {
+          "if": { "properties": { "type": { "const": "foreach" } }, "required": ["type"] },
+          "then": {
+            "required": ["items"],
+            "oneOf": [
+              { "required": ["workflow"] },
+              { "required": ["nodes"] }
+            ]
+          }
         }
       ]
     }

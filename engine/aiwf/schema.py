@@ -64,6 +64,13 @@ def validate_workflow(workflow: Dict[str, Any]) -> None:
                     f"{node['type']} node {node['id']!r} must not have outgoing edges; "
                     f"routing is defined by routes/default"
                 )
+            if node["type"] == "branch" and node.get("when") is not None:
+                missing = {"TRUE", "FALSE"} - set(node.get("routes", {}))
+                if missing:
+                    raise ValueError(
+                        f"branch node {node['id']!r} with when needs TRUE/FALSE "
+                        f"routes, missing: {sorted(missing)}"
+                    )
             targets = list(node.get("routes", {}).values())
             if node["type"] == "branch" and "default" in node:
                 targets.append(node["default"])
@@ -99,6 +106,44 @@ def validate_workflow(workflow: Dict[str, Any]) -> None:
                 raise ValueError(
                     f"node {node['id']!r} input_schema must be a JSON Schema object"
                 )
+
+        # inline foreach body: reserved ids, internal edges
+        body = node.get("nodes")
+        if body is not None:
+            if not body:
+                raise ValueError(
+                    f"node {node['id']!r} nodes must not be empty"
+                )
+            body_ids = {n["id"] for n in body}
+            for n in body:
+                if n["id"] in ("start", "end") or n["type"] in ("start", "end"):
+                    raise ValueError(
+                        f"inline body of node {node['id']!r} must not define "
+                        f"start/end (they are wrapped automatically)"
+                    )
+            body_id_list = [n["id"] for n in body]
+            dup_body = {i for i in body_id_list if body_id_list.count(i) > 1}
+            if dup_body:
+                raise ValueError(
+                    f"duplicate inline node ids in {node['id']!r}: "
+                    f"{sorted(dup_body)}"
+                )
+            for edge in node.get("edges", []):
+                for end in ("from", "to"):
+                    if edge[end] not in body_ids:
+                        raise ValueError(
+                            f"inline edge of node {node['id']!r} references "
+                            f"unknown body node: {edge[end]}"
+                        )
+
+    # top-level exports: key -> JSON Schema fragment
+    exports = workflow.get("exports")
+    if exports is not None:
+        if not isinstance(exports, dict):
+            raise ValueError("workflow exports must be an object mapping key -> schema")
+        for key, fragment in exports.items():
+            if not isinstance(fragment, dict):
+                raise ValueError(f"export {key!r} must be a JSON Schema object")
 
 
 def validate_inputs(workflow: Dict[str, Any], inputs: Dict[str, Any]) -> None:

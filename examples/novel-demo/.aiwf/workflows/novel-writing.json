@@ -135,6 +135,7 @@
       "id": "assemble",
       "type": "task",
       "name": "汇总定稿",
+      "consumes": [{ "glob": "novel/chapters/*.md" }],
       "prompt": "读取 novel/chapters/ 目录下全部章节文件，按章号从小到大排序，组装为完整书稿：1) 书名与一句话简介（可参考 ${concept}）；2) 生成目录；3) 正文按序拼接，检查章节衔接。\n写入 novel/full-novel.md；完成后只输出 {\"$file\": \"novel/full-novel.md\"}",
       "review": {
         "requirements": [

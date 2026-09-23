@@ -28,6 +28,7 @@
   "default_model": "可选，给执行 agent 的模型建议",
   "max_steps": 50,
   "input_schema": { "标准 JSON Schema(draft-07)，校验运行启动输入" },
+  "exports": { "可选；作为子流程被调用时回传的 key → 可选 schema 片段" },
   "nodes": [ ... ],
   "edges": [ {"from": "node_a", "to": "node_b"} ]
 }
@@ -42,9 +43,11 @@
 | type | 作用 | 关键字段 |
 |------|------|---------|
 | `start` | 入口（最多一个；省略则从第一个节点开始） | — |
-| `task` | 交给执行 agent 的一个工作步骤；是否调用工具（写文件、查 API）由 agent 自行组织，输出写入 context（大产物写文件、只回引用） | `prompt`、`model`（建议）、`input_schema`（执行前向用户收集的信息）、`output_key`、`review`（执行后人工验收） |
-| `branch` | 执行 agent 回答标签，引擎按 routes 自动决定下一节点，不停顿 | `prompt`、`routes`、`default` |
+| `task` | 交给执行 agent 的一个工作步骤；是否调用工具（写文件、查 API）由 agent 自行组织，输出写入 context（大产物写文件、只回引用） | `prompt`、`model`（建议）、`input_schema`（执行前向用户收集的信息）、`output_key`、`output_schema`（产物契约）、`consumes`（显式依赖）、`review`（执行后人工验收） |
+| `branch` | 执行 agent 回答标签，引擎按 routes 自动决定下一节点，不停顿；配置 `when` 时由引擎确定性求值 | `prompt`、`routes`、`default` 或 `when`、`routes`（TRUE/FALSE） |
 | `review` | 纯人工检查点：流程到此暂停等人验收，本身不产出 | `requirements`、`routes`（APPROVE 去向必须显式给出） |
+| `subflow` | 调用另一个工作流一次，其 exports 回写到 context | `workflow`、`inputs`、`output_key` |
+| `foreach` | 对 items 逐个调用子工作流（v1 仅顺序执行），结果写引擎清单 | `items`、`workflow` 或 `nodes`（内联体）、`inputs`、`outputs_key`、`as`/`index_as`、`on_fail`、`max_instances` |
 | `end` | 显式结束 | — |
 
 ### 模板变量
@@ -97,13 +100,158 @@
 
 branch 和独立 review 都不能再连出 edges，路由完全由 routes/default 决定。
 
+### 产物契约：output_schema（可选）
+
+task 可挂标准 JSON Schema，`complete` 时引擎自动校验上报产物；不合格则**驳回**：
+节点保持 executing、`last_feedback` 写入原因（agent 重新执行，不失败运行、不占用
+人工验收）。适合结构化产物（如 `{"status":"PASS","$file":"..."}`）。
+
+```json
+"output_schema": {
+  "type": "object",
+  "required": ["$file"],
+  "properties": { "$file": { "type": "string" } }
+}
+```
+
+### 显式依赖：consumes（可选）
+
+级联重做的依据是数据依赖。prompt 里的 `${var}` 自动入图；当依赖是通过**读文件**
+发生、prompt 没有引用时，用 `consumes` 显式声明：
+
+```json
+"consumes": ["outline", { "glob": "novel/chapters/*.md" }]
+```
+
+- 字符串：依赖某个 context key，效果等同于在 prompt 引用它。
+- glob：按 `$file` 产物路径匹配（fnmatch），一条声明覆盖任意数量文件，专给
+  「读目录、批量汇总」型节点（如汇总全书）。
+- 追踪边界只是**节点产物**：节点内部改了多少文件都不进图，业务粒度（如哪些测试
+  受影响）由执行 agent 判断并写入产物，引擎只传播「上游产物变了」。
+
+### 确定性条件：when（可选）
+
+确定的判断不要交给 LLM。branch 配 `when` 后由引擎直接对 context 求值，结果走
+TRUE/FALSE 路由；agent 只需对该分支执行 `complete --empty`。
+
+```json
+{
+  "id": "gate", "type": "branch",
+  "when": { "gte": [ { "var": "chapter_count" }, { "var": "target_chapters" } ] },
+  "routes": { "TRUE": "assemble", "FALSE": "write_next" }
+}
+```
+
+操作符：`eq/ne/gt/gte/lt/lte`（两个操作数）、`and/or`（数组）、`not`；操作数为
+字面量或 `{"var":"key"}`（可带 `default`）。典型用途：测试/构建结果（exit code）、
+数量与清单完备性判断。条件引用的计数/状态由执行 agent 写入 context。
+
+## 子工作流与 foreach（v1：仅顺序执行）
+
+用于复用一段流程、或对一批条目重复同一段流程。
+
+### 子流程契约
+
+子流程就是**普通工作流**，外加顶层 `exports` 声明回传什么：
+
+```json
+{
+  "id": "chapter-wf",
+  "input_schema": {
+    "type": "object", "required": ["outline"],
+    "properties": { "outline": { "type": "string" } }
+  },
+  "exports": { "summary": { "type": "string" } },
+  "nodes": [ ... ]
+}
+```
+
+- `input_schema` 复用作父级入参契约；`exports` 为 key→可选 JSON Schema 片段。
+- 子级有**全新 context**：只有父级渲染后的 `inputs`（foreach 额外注入当前 item），
+  不继承父 context、看不到其他实例。
+- 子级走到 end 时引擎按 `exports` 快照校验（缺 key / 不符 schema 即子级失败）。
+
+### 单次调用：subflow
+
+```json
+{
+  "id": "call", "type": "subflow",
+  "workflow": "chapter-wf",
+  "inputs": { "outline": "主线：${topic}" },
+  "output_key": "chapter"
+}
+```
+
+子级 exports 对象写入父 context 的 `output_key`（默认节点 id）。
+
+### 批量循环：foreach
+
+循环体两种写法**二选一**：外引 `"workflow"`，或内联 `"nodes"`（一次性循环体，
+免建子流程文件；可带 `edges`，省略时按序串联，start/end 自动包裹）：
+
+```json
+{
+  "id": "chapters", "type": "foreach",
+  "workflow": "chapter-wf",
+  "items": [ { "outline": "第一章" }, { "outline": "第二章" } ],
+  "inputs": { "outline": "${item.outline}" },
+  "outputs_key": "results"
+}
+```
+
+```json
+{
+  "id": "batch", "type": "foreach",
+  "items": [ "甲", "乙" ],
+  "inputs": { "topic": "${item}" },
+  "nodes": [
+    { "id": "write", "type": "task", "output_key": "summary", "prompt": "写：${topic}" }
+  ],
+  "exports": [ "summary" ],
+  "outputs_key": "results"
+}
+```
+
+- 注入键：item 默认 `item`（可改 `as`），序号默认 `index`（可改 `index_as`）；
+  `id_field` 指定用 item 某字段值作为实例 key（默认用序号）。
+- 结果：引擎把每个实例的 `{key,status,exports}` 写入父运行目录下的
+  `foreach-<node>-results.json`，父 context 只放 `{"$file": 清单路径}`。
+- 内联体是**语法糖**：进入节点时合成子流程定义（id=`<父wf>.<node>`），物化到
+  `children/<node>/subflow.json` 后走同一机制。
+
+### items 三种来源、两种模式
+
+| 来源 | 模式 | 语义 |
+|------|------|------|
+| 字面量数组 | 静态 | 进入节点时快照 |
+| `{"var":"key"}` 指向数组 | 静态 | 同上，值来自 context |
+| `{"$file":"path"}` 指向数组 | 静态 | 同上，值来自文件 |
+| 上述来源指向 `{"done":bool,"items":[...]}` | 动态 | 每实例边界重读；新增条目追加实例，**仅 done=true 且全部结束才收尾** |
+
+动态模式条目只追加；初始为空且未 done 时流程进入 `awaiting_items`，外部补充后
+`aiwf resume` 继续。
+
+### 失败处理与防护
+
+- `on_fail`：`abort`（默认，父运行 failed，resume 重试该实例）；`continue`
+  （失败留在结果清单，继续后续实例）。
+- `max_instances`：默认 1000，超限拒绝（防止失控）。
+- 嵌套深度上限 8 层；`aiwf validate --project` 建跨文件调用图：拒缺失定义、拒环、
+  并检查 `inputs` 是否覆盖子 `input_schema` 的全部 required。
+- 重做/重试**不换目录不换 run_id**：子记录固定在父运行目录
+  `children/<node>/<instance>/`，同 record 内追加审计。
+- 上游修订波及 foreach 节点时，v1 语义=**整体重做**（重新生成全部实例）。
+- 单实例重做：`aiwf redo <run_id> --node <node> --instance <key> --reason ...`
+  （父节点已完成后使用；仅重跑该实例，清单其余保留）。
+
 ## 工作流程（按顺序执行）
 
 1. 与用户澄清：有哪些阶段、每阶段输入来自哪里、哪里需要向用户收集信息、哪里
    需要人工验收、产物如何处理（执行 agent 自己写文件；正文等大产物回 `$file`
    引用，不进记录）。
 2. 编写 JSON 到 `.aiwf/workflows/<id>.json`。
-3. 运行 `aiwf validate <path>`；报错就修改后重试，直到通过。
+3. 运行 `aiwf validate <path>`；定义了 subflow/foreach 时再跑
+   `aiwf validate --project`（跨文件调用图、环、必填入参覆盖）。报错就修改后重试。
 4. 向用户汇报：工作流 id、节点清单、启动所需输入（工作流 input_schema）。
 5. 不要在此场景内直接运行工作流——运行见 [run-workflow.md](run-workflow.md)。
 

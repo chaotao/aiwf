@@ -11,14 +11,23 @@ an external AI agent (and human reviewers) via this protocol:
     provide()  agent supplies user answers for a node's input_schema;
                changing an already-completed node's input auto-opens a revision
     complete() agent reports a task/branch output -> audit, context, routing
+               (task output is checked against output_schema; a branch with
+               `when` is evaluated deterministically by the engine)
     review()   human verdict APPROVE/REJECT on an acceptance gate
     revise()   out-of-plan jump back to a prior task node; the dependency graph
-               closure decides which downstream nodes are redone/reused
-    fail()     agent reports a node failure -> run failed
-    resume()   reopen a failed run
+               (${var} refs plus explicit consumes, glob-aware) decides which
+               downstream nodes are redone/reused
+    fail()     agent reports a node failure -> run failed (propagates to parent)
+    resume()   reopen a failed run / nudge a dynamic foreach
+    redo()     reopen a single foreach instance (or one subflow call)
+
+subflow node  invokes another workflow once; foreach node fans the same
+workflow (external def or inline nodes) out over an items list. Every child
+run is a normal run, nested physically inside the parent run folder.
 
 Persistence is the JSON run record, rewritten after every transition.
 """
+import fnmatch
 import json
 import os
 import re
@@ -41,6 +50,9 @@ SUMMARY_LIMIT = 160
 OUTPUT_LIMIT = 2000
 # Marker key of a file reference object: {"$file": "path/relative/to/project"}.
 FILE_REF_KEY = "$file"
+# Maximum nesting depth of subflow chains.
+MAX_SUBFLOW_DEPTH = 8
+DEFAULT_MAX_INSTANCES = 1000
 TEMPLATE_RE = re.compile(r"\$\{\s*([A-Za-z_][A-Za-z0-9_]*)\s*\}")
 
 
@@ -127,6 +139,55 @@ def make_summary(output: Any) -> str:
     return text[:SUMMARY_LIMIT]
 
 
+# ---- deterministic condition language (branch `when`) --------------------
+COMPARISON_OPS = {
+    "eq": lambda a, b: a == b,
+    "ne": lambda a, b: a != b,
+    "gt": lambda a, b: a > b,
+    "gte": lambda a, b: a >= b,
+    "lt": lambda a, b: a < b,
+    "lte": lambda a, b: a <= b,
+}
+
+
+def resolve_condition_value(value: Any, context: Dict[str, Any]) -> Any:
+    """Literal, or {"var": "key"} read from context (optional default)."""
+    if isinstance(value, dict) and "var" in value:
+        key = value["var"]
+        if key not in context:
+            if "default" in value:
+                return value["default"]
+            raise KeyError(f"condition variable {key!r} not found in workflow context")
+        return context[key]
+    return value
+
+
+def eval_condition(cond: Dict[str, Any], context: Dict[str, Any]) -> bool:
+    """Evaluate a one-operator condition tree against context.
+
+    Operators: eq/ne/gt/gte/lt/lte (two operands), and/or (lists), not.
+    This is plain deterministic evaluation, never an LLM call.
+    """
+    if not isinstance(cond, dict) or len(cond) != 1:
+        raise ValueError("condition must be an object with exactly one operator")
+    (op, arg), = cond.items()
+    if op in COMPARISON_OPS:
+        a, b = arg
+        return bool(
+            COMPARISON_OPS[op](
+                resolve_condition_value(a, context),
+                resolve_condition_value(b, context),
+            )
+        )
+    if op == "and":
+        return all(eval_condition(c, context) for c in arg)
+    if op == "or":
+        return any(eval_condition(c, context) for c in arg)
+    if op == "not":
+        return not eval_condition(arg, context)
+    raise ValueError(f"unknown condition operator: {op!r}")
+
+
 def normalize_answer(raw: Any) -> str:
     """First line, keep alnum/underscore, uppercase. 'PASS.' -> 'PASS'."""
     lines = str(raw).strip().splitlines()
@@ -183,34 +244,166 @@ class WorkflowEngine:
     def produced_keys(node: Dict[str, Any]) -> List[str]:
         if node["type"] == "task":
             return [node.get("output_key", node["id"])]
+        if node["type"] == "subflow":
+            return [node.get("output_key", node["id"])]
+        if node["type"] == "foreach":
+            return [node.get("outputs_key", node["id"])]
         return []
 
     def dependency_graph(
         self, workflow: Dict[str, Any]
-    ) -> Tuple[Dict[str, Set[str]], Dict[str, Set[str]]]:
-        """Return (node -> referenced context keys, context key -> consuming nodes)."""
+    ) -> Tuple[
+        Dict[str, Set[str]], Dict[str, Set[str]], Dict[str, Set[str]]
+    ]:
+        """Return (node -> referenced context keys, context key -> consuming
+        nodes, glob pattern -> consuming nodes).
+
+        Refs come from ${var} in prompts/requirements AND explicit consumes
+        declarations; glob entries land in the third mapping and are matched
+        against $file output paths at revision time.
+        """
         refs: Dict[str, Set[str]] = {}
         consumers: Dict[str, Set[str]] = {}
+        glob_consumers: Dict[str, Set[str]] = {}
         for node in workflow["nodes"]:
             nrefs: Set[str] = set()
             if node["type"] in ("task", "branch"):
                 nrefs.update(template_refs(node.get("prompt", "")))
-            if node["type"] == "task" and node.get("review"):
-                nrefs.update(template_refs(node["review"].get("requirements")))
+            if node["type"] == "task":
+                if node.get("review"):
+                    nrefs.update(template_refs(node["review"].get("requirements")))
+                for item in node.get("consumes", []):
+                    if isinstance(item, str):
+                        nrefs.add(item)
+                    else:  # {"glob": "..."}
+                        glob_consumers.setdefault(item["glob"], set()).add(node["id"])
             if node["type"] == "review":
                 nrefs.update(template_refs(node.get("requirements")))
+            if node["type"] in ("subflow", "foreach"):
+                nrefs.update(template_refs(node.get("inputs", {})))
+            if node["type"] == "foreach":
+                items_src = node.get("items")
+                if isinstance(items_src, dict) and "var" in items_src:
+                    nrefs.add(items_src["var"])
             refs[node["id"]] = nrefs
             for key in nrefs:
                 consumers.setdefault(key, set()).add(node["id"])
-        return refs, consumers
+        return refs, consumers, glob_consumers
 
-    def stale_closure(self, workflow: Dict[str, Any], changed_keys: Set[str]) -> Set[str]:
-        """Nodes whose output may change when changed_keys change (transitive)."""
-        _, consumers = self.dependency_graph(workflow)
+    # ---- project-wide validation: call graph + contracts -------------
+    def validate_project(self) -> Dict[str, Any]:
+        """Validate every stored definition and the subflow call graph:
+        missing refs, cycles, and required-input coverage."""
+        defs: Dict[str, Dict[str, Any]] = {
+            i: self.storage.load_workflow(i)
+            for i in self.storage.list_workflows()
+        }
+        for wf in defs.values():
+            validate_workflow(wf)
+
+        graph: Dict[str, set] = {wid: set() for wid in defs}
+        queue = list(defs.values())
+        while queue:
+            wf = queue.pop()
+            for node in wf["nodes"]:
+                if node["type"] not in ("subflow", "foreach"):
+                    continue
+                if node.get("workflow"):
+                    ref = node["workflow"]
+                    if ref not in defs:
+                        raise ValueError(
+                            f"workflow {wf['id']!r} node {node['id']!r} calls "
+                            f"missing workflow {ref!r}"
+                        )
+                    child = defs[ref]
+                else:
+                    child = self._synthesize_inline(wf, node)
+                    if child["id"] not in defs:
+                        defs[child["id"]] = child
+                        graph[child["id"]] = set()
+                        queue.append(child)
+                graph[wf["id"]].add(child["id"])
+                self._check_inputs_cover(wf, node, child)
+
+        self._assert_acyclic(graph)
+        return {
+            "workflows": sorted(defs),
+            "edges": {k: sorted(v) for k, v in graph.items() if v},
+        }
+
+    @staticmethod
+    def _check_inputs_cover(
+        parent_wf: Dict[str, Any],
+        node: Dict[str, Any],
+        child_wf: Dict[str, Any],
+    ) -> None:
+        provided = set((node.get("inputs") or {}).keys())
+        if node["type"] == "foreach":
+            provided.add(node.get("as", "item"))
+            provided.add(node.get("index_as", "index"))
+        required = set((child_wf.get("input_schema") or {}).get("required", []))
+        missing = required - provided
+        if missing:
+            raise ValueError(
+                f"node {parent_wf['id']!r}.{node['id']!r} does not map "
+                f"required inputs {sorted(missing)} of {child_wf['id']!r}"
+            )
+
+    @staticmethod
+    def _assert_acyclic(graph: Dict[str, set]) -> None:
+        WHITE, GREY, BLACK = 0, 1, 2
+        color = {k: WHITE for k in graph}
+
+        def visit(node: str, trail: List[str]) -> None:
+            color[node] = GREY
+            for nxt in sorted(graph.get(node, ())):
+                if color[nxt] == GREY:
+                    cycle = trail[trail.index(nxt):] + [nxt]
+                    raise ValueError(
+                        f"subflow call cycle: {' -> '.join(cycle)}"
+                    )
+                if color[nxt] == WHITE:
+                    visit(nxt, trail + [nxt])
+            color[node] = BLACK
+
+        for node in sorted(graph):
+            if color[node] == WHITE:
+                visit(node, [node])
+
+    def stale_closure(
+        self,
+        workflow: Dict[str, Any],
+        changed_keys: Set[str],
+        context: Optional[Dict[str, Any]] = None,
+    ) -> Set[str]:
+        """Nodes whose output may change when changed_keys change (transitive).
+
+        Glob consumers are matched against the current $file paths found in
+        context, so batch consumers (e.g. "assemble all chapters") are marked
+        stale when one of their input files changes.
+        """
+        _, consumers, glob_consumers = self.dependency_graph(workflow)
+        context = context or {}
         affected: Set[str] = set()
         pending = set(changed_keys)
+
+        def match_globs(key: str) -> None:
+            path = file_ref_path(context.get(key))
+            if path is None:
+                return
+            for pattern, nodes in glob_consumers.items():
+                if not fnmatch.fnmatch(path, pattern):
+                    continue
+                for node_id in nodes:
+                    if node_id in affected:
+                        continue
+                    affected.add(node_id)
+                    node = self._node(workflow, node_id)
+                    pending.update(self.produced_keys(node))
+
         while pending:
             key = pending.pop()
+            match_globs(key)
             for node_id in consumers.get(key, ()):  # type: ignore[union-attr]
                 if node_id in affected:
                     continue
@@ -229,6 +422,583 @@ class WorkflowEngine:
                     seen.add(nxt)
                     stack.append(nxt)
         return seen
+
+    # ---- subflow / foreach machinery ---------------------------------
+    @staticmethod
+    def _make_instance(key: str, index: int) -> Dict[str, Any]:
+        return {
+            "key": key, "index": index, "status": "pending", "run_id": None,
+            "started_at": None, "ended_at": None, "error": None, "exports": {},
+        }
+
+    def _instance_key(
+        self, node: Dict[str, Any], index: int, item: Any
+    ) -> str:
+        id_field = node.get("id_field")
+        if id_field and isinstance(item, dict) and id_field in item:
+            return str(item[id_field])
+        return str(index)
+
+    def _new_single_state(
+        self, node: Dict[str, Any], child_wf: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        return {
+            "node_id": node["id"], "status": "active", "kind": "single",
+            "subflow_id": child_wf["id"], "inline": False,
+            "items_mode": None, "items_source": None,
+            "as": "item", "index_as": "index", "id_field": None,
+            "cursor": 0, "total_seen": 1, "done": False,
+            "returning": False, "on_fail": "abort",
+            "output_key": node.get("output_key", node["id"]),
+            "instances": [self._make_instance("0", 0)],
+        }
+
+    def _new_foreach_state(
+        self, node: Dict[str, Any], child_wf: Dict[str, Any],
+        items_mode: str, items: list, done: bool
+    ) -> Dict[str, Any]:
+        instances = [
+            self._make_instance(self._instance_key(node, i, item), i)
+            for i, item in enumerate(items)
+        ]
+        return {
+            "node_id": node["id"], "status": "active", "kind": "foreach",
+            "subflow_id": child_wf["id"], "inline": bool(node.get("nodes")),
+            "items_mode": items_mode, "items_source": node["items"],
+            "as": node.get("as", "item"),
+            "index_as": node.get("index_as", "index"),
+            "id_field": node.get("id_field"),
+            "cursor": 0, "total_seen": len(items), "done": done,
+            "returning": False, "on_fail": node.get("on_fail", "abort"),
+            "output_key": node.get("outputs_key", node["id"]),
+            "instances": instances,
+        }
+
+    def _resolve_items(
+        self, node: Dict[str, Any], ctx: Dict[str, Any]
+    ) -> Tuple[str, list, bool]:
+        """Return (mode, items, done). Array source = static; an object
+        {"done":bool,"items":[...]} = dynamic."""
+        src = node["items"]
+        if isinstance(src, list):
+            value: Any = src
+        elif isinstance(src, dict) and "var" in src:
+            key = src["var"]
+            if key not in ctx:
+                raise KeyError(f"items variable {key!r} not found in context")
+            value = ctx[key]
+        elif isinstance(src, dict) and "$file" in src:
+            value = self.storage.read_json_file(src["$file"])
+        else:
+            raise ValueError("unsupported items source; use an array, {var} or {$file}")
+        if isinstance(value, list):
+            return "static", value, False
+        if isinstance(value, dict) and isinstance(value.get("items"), list):
+            return "dynamic", value["items"], bool(value.get("done", False))
+        raise ValueError("items source must be an array or {\"done\":...,\"items\":[...]}")
+
+    def _merge_items(
+        self, state: Dict[str, Any], items: list, done: bool,
+        node: Dict[str, Any]
+    ) -> None:
+        """Dynamic boundary: append pending instances for newly added items."""
+        cap = node.get("max_instances", DEFAULT_MAX_INSTANCES)
+        if len(items) > cap:
+            raise ValueError(
+                f"items count {len(items)} exceeds max_instances {cap}"
+            )
+        existing = state["instances"]
+        if len(items) > len(existing):
+            for i in range(len(existing), len(items)):
+                existing.append(
+                    self._make_instance(self._instance_key(node, i, items[i]), i)
+                )
+        state["total_seen"] = len(items)
+        state["done"] = done
+
+    @staticmethod
+    def _find_instance(
+        state: Dict[str, Any], key: str
+    ) -> Dict[str, Any]:
+        inst = next(
+            (i for i in state["instances"] if i["key"] == str(key)), None
+        )
+        if inst is None:
+            raise RuntimeError(
+                f"instance {key!r} not found in node {state['node_id']!r}"
+            )
+        return inst
+
+    @staticmethod
+    def _active_instance(state: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        inst = next((i for i in state["instances"] if i["status"] == "running"), None)
+        if inst:
+            return inst
+        return next((i for i in state["instances"] if i["status"] == "pending"), None)
+
+    @staticmethod
+    def _next_pending(state: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        return next((i for i in state["instances"] if i["status"] == "pending"), None)
+
+    # ---- definition loading / inline synthesis -----------------------
+    def _load_or_synthesize_child(
+        self,
+        parent_workflow: Dict[str, Any],
+        parent_record: Dict[str, Any],
+        node: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        if node.get("workflow"):
+            child_wf = self.storage.load_workflow(node["workflow"])
+            validate_workflow(child_wf)
+            return child_wf
+        child_wf = self._synthesize_inline(parent_workflow, node)
+        self.storage.write_json_file(
+            self.storage.inline_subflow_path(parent_record, node["id"]),
+            child_wf,
+        )
+        return child_wf
+
+    def _synthesize_inline(
+        self, parent_workflow: Dict[str, Any], node: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        body = node["nodes"]
+        raw_exports = node.get("exports")
+        if isinstance(raw_exports, list):
+            exports_map = {k: {} for k in raw_exports}
+        else:
+            exports_map = dict(raw_exports or {})
+        input_keys = list((node.get("inputs") or {}).keys())
+        wf = {
+            "schema_version": "1.0",
+            "id": f'{parent_workflow["id"]}.{node["id"]}',
+            "name": f'inline:{node["id"]}',
+            "input_schema": {
+                "type": "object",
+                "properties": {k: {} for k in input_keys},
+                "required": input_keys,
+            },
+            "exports": exports_map,
+            "nodes": (
+                [{"id": "start", "type": "start"}]
+                + [dict(n) for n in body]
+                + [{"id": "end", "type": "end"}]
+            ),
+            "edges": self._synthesized_edges(node, body),
+        }
+        validate_workflow(wf)
+        return wf
+
+    @staticmethod
+    def _synthesized_edges(
+        node: Dict[str, Any], body: List[Dict[str, Any]]
+    ) -> List[Dict[str, str]]:
+        first_id, last_id = body[0]["id"], body[-1]["id"]
+        raw = node.get("edges")
+        if raw:
+            edges = [dict(e) for e in raw]
+        else:
+            edges = [
+                {"from": body[i]["id"], "to": body[i + 1]["id"]}
+                for i in range(len(body) - 1)
+            ]
+        pairs = {(e["from"], e["to"]) for e in edges}
+        if ("start", first_id) not in pairs:
+            edges.append({"from": "start", "to": first_id})
+        if (last_id, "end") not in pairs:
+            edges.append({"from": last_id, "to": "end"})
+        return edges
+
+    def _child_wf_for_state(
+        self,
+        workflow: Dict[str, Any],
+        record: Dict[str, Any],
+        node: Dict[str, Any],
+        state: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        if state["inline"]:
+            return self.storage.read_json_file(
+                self.storage.inline_subflow_path(record, node["id"])
+            )
+        child_wf = self.storage.load_workflow(state["subflow_id"])
+        validate_workflow(child_wf)
+        return child_wf
+
+    def _item_at(
+        self, node: Dict[str, Any], ctx: Dict[str, Any], index: int
+    ) -> Any:
+        _mode, items, _done = self._resolve_items(node, ctx)
+        return items[index]
+
+    # ---- chain guards -------------------------------------------------
+    def _assert_chain_ok(
+        self, parent_record: Dict[str, Any], child_wf_id: str
+    ) -> None:
+        cur = parent_record
+        seen: Set[str] = set()
+        depth = 0
+        while True:
+            if cur["workflow_id"] == child_wf_id:
+                raise RuntimeError(
+                    f"subflow cycle: {child_wf_id!r} already running in "
+                    f"the parent chain"
+                )
+            parent = cur.get("parent")
+            if not parent:
+                return
+            if parent["run_id"] in seen:
+                raise RuntimeError("subflow parent chain is cyclic")
+            seen.add(parent["run_id"])
+            depth += 1
+            if depth >= MAX_SUBFLOW_DEPTH:
+                raise RuntimeError(
+                    f"subflow nesting depth exceeds {MAX_SUBFLOW_DEPTH}"
+                )
+            cur = self.storage.find_run(parent["run_id"])
+
+    # ---- instance start / completion ----------------------------------
+    def _begin_instance(
+        self,
+        workflow: Dict[str, Any],
+        record: Dict[str, Any],
+        node: Dict[str, Any],
+        state: Dict[str, Any],
+        inst: Dict[str, Any],
+    ) -> None:
+        child_wf = self._child_wf_for_state(workflow, record, node, state)
+        scope = dict(record["context"])
+        if state["kind"] == "foreach":
+            item_value = self._item_at(
+                node, record["context"], inst["index"]
+            )
+            scope[state["as"]] = item_value
+            scope[state["index_as"]] = inst["index"]
+        resolved = render(node.get("inputs", {}), scope)
+        if state["kind"] == "foreach":
+            # the current item is part of the child contract context
+            resolved[state["as"]] = item_value
+            resolved[state["index_as"]] = inst["index"]
+        validate_inputs(child_wf, resolved)
+        self._assert_chain_ok(record, child_wf["id"])
+
+        run_id = inst["run_id"] or make_run_id()
+        inst.update(
+            run_id=run_id, status="running", started_at=now_iso(),
+            error=None, exports={},
+        )
+        link = {
+            "workflow_id": record["workflow_id"],
+            "run_id": record["run_id"],
+            "node_id": node["id"],
+            "instance": inst["key"],
+        }
+        self._append_event(
+            record, "subflow_started", node_id=node["id"],
+            instance=inst["key"], child_run_id=run_id,
+        )
+        self._save(workflow, record)
+
+        child_record = self._new_child_record(
+            child_wf, resolved, run_id, link
+        )
+        self._enter_node(child_wf, child_record)
+
+    def _new_child_record(
+        self,
+        child_wf: Dict[str, Any],
+        resolved: Dict[str, Any],
+        run_id: str,
+        link: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        record = {
+            "schema_version": SCHEMA_VERSION,
+            "run_id": run_id,
+            "workflow_id": child_wf["id"],
+            "status": "running",
+            "phase": "executing",
+            "started_at": now_iso(),
+            "ended_at": None,
+            "duration_ms": None,
+            "inputs": resolved,
+            "context": dict(resolved),
+            "next_node": self.start_node_id(child_wf),
+            "node_started_at": None,
+            "error": None,
+            "last_feedback": None,
+            "pending_review": None,
+            "revision": None,
+            "node_runs": [],
+            "events": [],
+            "parent": link,
+            "subflow_state": None,
+        }
+        self._append_event(record, "run_started")
+        return record
+
+    def _collect_exports(
+        self, workflow: Dict[str, Any], record: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        spec = workflow.get("exports") or {}
+        exports: Dict[str, Any] = {}
+        for key, schema in spec.items():
+            if key not in record["context"]:
+                raise KeyError(f"export {key!r} missing from child context")
+            value = record["context"][key]
+            if schema:
+                _jsonschema_validate(value, schema)
+            exports[key] = value
+        return exports
+
+    def _propagate_child_success(
+        self,
+        child_wf: Dict[str, Any],
+        child_record: Dict[str, Any],
+        ended: datetime,
+        exports: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        self._complete(child_wf, child_record)
+        link = child_record["parent"]
+        parent_record = self.storage.find_run(link["run_id"])
+        parent_wf = self.storage.load_workflow_for_record(parent_record)
+        node = self._node(parent_wf, link["node_id"])
+        state = parent_record["subflow_state"]
+        inst = self._find_instance(state, link["instance"])
+        inst.update(
+            status="success", ended_at=child_record["ended_at"],
+            error=None, exports=exports,
+        )
+        self._append_event(
+            parent_record, "instance_completed", node_id=node["id"],
+            instance=inst["key"], child_run_id=child_record["run_id"],
+        )
+        if state["kind"] == "single":
+            return self._finish_subflow_node(
+                parent_wf, parent_record, node, state
+            )
+        return self._advance_foreach(parent_wf, parent_record, node, state)
+
+    def _propagate_child_failure(
+        self,
+        child_wf: Dict[str, Any],
+        child_record: Dict[str, Any],
+        message: str,
+    ) -> Dict[str, Any]:
+        self._fail(child_wf, child_record, message)
+        link = child_record["parent"]
+        parent_record = self.storage.find_run(link["run_id"])
+        parent_wf = self.storage.load_workflow_for_record(parent_record)
+        node = self._node(parent_wf, link["node_id"])
+        state = parent_record["subflow_state"]
+        inst = self._find_instance(state, link["instance"])
+        err = re.sub(r"\s+", " ", message).strip()[:300]
+        inst.update(
+            status="failed", ended_at=child_record["ended_at"], error=err
+        )
+        self._append_event(
+            parent_record, "instance_failed", node_id=node["id"],
+            instance=inst["key"], child_run_id=child_record["run_id"],
+            reason=err,
+        )
+        if state["kind"] == "single" or state.get("on_fail", "abort") == "abort":
+            return self._fail(
+                parent_wf, parent_record,
+                f"subflow node {node['id']} instance {inst['key']} failed: {err}",
+            )
+        return self._advance_foreach(parent_wf, parent_record, node, state)
+
+    def _advance_foreach(
+        self,
+        parent_wf: Dict[str, Any],
+        parent_record: Dict[str, Any],
+        node: Dict[str, Any],
+        state: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        if state.get("returning"):
+            return self._finish_foreach_node(
+                parent_wf, parent_record, node, state
+            )
+        mode, items, done = self._resolve_items(node, parent_record["context"])
+        if mode == "dynamic":
+            self._merge_items(state, items, done, node)
+        nxt = self._next_pending(state)
+        if nxt is not None:
+            self._save(parent_wf, parent_record)
+            self._begin_instance(parent_wf, parent_record, node, state, nxt)
+            return parent_record
+        if state["items_mode"] == "dynamic" and not state["done"]:
+            parent_record["phase"] = "awaiting_items"
+            self._save(parent_wf, parent_record)
+            return parent_record
+        return self._finish_foreach_node(parent_wf, parent_record, node, state)
+
+    def _finish_foreach_node(
+        self,
+        parent_wf: Dict[str, Any],
+        parent_record: Dict[str, Any],
+        node: Dict[str, Any],
+        state: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        payload = {
+            "items": [
+                {"key": i["key"], "status": i["status"], "exports": i["exports"]}
+                for i in state["instances"]
+            ]
+        }
+        path = self.storage.results_manifest_path(parent_record, node["id"])
+        self.storage.write_json_file(path, payload)
+        output = {"$file": path}
+        parent_record["context"][node.get("outputs_key", node["id"])] = output
+        return self._finish_subflow_node(
+            parent_wf, parent_record, node, state, output
+        )
+
+    def _finish_subflow_node(
+        self,
+        parent_wf: Dict[str, Any],
+        parent_record: Dict[str, Any],
+        node: Dict[str, Any],
+        state: Dict[str, Any],
+        output: Any = None,
+    ) -> Dict[str, Any]:
+        if output is None:  # single call: exports land under output_key
+            output = state["instances"][0]["exports"]
+            parent_record["context"][
+                node.get("output_key", node["id"])
+            ] = output
+        state["status"] = "completed"
+        state["done"] = True
+        parent_record["phase"] = "executing"
+        parent_record["next_node"] = node["id"]
+        ended = datetime.now()
+        parent_record["node_runs"].append(
+            self._node_run(
+                node, parent_record, "success", ended, output, None, None, None
+            )
+        )
+        rev = self._active_revision(parent_record)
+        if rev and node["id"] in rev["stale_nodes"]:
+            rev["redone_nodes"].append(node["id"])
+            if (
+                rev["mode"] != "return"
+                and set(rev["redone_nodes"]) == set(rev["stale_nodes"])
+            ):
+                self._close_revision(parent_record)
+        parent_record["subflow_state"] = state
+        self._advance(parent_wf, parent_record, node, None)
+        return parent_record
+
+    def _activate_subflow_node(
+        self,
+        workflow: Dict[str, Any],
+        record: Dict[str, Any],
+        node: Dict[str, Any],
+    ) -> None:
+        state = record.get("subflow_state")
+        if state and state.get("status") == "active" and state["node_id"] == node["id"]:
+            self._reconcile_state(workflow, record, node, state)
+            return
+        self._start_subflow_node(workflow, record, node)
+
+    def _start_subflow_node(
+        self,
+        workflow: Dict[str, Any],
+        record: Dict[str, Any],
+        node: Dict[str, Any],
+    ) -> None:
+        if node["type"] == "subflow":
+            child_wf = self.storage.load_workflow(node["workflow"])
+            validate_workflow(child_wf)
+            state = self._new_single_state(node, child_wf)
+        else:
+            items_mode, items, done = self._resolve_items(
+                node, record["context"]
+            )
+            cap = node.get("max_instances", DEFAULT_MAX_INSTANCES)
+            if len(items) > cap:
+                raise ValueError(
+                    f"items count {len(items)} exceeds max_instances {cap}"
+                )
+            child_wf = self._load_or_synthesize_child(
+                workflow, record, node
+            )
+            state = self._new_foreach_state(
+                node, child_wf, items_mode, items, done
+            )
+            if not items and (items_mode == "static" or done):
+                record["subflow_state"] = state
+                self._finish_foreach_node(workflow, record, node, state)
+                return
+            if not items:  # dynamic source, not done yet
+                record["subflow_state"] = state
+                record["phase"] = "awaiting_items"
+                self._save(workflow, record)
+                return
+        record["subflow_state"] = state
+        self._save(workflow, record)
+        self._begin_instance(
+            workflow, record, node, state, state["instances"][0]
+        )
+
+    def _reconcile_state(
+        self,
+        workflow: Dict[str, Any],
+        record: Dict[str, Any],
+        node: Dict[str, Any],
+        state: Dict[str, Any],
+    ) -> bool:
+        """Crash recovery at a parent node. Return True when the run moved."""
+        inst = self._active_instance(state)
+        if inst is None or not inst.get("run_id"):
+            if inst is not None:
+                self._begin_instance(workflow, record, node, state, inst)
+                return True
+            if state["kind"] == "single":
+                self._begin_instance(
+                    workflow, record, node, state, state["instances"][0]
+                )
+                return True
+            # foreach with zero instances: evaluate the boundary; starting
+            # a new instance counts as moved, settling on awaiting_items does not
+            self._advance_foreach(workflow, record, node, state)
+            fresh = self._active_instance(state)
+            return bool(fresh and fresh.get("run_id"))
+        try:
+            child_record = self.storage.find_run(inst["run_id"])
+        except FileNotFoundError:
+            inst.update(status="pending", run_id=None)
+            self._begin_instance(workflow, record, node, state, inst)
+            return True
+        child_wf = self.storage.load_workflow_for_record(child_record)
+        if child_record["status"] == "completed":
+            if inst["status"] != "success":
+                exports = self._collect_exports(child_wf, child_record)
+                self._propagate_child_success(
+                    child_wf, child_record, datetime.now(), exports
+                )
+            elif state["kind"] == "single":
+                self._finish_subflow_node(workflow, record, node, state)
+            else:
+                self._advance_foreach(workflow, record, node, state)
+            return True
+        if child_record["status"] == "failed":
+            if inst["status"] != "failed":
+                self._propagate_child_failure(
+                    child_wf, child_record,
+                    child_record.get("error") or "child run failed",
+                )
+            elif state["kind"] == "single" or state.get("on_fail") == "abort":
+                self._fail(
+                    workflow, record,
+                    f"subflow node {node['id']} instance {inst['key']} failed: "
+                    f"{inst['error']}",
+                )
+            else:
+                self._advance_foreach(workflow, record, node, state)
+            return True
+        # child genuinely running: nothing changed
+        if record["phase"] == "awaiting_items":
+            record["phase"] = "executing"
+            self._save(workflow, record)
+        return False
 
     # ---- protocol: start / resume ------------------------------------
     def start(
@@ -259,6 +1029,8 @@ class WorkflowEngine:
             "revision": None,
             "node_runs": [],
             "events": [],
+            "parent": None,
+            "subflow_state": None,
         }
         self._append_event(record, "run_started")
         self._enter_node(workflow, record)
@@ -269,6 +1041,19 @@ class WorkflowEngine:
         record = self.storage.load_run(workflow["id"], run_id)
         if record["status"] == "completed":
             raise RuntimeError(f"run {run_id} is already completed")
+        state = record.get("subflow_state")
+        node = (
+            self._node(workflow, state["node_id"])
+            if state and state.get("node_id") else None
+        )
+        if record["phase"] == "awaiting_items":
+            if node is None:
+                raise RuntimeError("invalid awaiting_items state")
+            record["phase"] = "executing"
+            record["error"] = None
+            self._append_event(record, "run_resumed")
+            self._save(workflow, record)
+            return self._advance_foreach(workflow, record, node, state)
         if not record.get("next_node"):
             raise RuntimeError(f"run {run_id} has no next_node to resume from")
         record["status"] = "running"
@@ -276,6 +1061,21 @@ class WorkflowEngine:
         self._append_event(record, "run_resumed")
         # phase/pending state already describes the node; only reset its timer
         record["node_started_at"] = now_iso()
+        # a failed instance of the active subflow node: reopen the child too
+        if state and state.get("status") == "active":
+            failed = next(
+                (i for i in state["instances"] if i["status"] == "failed"), None
+            )
+            if failed and failed.get("run_id"):
+                child_record = self.storage.find_run(failed["run_id"])
+                child_record["status"] = "running"
+                child_record["error"] = None
+                self._append_event(child_record, "run_resumed")
+                failed.update(
+                    status="running", error=None, started_at=now_iso()
+                )
+                child_wf = self.storage.load_workflow_for_record(child_record)
+                self._save(child_wf, child_record)
         self._save(workflow, record)
         return record
 
@@ -296,6 +1096,14 @@ class WorkflowEngine:
             return envelope
 
         node = self._node(workflow, current)
+        state = record.get("subflow_state")
+        if (
+            state and state.get("status") == "active"
+            and state.get("node_id") == current
+        ):
+            moved = self._reconcile_state(workflow, record, node, state)
+            if moved:
+                return self.node_spec(workflow, record)
 
         if record["phase"] == "awaiting_input":
             envelope["input_request"] = self._input_request(node, record["context"])
@@ -326,6 +1134,7 @@ class WorkflowEngine:
                 model_hint=node.get("model") or workflow.get("default_model"),
                 prompt=render(node.get("prompt", ""), ctx),
                 output_key=node.get("output_key", node["id"]),
+                output_schema=node.get("output_schema"),
                 previous_output=self._last_output(record, node["id"]),
                 feedback=record.get("last_feedback"),
                 under_revision=bool(self._active_revision(record)),
@@ -337,8 +1146,69 @@ class WorkflowEngine:
                 routes=node.get("routes", {}),
                 default=node.get("default"),
             )
+            if node.get("when"):
+                spec.update(deterministic=True, when=node["when"])
+        elif ntype in ("subflow", "foreach"):
+            state = record.get("subflow_state")
+            spec["subflow_ref"] = node.get("workflow")
+            spec["inline"] = bool(node.get("nodes"))
+            try:  # foreach ${item} is not in the parent context -> raw
+                spec["inputs"] = render(node.get("inputs", {}), ctx)
+            except KeyError:
+                spec["inputs"] = node.get("inputs", {})
+            if ntype == "subflow":
+                spec["output_key"] = node.get("output_key", node["id"])
+            else:
+                spec.update(
+                    items=self._items_preview(node, ctx),
+                    as_=node.get("as", "item"),
+                    index_as=node.get("index_as", "index"),
+                    id_field=node.get("id_field"),
+                    outputs_key=node.get("outputs_key", node["id"]),
+                    on_fail=node.get("on_fail", "abort"),
+                    max_instances=node.get(
+                        "max_instances", DEFAULT_MAX_INSTANCES
+                    ),
+                )
+            if state and state.get("node_id") == node["id"]:
+                done_n = sum(
+                    1 for i in state["instances"] if i["status"] == "success"
+                )
+                spec["subflow_state"] = {
+                    "subflow_id": state["subflow_id"],
+                    "status": state["status"],
+                    "progress": f"{done_n}/{len(state['instances'])}",
+                    "items_mode": state["items_mode"],
+                }
+                inst = self._active_instance(state)
+                if (
+                    inst and inst.get("run_id")
+                    and state.get("status") == "active"
+                ):
+                    spec["child"] = {
+                        "run_id": inst["run_id"],
+                        "instance": inst["key"],
+                        "index": inst["index"],
+                    }
+            if record["phase"] == "awaiting_items":
+                spec["message"] = (
+                    "dynamic items source has no pending items; append items "
+                    "(or set done=true), then `aiwf resume`"
+                )
         # start / end: id/type/name only
         return spec
+
+    def _items_preview(
+        self, node: Dict[str, Any], ctx: Dict[str, Any]
+    ) -> str:
+        try:
+            mode, items, _done = self._resolve_items(node, ctx)
+        except Exception:
+            return "unresolved"
+        head = ", ".join(repr(x)[:24] for x in items[:5])
+        if len(items) > 5:
+            head += ", ..."
+        return f"{mode}[{len(items)}]: {head}"
 
     def _input_request(self, node: Dict[str, Any], ctx: Dict[str, Any]) -> Dict[str, Any]:
         schema = node["input_schema"]
@@ -413,7 +1283,10 @@ class WorkflowEngine:
             raise ValueError(f"node {node_id!r} is not a task node")
         if not self._has_success(record, node_id):
             raise RuntimeError(f"task node {node_id!r} has not been executed yet")
-        _jsonschema_validate({**record["context"], **values}, node["input_schema"])
+        if node.get("input_schema"):
+            _jsonschema_validate(
+                {**record["context"], **values}, node["input_schema"]
+            )
         self._begin_revision(
             workflow, record,
             target=node, changed_keys=set(values.keys()),
@@ -443,22 +1316,69 @@ class WorkflowEngine:
         node = self._node(workflow, current)
         ended = datetime.now()
 
+        # while a child run is live the parent node cannot be driven directly
+        sub_state = record.get("subflow_state")
+        if (
+            node["type"] in ("subflow", "foreach")
+            and sub_state and sub_state.get("status") == "active"
+            and sub_state.get("node_id") == current
+        ):
+            inst = self._active_instance(sub_state)
+            child_id = inst.get("run_id") if inst else None
+            raise RuntimeError(
+                f"node {current!r} has child run {child_id} in progress; "
+                f"drive that child (aiwf current {child_id}) or finish it"
+            )
+
+        # a child run reaches end only if its exports contract is satisfied
+        child_exports: Optional[Dict[str, Any]] = None
+        if node["type"] == "end" and record.get("parent"):
+            try:
+                child_exports = self._collect_exports(workflow, record)
+            except Exception as e:
+                record["node_runs"].append(
+                    self._node_run(node, record, "failed", ended, None,
+                                   None, None, None)
+                )
+                return self._propagate_child_failure(
+                    workflow, record,
+                    f"exports contract unmet at end: {e}",
+                )
+
+        # output contract: a non-conforming report is rejected with feedback,
+        # the node stays open and the run keeps running
+        if node["type"] == "task" and node.get("output_schema"):
+            try:
+                _jsonschema_validate(output, node["output_schema"])
+            except Exception as e:
+                return self._reject_output(
+                    workflow, record, node, ended, output, str(e)
+                )
+
         decision: Optional[Dict[str, str]] = None
         try:
             ntype = node["type"]
             if ntype == "task":
                 record["context"][node.get("output_key", node["id"])] = output
             elif ntype == "branch":
+                if node.get("when"):
+                    answer = (
+                        "TRUE"
+                        if eval_condition(node["when"], record["context"])
+                        else "FALSE"
+                    )
+                else:
+                    answer = output
                 routes = {normalize_answer(k): v for k, v in node.get("routes", {}).items()}
-                target = routes.get(normalize_answer(output))
+                target = routes.get(normalize_answer(answer))
                 if not target:
                     target = node.get("default")
                 if not target:
                     raise RuntimeError(
                         f"branch node {node['id']!r}: no route matched answer "
-                        f"{str(output).strip()!r} and no default configured"
+                        f"{str(answer).strip()!r} and no default configured"
                     )
-                decision = {"answer": str(output).strip(), "route": target}
+                decision = {"answer": str(answer).strip(), "route": target}
             # start / end: nothing to store
         except Exception as e:
             record["node_runs"].append(
@@ -479,6 +1399,10 @@ class WorkflowEngine:
                 self._close_revision(record)
 
         if node["type"] == "end":
+            if record.get("parent"):
+                return self._propagate_child_success(
+                    workflow, record, ended, child_exports  # type: ignore[arg-type]
+                )
             return self._complete(workflow, record)
 
         if len(record["node_runs"]) >= workflow.get("max_steps", 50):
@@ -517,6 +1441,31 @@ class WorkflowEngine:
         self._advance(workflow, record, node, decision)
         return record
 
+    def _reject_output(
+        self,
+        workflow: Dict[str, Any],
+        record: Dict[str, Any],
+        node: Dict[str, Any],
+        ended: datetime,
+        output: Any,
+        message: str,
+    ) -> Dict[str, Any]:
+        """Audit an output that failed output_schema, feed the reason back,
+        and re-enter the same node in executing phase (run stays running)."""
+        record["node_runs"].append(
+            self._node_run(node, record, "rejected", ended, output,
+                           None, None, None)
+        )
+        feedback = f"output_schema 校验未通过：{message}"
+        feedback = re.sub(r"\s+", " ", feedback).strip()[:300]
+        record["last_feedback"] = feedback
+        record["node_started_at"] = now_iso()
+        self._append_event(
+            record, "output_rejected", node_id=node["id"], reason=feedback
+        )
+        self._save(workflow, record)
+        return record
+
     def fail(self, workflow: Dict[str, Any], run_id: str, error: str) -> Dict[str, Any]:
         record = self._load_running(workflow, run_id)
         current = record["next_node"]
@@ -525,7 +1474,67 @@ class WorkflowEngine:
         record["node_runs"].append(
             self._node_run(node, record, "failed", ended, None, None, None, None)
         )
-        return self._fail(workflow, record, f"node {current!r} failed: {error}")
+        message = f"node {current!r} failed: {error}"
+        if record.get("parent"):
+            return self._propagate_child_failure(
+                workflow, record, message
+            )
+        return self._fail(workflow, record, message)
+
+    # ---- protocol: redo a single subflow instance --------------------
+    def redo(
+        self,
+        workflow: Dict[str, Any],
+        run_id: str,
+        node_id: str,
+        instance: str,
+        reason: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        record = self.storage.load_run(workflow["id"], run_id)
+        node = self._safe_node(workflow, node_id)
+        if node is None or node["type"] not in ("subflow", "foreach"):
+            raise ValueError(f"node {node_id!r} is not subflow/foreach")
+        state = record.get("subflow_state")
+        if not state or state["node_id"] != node_id:
+            raise RuntimeError(
+                f"node {node_id!r} has no subflow runs in this run"
+            )
+        if state["status"] == "active":
+            raise RuntimeError(
+                f"node {node_id!r} is still active; finish/fail it first"
+            )
+        inst = self._find_instance(state, instance)
+        if not inst.get("run_id"):
+            raise RuntimeError(f"instance {instance!r} has no child run to redo")
+        child_record = self.storage.find_run(inst["run_id"])
+        child_wf = self.storage.load_workflow_for_record(child_record)
+
+        # reopen the parent node
+        record["status"] = "running"
+        record["phase"] = "executing"
+        record["error"] = None
+        record["ended_at"] = None
+        record["duration_ms"] = None
+        record["next_node"] = node_id
+        state["status"] = "active"
+        state["returning"] = True
+        state["done"] = False
+        inst.update(
+            status="running", error=None, started_at=now_iso(), exports={}
+        )
+        self._append_event(
+            record, "instance_redone", node_id=node_id,
+            instance=inst["key"], child_run_id=inst["run_id"],
+            reason=reason,
+        )
+        self._save(workflow, record)
+
+        # restart the child from its start node, same directory/run_id
+        child_record["status"] = "running"
+        child_record["error"] = None
+        self._append_event(child_record, "run_resumed")
+        self._move_to(child_wf, child_record, self.start_node_id(child_wf))
+        return record
 
     # ---- protocol: human review verdict ------------------------------
     def review(
@@ -632,7 +1641,9 @@ class WorkflowEngine:
         if mode == "return":
             stale = {target["id"]}  # only the target redoes; everything else reused
         elif scope == "auto":
-            stale = self.stale_closure(workflow, changed_keys)
+            stale = self.stale_closure(
+                workflow, changed_keys, context=record["context"]
+            )
         else:  # manual / all
             if scope == "all":
                 stale = self._forward_reachable(workflow, target["id"])
@@ -712,6 +1723,10 @@ class WorkflowEngine:
                 record, "review_requested", node_id=node["id"],
                 requirements=requirements,
             )
+        elif node["type"] in ("subflow", "foreach"):
+            self._save(workflow, record)
+            self._activate_subflow_node(workflow, record, node)
+            return
         else:
             record["phase"] = "executing"
         self._save(workflow, record)
@@ -743,8 +1758,11 @@ class WorkflowEngine:
         nxt = target_id
         rev = self._active_revision(record)
         while rev and rev["mode"] == "cascade":
-            if nxt in rev["stale_nodes"] and nxt not in rev["redone_nodes"]:
-                break  # must redo this one
+            if nxt in rev["stale_nodes"]:
+                # Stale nodes always re-execute, even on a later loop
+                # iteration: a chapter node revisited starts a new chapter
+                # rather than reusing the old one.
+                break
             prior = self._last_success_node_run(record, nxt)
             if prior is not None:
                 record["node_runs"].append(self._skipped_run(record, prior))
@@ -762,6 +1780,7 @@ class WorkflowEngine:
                 continue
             break  # reached new territory: execute normally
 
+        self._maybe_close_cascade(workflow, record, nxt)
         record["next_node"] = nxt
         self._enter_node(workflow, record)
 
@@ -773,6 +1792,26 @@ class WorkflowEngine:
             record, "revision_completed", target=rev["target"],
             redone_nodes=rev["redone_nodes"], seq=rev["seq"],
         )
+
+    def _maybe_close_cascade(
+        self, workflow: Dict[str, Any], record: Dict[str, Any], nxt: str
+    ) -> None:
+        """Close a cascade revision once the live path can no longer reach
+        any un-redone stale node.
+
+        stale_closure is a static over-approximation: it includes nodes
+        behind branch routes the actual path never takes (e.g. a fix node
+        reachable only when a check answers REVISE). Such nodes will never
+        be redone, so the revision ends when execution leaves the stale
+        region instead of waiting for the full static set.
+        """
+        rev = self._active_revision(record)
+        if not rev or rev["mode"] != "cascade":
+            return
+        remaining = set(rev["stale_nodes"]) - set(rev["redone_nodes"])
+        reachable = self._forward_reachable(workflow, nxt) | {nxt}
+        if not (remaining & reachable):
+            self._close_revision(record)
 
     # ---- internals: audit --------------------------------------------
     def _load_running(self, workflow: Dict[str, Any], run_id: str) -> Dict[str, Any]:
@@ -875,6 +1914,13 @@ class WorkflowEngine:
             return {"prompt": render(node.get("prompt", ""), record["context"])}
         if ntype == "branch":
             return {"prompt": render(node.get("prompt", ""), record["context"])}
+        if ntype in ("subflow", "foreach"):
+            # raw mapping: per-instance rendering lives in each child's inputs
+            return {
+                "workflow": node.get("workflow"),
+                "inline": bool(node.get("nodes")),
+                "inputs": node.get("inputs", {}),
+            }
         return None
 
     @staticmethod
@@ -889,9 +1935,7 @@ class WorkflowEngine:
         validate_run_record(record)
         context_md = self._render_context_md(workflow, record)
         self.storage.save_run(record)
-        self.storage.save_context_doc(
-            record["workflow_id"], record["run_id"], context_md
-        )
+        self.storage.save_context_doc(record, context_md)
 
     @staticmethod
     def _elapsed_total(record: Dict[str, Any], ended: datetime) -> Optional[int]:
@@ -903,6 +1947,9 @@ class WorkflowEngine:
 
     def _complete(self, workflow: Dict[str, Any], record: Dict[str, Any]) -> Dict[str, Any]:
         ended = datetime.now()
+        # safety net: a finished run must not carry an active revision
+        if self._active_revision(record):
+            self._close_revision(record)
         record.update(
             status="completed",
             phase="executing",
@@ -999,5 +2046,33 @@ class WorkflowEngine:
                     f"- `{path}` ← {nr['node_id']}（{nr.get('node_name', '')}）"
                 )
         lines += artifacts if artifacts else ["- （暂无外置产物）"]
+        lines.append("")
+
+        state = record.get("subflow_state")
+        if state:
+            lines.append("## 子工作流")
+            tag = "内联" if state["inline"] else "外引"
+            lines.append(
+                f"- 节点 `{state['node_id']}` → `{state['subflow_id']}`"
+                f"（{tag}，{state['status']}）"
+            )
+            if state["kind"] == "foreach":
+                done_n = sum(
+                    1 for i in state["instances"] if i["status"] == "success"
+                )
+                lines.append(
+                    f"- 进度 {done_n}/{len(state['instances'])}"
+                    f"，模式 {state['items_mode']}"
+                    f"，on_fail {state['on_fail']}"
+                )
+            for inst in state["instances"]:
+                row = (
+                    f"  - [{inst['status']}] `{inst['key']}`"
+                    f" run `{inst.get('run_id')}`"
+                )
+                if inst.get("error"):
+                    row += f" — {inst['error']}"
+                lines.append(row)
+            lines.append("")
 
         return "\n".join(lines) + "\n"
