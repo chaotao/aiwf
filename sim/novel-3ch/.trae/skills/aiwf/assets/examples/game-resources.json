@@ -1,0 +1,51 @@
+{
+  "schema_version": "1.1",
+  "id": "game-resources",
+  "name": "游戏开发：逐项检查 Godot 资源",
+  "max_steps": 100,
+  "input_schema": {
+    "type": "object",
+    "required": ["project_dir", "resources"],
+    "properties": {
+      "project_dir": {"type": "string"},
+      "resources": {
+        "type": "array",
+        "maxItems": 50,
+        "items": {
+          "type": "object",
+          "required": ["key", "path"],
+          "properties": {"key": {"type": "string"}, "path": {"type": "string"}}
+        }
+      }
+    }
+  },
+  "nodes": [
+    {
+      "id": "inspect_resources",
+      "type": "foreach",
+      "items": {"ref": "resources"},
+      "id_field": "key",
+      "as": "resource",
+      "index_as": "resource_index",
+      "max_instances": 50,
+      "inputs": {"project_dir": {"ref": "project_dir"}},
+      "nodes": [
+        {
+          "id": "inspect",
+          "type": "task",
+          "inputs": {"project_dir": {"ref": "project_dir"}, "resource": {"ref": "resource"}},
+          "prompt": "只读检查 resource 指向的 Godot 资源，核对导入状态、引用路径、可获得的许可信息；优先核对是否为 CC0，许可不明时如实记录。将证据、发现和建议写入声明文件，不自动替换资源。",
+          "output": {"file": "${run.dir}/resource-report.md"}
+        }
+      ],
+      "exports": ["inspect"]
+    },
+    {
+      "id": "summarize",
+      "type": "task",
+      "inputs": {"manifest": {"ref": "inspect_resources"}},
+      "prompt": "读取清单及成功项 exports.inspect 报告，按导入、引用、许可问题归类，给出修复优先级；列出失败项。",
+      "output": {"file": "${run.dir}/resource-summary.md"}
+    }
+  ]
+}

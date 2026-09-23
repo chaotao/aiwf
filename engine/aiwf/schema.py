@@ -3,6 +3,7 @@ lightweight usage needs no heavy deps.
 """
 import json
 import os
+import re
 from typing import Any, Dict
 
 def _default_schema_dir() -> str:
@@ -30,9 +31,38 @@ def _jsonschema_validate(instance: Any, schema: Dict[str, Any]):
     jsonschema.validate(instance=instance, schema=schema)
 
 
+def node_user_input_schema(node: Dict[str, Any]) -> Dict[str, Any]:
+    """User questions; input_schema is a legacy node-level alias only."""
+    if "user_input_schema" in node and "input_schema" in node:
+        raise ValueError(
+            f"node {node['id']!r}: use user_input_schema only; "
+            "cannot also specify legacy input_schema"
+        )
+    return node.get("user_input_schema", node.get("input_schema")) or {}
+
+
 def validate_workflow(workflow: Dict[str, Any]) -> None:
     """Structural validation against workflow.schema.json + semantic checks."""
     _jsonschema_validate(workflow, load_schema("workflow"))
+    if (workflow["schema_version"] == "1.1"
+            and "run" in (workflow.get("input_schema") or {}).get("properties", {})):
+        raise ValueError("'run' is reserved for runtime metadata")
+
+    def validate_data_refs(value, node_id):
+        if isinstance(value, dict):
+            if workflow["schema_version"] == "1.1" and "var" in value and set(value) <= {"var", "default"}:
+                raise ValueError(f"node {node_id!r}: use typed ref instead of var in version 1.1")
+            if "ref" in value:
+                if workflow["schema_version"] != "1.1":
+                    raise ValueError(f"node {node_id!r}: typed ref requires version 1.1")
+                if (set(value) != {"ref"} or not isinstance(value["ref"], str)
+                        or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z0-9_]+)*", value["ref"])):
+                    raise ValueError(f"node {node_id!r}: invalid typed ref {value!r}")
+            for child in value.values():
+                validate_data_refs(child, node_id)
+        elif isinstance(value, list):
+            for child in value:
+                validate_data_refs(child, node_id)
 
     node_ids = [n["id"] for n in workflow["nodes"]]
     dup = {i for i in node_ids if node_ids.count(i) > 1}
@@ -56,6 +86,23 @@ def validate_workflow(workflow: Dict[str, Any]) -> None:
 
     for node in workflow["nodes"]:
         n_out = out_counts.get(node["id"], 0)
+        node_input = node_user_input_schema(node)
+        if "user_input_schema" in node and node["type"] != "task":
+            raise ValueError(f"node {node['id']!r}: user_input_schema is only supported on task nodes")
+        for value in (node.get("inputs"), node.get("items"), node.get("when")):
+            validate_data_refs(value, node["id"])
+        if workflow["schema_version"] == "1.0":
+            if "output" in node or "check" in node:
+                raise ValueError("output/check require schema_version 1.1")
+        elif node["type"] != "task" and ("output" in node or "check" in node):
+            raise ValueError("output/check are only supported on task nodes")
+        if workflow["schema_version"] == "1.1":
+            if (node.get("output_key", node["id"]) == "run"
+                    or node.get("outputs_key") == "run"
+                    or "run" in node.get("inputs", {})
+                    or "run" in node_input.get("properties", {})
+                    or node.get("as") == "run" or node.get("index_as") == "run"):
+                raise ValueError("'run' is reserved for runtime metadata")
 
         # routing nodes (branch / standalone review) must not use edges
         if node["type"] in ("branch", "review"):
@@ -99,12 +146,11 @@ def validate_workflow(workflow: Dict[str, Any]) -> None:
             if not node.get("routes") and "default" not in node:
                 raise ValueError(f"branch node {node['id']!r} needs routes and/or default")
 
-        # node-level input schema sanity
-        node_input = node.get("input_schema")
-        if node_input is not None:
+        # User-input schema is independent of the task's inputs mapping.
+        if node_input:
             if node_input.get("type", "object") != "object":
                 raise ValueError(
-                    f"node {node['id']!r} input_schema must be a JSON Schema object"
+                    f"node {node['id']!r} user_input_schema must be a JSON Schema object"
                 )
 
         # inline foreach body: reserved ids, internal edges
@@ -135,6 +181,15 @@ def validate_workflow(workflow: Dict[str, Any]) -> None:
                             f"inline edge of node {node['id']!r} references "
                             f"unknown body node: {edge[end]}"
                         )
+            # Validate body routes too, including the generated exit.
+            body_workflow = {
+                "schema_version": workflow["schema_version"],
+                "id": "inline-validation", "name": "inline",
+                "nodes": body + [{"id": "end", "type": "end"}],
+            }
+            if "edges" in node:
+                body_workflow["edges"] = node["edges"]
+            validate_workflow(body_workflow)
 
     # top-level exports: key -> JSON Schema fragment
     exports = workflow.get("exports")

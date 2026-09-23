@@ -15,6 +15,22 @@
     "schema_version": { "type": "string", "const": "1.0" },
     "run_id": { "type": "string" },
     "workflow_id": { "type": "string" },
+    "workflow_version": { "enum": ["1.0", "1.1"] },
+    "activation_id": { "type": "string" },
+    "pending_check": {
+      "type": ["object", "null"],
+      "properties": {
+        "node_id": { "type": "string" },
+        "attempt": { "type": "integer", "minimum": 1 },
+        "max_attempts": { "type": "integer", "minimum": 1 },
+        "criteria": { "type": "array", "items": { "type": "string" } },
+        "output": {},
+        "started_at": { "type": "string" },
+        "exhausted": { "type": "boolean" }
+      },
+      "required": ["node_id", "attempt", "max_attempts", "criteria", "output", "started_at"],
+      "additionalProperties": false
+    },
     "parent": {
       "description": "Linkage to the parent run when this record is a subflow child; null for top-level runs.",
       "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/parent_link" }]
@@ -29,7 +45,7 @@
     },
     "phase": {
       "type": "string",
-      "enum": ["executing", "awaiting_input", "awaiting_review", "awaiting_items"],
+      "enum": ["executing", "awaiting_input", "awaiting_review", "awaiting_items", "awaiting_check"],
       "description": "Sub-state within status=running: executing normally, waiting for user input, waiting for human review, or (dynamic foreach) waiting for more items."
     },
     "started_at": { "type": "string" },
@@ -123,6 +139,7 @@
           "oneOf": [{ "type": "null" }, { "type": "string", "enum": ["static", "dynamic"] }]
         },
         "items_source": { "description": "Original items spec; null for single calls." },
+        "items_snapshot": { "type": "string", "description": "1.1 immutable/append-only item snapshot file." },
         "as": { "type": "string" },
         "index_as": { "type": "string" },
         "id_field": { "oneOf": [{ "type": "null" }, { "type": "string" }] },
@@ -203,6 +220,7 @@
             "review_requested", "review_decided",
             "revise_requested", "node_reused", "revision_completed",
             "output_rejected",
+            "check_requested", "check_decided",
             "subflow_started", "instance_completed", "instance_failed",
             "instance_redone",
             "run_resumed", "run_failed"
@@ -231,7 +249,13 @@
         "reused_nodes": { "type": "array", "items": { "type": "string" } },
         "redone_nodes": { "type": "array", "items": { "type": "string" } },
         "instance": { "type": "string" },
-        "child_run_id": { "type": "string" }
+        "child_run_id": { "type": "string" },
+        "attempt": { "type": "integer" },
+        "started_at": { "type": "string" },
+        "duration_ms": { "type": "integer" },
+        "input": {},
+        "output": {},
+        "summary": { "type": "string", "maxLength": 160 }
       }
     },
     "node_run": {

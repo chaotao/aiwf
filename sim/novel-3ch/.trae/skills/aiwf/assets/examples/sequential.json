@@ -1,0 +1,33 @@
+{
+  "schema_version": "1.1",
+  "id": "sequential",
+  "name": "入门：规划与交付",
+  "input_schema": {
+    "type": "object",
+    "required": ["idea"],
+    "properties": {"idea": {"type": "string"}}
+  },
+  "nodes": [
+    {
+      "id": "plan",
+      "type": "task",
+      "inputs": {"idea": {"ref": "idea"}},
+      "prompt": "根据 idea 生成短规划，输出 goal 字符串与 steps 字符串数组。",
+      "output_schema": {
+        "type": "object",
+        "required": ["goal", "steps"],
+        "properties": {
+          "goal": {"type": "string"},
+          "steps": {"type": "array", "items": {"type": "string"}, "maxItems": 5}
+        }
+      }
+    },
+    {
+      "id": "deliver",
+      "type": "task",
+      "inputs": {"plan": {"ref": "plan"}},
+      "prompt": "按 plan 材料写成完整方案，保存到声明文件。",
+      "output": {"file": "${run.dir}/plan.md"}
+    }
+  ]
+}

@@ -186,8 +186,17 @@ class Storage:
         from workflows/; a synthesized inline def lives next to the parent
         node (children/<node>/subflow.json)."""
         workflow_id = record["workflow_id"]
+        snapshot = os.path.join(self.run_dir_for_record(record), "workflow.json")
+        if os.path.exists(snapshot):
+            return self.read_json_file(snapshot)
         if self.workflow_exists(workflow_id):
-            return self.load_workflow(workflow_id)
+            workflow = self.load_workflow(workflow_id)
+            if workflow["schema_version"] != record.get("workflow_version", "1.0"):
+                raise ValueError(
+                    "workflow version changed for an existing run; restore its "
+                    "original definition or start a new run"
+                )
+            return workflow
         parent = record.get("parent")
         if parent:
             path = os.path.join(

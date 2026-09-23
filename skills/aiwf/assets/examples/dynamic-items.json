@@ -1,0 +1,40 @@
+{
+  "schema_version": "1.1",
+  "id": "dynamic-items",
+  "name": "高阶：动态追加章节",
+  "max_steps": 200,
+  "input_schema": {
+    "type": "object",
+    "required": ["queue"],
+    "properties": {
+      "queue": {"type": "object", "required": ["$file"], "properties": {"$file": {"type": "string"}}}
+    }
+  },
+  "nodes": [
+    {
+      "id": "chapters",
+      "type": "foreach",
+      "items": {"ref": "queue"},
+      "id_field": "number",
+      "max_instances": 100,
+      "inputs": {"previous": {"ref": "previous"}},
+      "nodes": [
+        {
+          "id": "draft",
+          "type": "task",
+          "inputs": {"chapter": {"ref": "item"}, "previous": {"ref": "previous"}},
+          "prompt": "按 chapter 创作一章；previous 非空时先读 previous.draft 保持连续性。写完后由外部 Agent 判断是否继续并更新父队列。",
+          "output": {"file": "${run.dir}/chapter-${item.number}.md"}
+        }
+      ],
+      "exports": ["draft"]
+    },
+    {
+      "id": "assemble",
+      "type": "task",
+      "inputs": {"manifest": {"ref": "chapters"}},
+      "prompt": "读取 manifest 及成功项 exports.draft，按清单顺序汇总，明确任何失败项。",
+      "output": {"file": "${run.dir}/novel.md"}
+    }
+  ]
+}

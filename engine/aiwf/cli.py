@@ -43,6 +43,13 @@ def print_spec(spec_envelope: Dict[str, Any], as_json: bool) -> None:
     print(f"workflow : {spec_envelope['workflow_id']}")
     print(f"status   : {spec_envelope['status']}")
     print(f"phase    : {spec_envelope['phase']}")
+    if spec_envelope.get("action"):
+        action = spec_envelope["action"]
+        print(f"action   : {action['kind']} --action {action['id']} (target {action['run_id']})")
+    if spec_envelope.get("check_request"):
+        print("quality check (agent):")
+        print(json.dumps(spec_envelope["check_request"], ensure_ascii=False, indent=2))
+        return
 
     rev = spec_envelope.get("revision")
     if rev:
@@ -69,6 +76,8 @@ def print_spec(spec_envelope: Dict[str, Any], as_json: bool) -> None:
         node_id = review_request["node_id"]
         print(f"node     : {node_id}  (attempt #{review_request['attempt']}, "
               f"{review_request['kind']})")
+        if review_request.get("output") is not None:
+            print("artifact : " + json.dumps(review_request["output"], ensure_ascii=False))
         req = review_request["requirements"]
         print("requirements:")
         if isinstance(req, list):
@@ -88,6 +97,10 @@ def print_spec(spec_envelope: Dict[str, Any], as_json: bool) -> None:
     print(f"node     : {node['id']} [{node['type']}] {node['name']}")
     ntype = node["type"]
     if ntype == "task":
+        if node.get("inputs"):
+            print("materials: " + json.dumps(node["inputs"], ensure_ascii=False))
+        if node.get("output"):
+            print("artifact : " + json.dumps(node["output"], ensure_ascii=False))
         print(f"model    : {node.get('model_hint') or '(agent default)'}")
         if node.get("feedback"):
             print("--- reviewer feedback for this redo ---")
@@ -231,6 +244,29 @@ def _load_workflow_for_record(storage: Storage, record: Dict[str, Any]):
 
 
 # ---- command handlers ----------------------------------------------------
+def _new_protocol(engine, record):
+    root = engine.root_record(record)
+    return root.get("workflow_version") == "1.1"
+
+
+def _emit(engine, record, args, advance=True):
+    if _new_protocol(engine, record):
+        if advance:
+            engine.settle(record["run_id"])
+        spec = engine.action_spec(record["run_id"])
+    else:
+        workflow = engine.storage.load_workflow_for_record(record)
+        spec = engine.node_spec(workflow, record)
+    print_spec(spec, args.json)
+    return 1 if spec["status"] == "failed" else 0
+
+
+def _act(engine, args, command, **kwargs):
+    spec = engine.act(args.run_id, args.action, command, **kwargs)
+    print_spec(spec, args.json)
+    return 1 if spec["status"] == "failed" else 0
+
+
 def cmd_init(args, storage: Storage) -> int:
     storage.init_dirs()
     print(f"initialized aiwf storage at {storage.root}")
@@ -271,15 +307,12 @@ def cmd_run(args, storage: Storage) -> int:
     workflow = storage.load_workflow(args.workflow_id)
     engine = WorkflowEngine(storage)
     record = engine.start(workflow, _collect_inputs(args))
-    print_spec(engine.node_spec(workflow, record), args.json)
-    return 0
+    return _emit(engine, record, args)
 
 
 def cmd_current(args, storage: Storage) -> int:
     record = storage.find_run(args.run_id)
-    workflow = _load_workflow_for_record(storage, record)
-    print_spec(WorkflowEngine(storage).node_spec(workflow, record), args.json)
-    return 0
+    return _emit(WorkflowEngine(storage), record, args, advance=False)
 
 
 def _read_output(args) -> Any:
@@ -310,6 +343,9 @@ def cmd_complete(args, storage: Storage) -> int:
     record = storage.find_run(args.run_id)
     workflow = _load_workflow_for_record(storage, record)
     engine = WorkflowEngine(storage)
+    if _new_protocol(engine, record):
+        return _act(engine, args, "complete", output=_read_output(args),
+                    model=args.model, tokens=_read_tokens(args))
     record = engine.complete(
         workflow, args.run_id,
         output=_read_output(args),
@@ -329,24 +365,26 @@ def cmd_provide(args, storage: Storage) -> int:
     record = storage.find_run(args.run_id)
     workflow = _load_workflow_for_record(storage, record)
     engine = WorkflowEngine(storage)
+    if _new_protocol(engine, record) and not args.node:
+        return _act(engine, args, "provide", values=values)
     record = engine.provide(
         workflow, args.run_id, values,
         node_id=args.node, reason=args.reason,
     )
-    print_spec(engine.node_spec(workflow, record), args.json)
-    return 0
+    return _emit(engine, record, args)
 
 
 def cmd_review(args, storage: Storage) -> int:
     record = storage.find_run(args.run_id)
     workflow = _load_workflow_for_record(storage, record)
     engine = WorkflowEngine(storage)
+    if _new_protocol(engine, record):
+        return _act(engine, args, "review", verdict=args.verdict, feedback=args.feedback)
     record = engine.review(
         workflow, args.run_id, args.verdict,
         feedback=args.feedback,
     )
-    print_spec(engine.node_spec(workflow, record), args.json)
-    return 0
+    return _emit(engine, record, args)
 
 
 def cmd_revise(args, storage: Storage) -> int:
@@ -358,14 +396,16 @@ def cmd_revise(args, storage: Storage) -> int:
         workflow, args.run_id, args.target, args.reason,
         mode=args.mode, scope=args.scope, manual_nodes=manual,
     )
-    print_spec(engine.node_spec(workflow, record), args.json)
-    return 0
+    return _emit(engine, record, args)
 
 
 def cmd_fail(args, storage: Storage) -> int:
     record = storage.find_run(args.run_id)
     workflow = _load_workflow_for_record(storage, record)
     engine = WorkflowEngine(storage)
+    if _new_protocol(engine, record):
+        _act(engine, args, "fail", error=args.error)
+        return 1
     record = engine.fail(workflow, args.run_id, args.error)
     workflow = _load_workflow_for_record(storage, record)
     print_spec(engine.node_spec(workflow, record), args.json)
@@ -373,11 +413,18 @@ def cmd_fail(args, storage: Storage) -> int:
 
 
 def cmd_resume(args, storage: Storage) -> int:
-    workflow = storage.load_workflow(args.workflow_id)
+    record = storage.find_run(args.run_id)
+    workflow = storage.load_workflow_for_record(record)
+    if workflow["id"] != args.workflow_id:
+        raise ValueError("workflow id does not match run")
     engine = WorkflowEngine(storage)
-    record = engine.resume(workflow, args.run_id)
-    print_spec(engine.node_spec(workflow, record), args.json)
-    return 0
+    if _new_protocol(engine, record) and record["status"] == "running":
+        leaf = engine._leaf_record(record)
+        if leaf["phase"] == "awaiting_items":
+            record = leaf
+            workflow = storage.load_workflow_for_record(record)
+    record = engine.resume(workflow, record["run_id"])
+    return _emit(engine, record, args)
 
 
 def cmd_redo(args, storage: Storage) -> int:
@@ -389,8 +436,7 @@ def cmd_redo(args, storage: Storage) -> int:
         reason=args.reason,
     )
     workflow = _load_workflow_for_record(storage, record)
-    print_spec(engine.node_spec(workflow, record), args.json)
-    return 0
+    return _emit(engine, record, args)
 
 
 def cmd_runs_list(args, storage: Storage) -> int:
@@ -543,6 +589,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     pcomp = sub.add_parser("complete", help="report task/branch output and advance")
     pcomp.add_argument("run_id")
+    pcomp.add_argument("--action", help="current action id (required for 1.1)")
     pcomp.add_argument("--output", help="output; parsed as JSON when possible")
     pcomp.add_argument("--output-file", help="JSON file containing the output")
     pcomp.add_argument("--empty", action="store_true", help="no output (start/end)")
@@ -554,6 +601,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     pprov = sub.add_parser("provide", help="supply user input for a task node")
     pprov.add_argument("run_id")
+    pprov.add_argument("--action", help="current action id (required for 1.1 input)")
     pprov.add_argument("--node", help="completed task node whose input is changed")
     pprov.add_argument("-p", "--param", action="append", help="key=value; repeatable")
     pprov.add_argument("--data-file", help="JSON object file with answers")
@@ -563,6 +611,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     prev2 = sub.add_parser("review", help="submit human review verdict")
     prev2.add_argument("run_id")
+    prev2.add_argument("--action", help="current action id (required for 1.1)")
     prev2.add_argument("--verdict", required=True, choices=["APPROVE", "REJECT"],
                        help="accept or reject")
     prev2.add_argument("--feedback", help="review comments for the agent")
@@ -581,6 +630,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     pf = sub.add_parser("fail", help="report a node failure")
     pf.add_argument("run_id")
+    pf.add_argument("--action", help="current action id (required for 1.1)")
     pf.add_argument("--error", required=True)
     pf.add_argument("--json", action="store_true")
     pf.set_defaults(func=cmd_fail)
@@ -635,7 +685,14 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: Optional[List[str]] = None) -> int:
     args = build_parser().parse_args(argv)
     storage = Storage()
-    return args.func(args, storage)
+    try:
+        return args.func(args, storage)
+    except (ValueError, RuntimeError, KeyError, OSError) as e:
+        if getattr(args, "json", False):
+            print(json.dumps({"status": "error", "error": str(e)}, ensure_ascii=False))
+        else:
+            print(f"error: {e}", file=sys.stderr)
+        return 2
 
 
 if __name__ == "__main__":

@@ -1,5 +1,10 @@
 # 审计 / 检索工作流运行记录
 
+1.1 的 `current <根run_id> --json` 是只读叶子任务包；`runs show` 仍读取指定
+run 的原始记录。`workflow.json` 是该运行的定义快照，修改源定义不会改写快照。
+`check_requested/check_decided` 记录 Agent 质检次数、原始输入/输出、理由、起始时间、
+耗时和摘要；`review_decided` 记录人工结论，两者不得混淆。
+
 所有执行记录都在 `.aiwf/runs/<workflow_id>/<run_id>/` 下：**每次运行一个独立
 文件夹**，含 `record.json`（审计记录）与 `context.md`（自动生成的共享上下文）。
 同一工作流多次执行各自成目录，每次状态变更立即落盘。记录分两层：**events
@@ -9,7 +14,7 @@
 
 ```
 runs/<父wf>/<父rid>/
-  record.json, context.md
+  record.json, context.md, workflow.json  # 1.1 定义快照
   foreach-<node>-results.json              # foreach 实例结果清单
   children/<node>/subflow.json             # 内联 nodes 合成的子流程定义
   children/<node>/<instance>/record.json   # 每个实例一份子记录（single 固定 "0"）
@@ -46,11 +51,11 @@ exports 摘要、子 run_id 与记录目录；单实例细节用 `runs show <chi
 
 | 字段 | 说明 |
 |------|------|
-| `status` | `success` / `failed` / `skipped`（修订中复用旧产物）/ `rejected`（产物不符 output_schema，节点未关闭） |
+| `status` | `success` / `failed` / `skipped`（修订中复用旧产物）/ `rejected`（产物不符 Schema 或主文件契约，节点未关闭） |
 | `started_at` / `ended_at` / `duration_ms` | 节点从进入到 complete/fail 的**开放墙钟时间**，毫秒。其中包含 agent 思考、工具执行与等待/交接时间，并不严格等于纯任务计算耗时，不宜直接当作性能指标对比 |
 | `model` | 执行 agent 实际上报的模型；未上报为 null |
 | `tokens` | agent 上报的 prompt/completion/total token；未上报 null |
-| `input` | 实际消费的渲染后 prompt；start/end/skipped 为 null |
+| `input` | 渲染后 prompt 和显式 inputs 材料；start/end/skipped 为 null |
 | `output` | 短结果或文件引用 `{"$file": "路径"}`（单输出 ≤2000 字符）；skipped 节点为复用的旧输出；rejected 节点保留被驳回的产物 |
 | `summary` | 输出自动生成的 <=160 字摘要 |
 | `decision` | branch 专用：answer + 实际选中的 route |
@@ -60,7 +65,7 @@ exports 摘要、子 run_id 与记录目录；单实例细节用 `runs show <chi
 
 > 独立 `review` 检查点本身**不产生 node_run**，只在事件流留
 > `review_requested / review_decided`；内嵌验收则体现在被审 task 的记录里。
-> 节点状态为 `rejected`（不符 output_schema）时节点并未关闭，记录中保留被驳回
+> 节点状态为 `rejected`（不符输出契约）时节点并未关闭，记录中保留被驳回
 > 的产物，修正后重新 complete，run_id 与运行目录均不变。
 
 ### 运行级字段
@@ -69,6 +74,8 @@ exports 摘要、子 run_id 与记录目录；单实例细节用 `runs show <chi
 `error`（失败原因）、`pending_review`（验收门状态）、`revision`（当前/最近修订）、
 `parent`（子记录专用：父 workflow/run/node/instance）、`subflow_state`（父记录
 专用：每个 subflow/foreach 节点的 kind、items_mode、done、instances 列表）。
+1.1 额外有 `workflow_version` 和 `pending_check`；foreach 的 `items_snapshot`
+指向本次运行使用的清单快照。输出文件存在不代表内容已通过业务检查。
 
 ## 3. events 事件流
 
@@ -81,7 +88,8 @@ exports 摘要、子 run_id 与记录目录；单实例细节用 `runs show <chi
 | `input_changed` | 修改已完成节点的输入，自动开启修订 |
 | `review_requested` | 进入验收门（含渲染后 requirements） |
 | `review_decided` | 人的验收结论（verdict + feedback） |
-| `output_rejected` | complete 上报的产物不符节点 output_schema（含 reason；run 不失败，修正后重报） |
+| `output_rejected` | complete 上报的产物不符输出契约（含 reason；run 不失败，修正后重报） |
+| `check_requested` / `check_decided` | Agent 质检与返工，含 attempt、verdict、reason 及 raw I/O |
 | `revise_requested` | 发起计划外回跳（含 stale/reused 清单、mode、scope） |
 | `node_reused` | 级联修订中某节点跳过、复用旧产物 |
 | `revision_completed` | 修订关闭 |
@@ -116,7 +124,7 @@ aiwf runs search "revision"
 ## 审计要点（回答用户时按需覆盖）
 
 - **时间线**：events 还原交互顺序，node_runs 还原耗时分布，指出最慢节点。
-- **数据流**：task 输出经 output_key 进 context，后续节点用 `${key}` 消费；
+- **数据流**：task 输出经 output_key 进 context，后续节点用 inputs 中的 `{"ref":"key"}` 消费；
   大产物经 `$file` 引用、正文留在文件；结合 context.md 产物索引核对数据是否符合预期。
 - **失败回溯**：定位第一个 failed 节点，结合 error 与该节点记录给原因。
 - **修订审计**：检查 revision 与 revise_requested 的 stale/reused 清单是否合理，

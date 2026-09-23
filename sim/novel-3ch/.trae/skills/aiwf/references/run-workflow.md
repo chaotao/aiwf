@@ -1,186 +1,124 @@
-# 驱动 aiwf 工作流运行
+# 执行与接管工作流
 
-**核心概念**：引擎不调用 LLM、不执行任务。你（agent）是执行者，必要时把人
-接入；引擎负责校验、渲染、审计与推进。每次查看状态，信封都带 `status` 和
-`phase`，按 phase 行动。
+你执行业务、使用工具或向用户提问；引擎负责状态、校验和审计，不调用 LLM。
+默认以下为 1.1 协议。始终加 `--json`，使用每次返回的最新任务包继续。
 
-## 1. 启动 / 接管
+## 开始与接管
 
 ```bash
-aiwf run <wf_id> --input-file inputs.json --json
-aiwf run <wf_id> -p title="书名" --json
-aiwf resume <wf_id> <run_id> --json       # 续跑失败运行
-aiwf current <run_id> --json              # 中断后重新查看
+aiwf run <workflow_id> --input-file inputs.json --json
+aiwf current <root_run_id> --json
 ```
 
-信封（始终加 `--json`）：
+任务包的 `run_id` 是根运行；`action` 指向当前真实目标：
 
 ```json
-{ "run_id": "...", "workflow_id": "...",
-  "status": "running|completed|failed",
-  "phase": "executing|awaiting_input|awaiting_review|awaiting_items",
-  "revision": { "...当前修订信息，无则 null" },
-  "error": "失败原因（status=failed 时直接在此，无需另查 runs show）",
-  "node": { "..." }, "input_request": null, "review_request": null }
+{
+  "run_id": "root-id",
+  "status": "running",
+  "phase": "executing",
+  "action": {
+    "id": "opaque-action-id",
+    "run_id": "child-or-root-id",
+    "node_id": "write",
+    "kind": "complete"
+  },
+  "node": {
+    "id": "write",
+    "type": "task",
+    "prompt": "按本章规划创作正文。",
+    "inputs": {"chapter": {"number": 1}},
+    "output": {"file": ".aiwf/runs/.../chapter.md"},
+    "previous_output": null,
+    "feedback": null
+  }
+}
 ```
 
-**接管正在跑的 foreach（中途换 agent 最常见）**，三步：
+无需查子 run 或维护调用栈；子 run_id 供审计定位。`workflow_id` 对应叶子定义，
+`root_workflow_id` 用于根运行 resume。`current` 只读；若 action.kind 为 resume，
+执行明确的 resume 命令以恢复调度。所有状态变更命令返回下一任务包。
 
-1. `aiwf current <父run_id> --json`：信封节点是 foreach 时看 `node.child.run_id`
-   （或父 `context.md` 的「子工作流」小节）；
-2. `aiwf current <child_run_id> --json`：拿到子级当前节点；
-3. 按子级自己的 phase 驱动，直到子级 end——会自动传播回父级并创建下一实例。
+## 按 action.kind 行动
 
-## 2. 按 phase / node 行动
+| kind | 执行 |
+|---|---|
+| complete | 按 node.prompt 执行，使用 node.inputs 材料，按 node.output/output_schema 交付 |
+| check | 按 check_request.criteria 审查 check_request.output，返回 verdict 与 reason |
+| provide | 根据 input_request 向用户收集答案 |
+| review | 展示 review_request 的要求与产物，等待用户真实结论 |
+| resume | 动态清单等待或调度恢复；更新清单后执行 resume |
 
-### phase=executing：执行当前节点
-
-- **task**：
-  - 用渲染后的 `node.prompt` 调用**你自己的模型**；`model_hint` 仅供参考。
-  - 是否使用工具（写文件、查 API 等）由你自行组织，引擎不感知工具。
-  - **大产物（正文/剧本/长报告）写入文件**，不要把全文作为输出；完成后只上报
-    引用 `{"$file": "路径"}`。prompt 里出现的路径（如 `路径：novel/x.md`）是
-    上游产物，先用读文件工具读取再使用。
-  - `previous_output`（修订/重做时为上次原稿或原引用）在此基础上改，不要从零生成。
-  - 短结果（一句话、小 JSON）可直接作为输出；产物最终存入 `output_key`。
-- **branch**：分两种，看信封字段：
-  - **模型分支**（无 `deterministic`）：用 `node.prompt` 调用你自己的模型。若
-    prompt 给的是文件路径，先读文件；回答必须是 `routes` 中的标签（取首行、忽略
-    标点大小写），`complete --output 标签`；你不需要决定下一节点，引擎算路由。
-  - **确定性分支**（`deterministic=true`，配了 `when`）：引擎自己求值，不要回答
-    标签，直接 `complete <run_id> --empty`，结果按 TRUE/FALSE 路由。
-- **start / end**：无需执行。
-
-然后上报：
+执行 task 时，先读取材料中 `$file` 指向的文件。`previous_output` 非空表示该任务
+已有版本，可结合 `feedback` 修订。文件按 `node.output.file` 写入，完成后上报
+相同路径的 `$file`；引擎不会替你创建正文。别把正文粘贴进 complete。
 
 ```bash
-aiwf complete <run_id> --output "文本或标签" [--model m] [--tokens '{...}'] --json
-aiwf complete <run_id> --output '{"$file": "novel/chapter-1.md"}' --json   # 大产物
-aiwf complete <run_id> --output-file result.json --json
-aiwf complete <run_id> --empty --json    # start/end
+aiwf complete <root_run_id> --action <最新action.id> --output-file result.json --json
+aiwf complete <root_run_id> --action <最新action.id> --output '{"$file":"实际路径"}' --json
 ```
 
-> 单个节点输出超过 **2000 字符**会被引擎拒绝；遇到该报错就把内容写文件、改报引用。
-
-### phase=awaiting_input：向用户收集信息
-
-信封的 `input_request` 列出需要回答的字段：每个字段的 title/description/type/
-enum。向用户提问（可一次问完），回答后：
+有 `check` 的任务，上报作品后不会直接过关。先实际检查，再上报：
 
 ```bash
-aiwf provide <run_id> -p inspiration="赛博雨夜" --json
-aiwf provide <run_id> --data-file answers.json --json
+aiwf complete <root_run_id> --action <最新action.id> \
+  --output '{"verdict":"REVISE","reason":"缺少本章要求的转折，需要补充主角选择及其代价"}' --json
+aiwf complete <root_run_id> --action <最新action.id> \
+  --output '{"verdict":"PASS","reason":"关键事件完整，冲突推进且章尾钩子明确"}' --json
 ```
 
-引擎校验回答并写入 context；若同一节点还有未答字段会继续等待，全部答完后返回
-渲染好的正常 task spec。用户修改已答内容时重新 provide 即可。
-
-### phase=awaiting_review：请人验收
-
-信封的 `review_request` 包含：`kind`（内嵌/独立检查点）、渲染后的
-`requirements`（字符串或检查项清单）、`routes`（APPROVE/REJECT 去向）、
-`attempt`。把验收要求和待审产物展示给人，拿到结论后：
-
-> 注意：独立 `review` 检查点本身**不出现在 node_runs**，只在事件流留
-> `review_requested/review_decided`；内嵌验收则在被审 task 的记录里体现。
+REVISE 保持同一任务与实例，反馈自动进入下一任务包；达到 max_attempts 则失败。
+PASS 后若有 review，仍须用户批准。人工验收的拒绝开启新一轮创作与质检；
+max_steps 对整个运行继续生效。结构错误和文件不存在会留下 rejected 记录；
+按反馈修正后用新 action.id 重报。
 
 ```bash
-aiwf review <run_id> --verdict APPROVE --feedback "可选意见" --json
-aiwf review <run_id> --verdict REJECT --feedback "需要改什么" --json
+aiwf provide <root_run_id> --action <最新action.id> --data-file answers.json --json
+aiwf review <root_run_id> --action <最新action.id> --verdict APPROVE --feedback "用户的意见" --json
+aiwf review <root_run_id> --action <最新action.id> --verdict REJECT --feedback "用户要求修改的内容" --json
 ```
 
-- APPROVE：按 routes 前进；
-- REJECT：指针回到 routes 指定节点（缺省重做被验收的 task），反馈随下次 spec
-  下发（`node.feedback`），按意见修改。
-- 若 complete 时产物不符节点的 `output_schema`，引擎直接**驳回**（run 不失败、
-  不走人工）：node_runs 记 `rejected`、`node.feedback` 给原因，按反馈改完重报即可。
+质检结论是 Agent 判断，人工 review 必须来自用户；测试夹具中的模拟审批不可用于
+真实运行。`status=completed` 才交付最终成果；failed 时查看 error 并处理原因。
+收到 stale action 不要重试旧结果，应重新 current，确认现在的任务与产物是否匹配。
+动作编号防顺序误报，不提供多进程并发写保护；同一根运行由一个执行者驱动。
 
-### 子工作流节点：转去驱动子级
-
-当前节点是 `subflow` / `foreach` 时，引擎已自动建好子运行；信封的 `node.child`
-给出子 `run_id`（foreach 还带进度 `node.subflow_state.progress`）：
-
-- **不要 complete 父节点**——子级进行中父级会拒绝。直接用现有命令驱动子级：
-  ```bash
-  aiwf current <child_run_id> --json
-  # 按子级自己的 phase 行动（多为普通 task），直到子级走到 end
-  aiwf complete <child_run_id> --empty --json
-  ```
-- 子级 end 的那次 complete 会被引擎**自动传播**：校验子级 exports 快照；foreach
-  重读 items、创建下一实例或写结果清单收尾。返回的信封已经是**父级的下一规格**
-  （foreach 会显示新的 `node.child`，继续驱动即可）。
-- foreach 的结果清单位于父运行目录 `foreach-<node>-results.json`，父 context 只有
-  `{"$file":路径}`，需要汇总时读该清单。
-- **动态 items**：父级进入 `awaiting_items` 表示当前条目已跑完、源里还没有新条目。
-  外部追加条目（或设 `done=true`）后执行 `aiwf resume <wf_id> <run_id>` 继续。
-- 父节点已完成后只想重做某一实例：
-  ```bash
-  aiwf redo <run_id> --node chapters --instance 0 --reason "重写第一章" --json
-  ```
-  子级沿用原目录与 run_id；完成后清单整体刷新、其余实例保留。
-- 子级失败（含 exports 契约不满足）：abort 时父级 failed，`aiwf resume` 会同时
-  重开该子级；on_fail=continue 时 foreach 自动推进下一条，失败留在清单。
-
-## 3. 计划外回跳修订（revise）
-
-执行中途发现某个**已完成的 task** 内容需要调整（而非验收打回），无需改定义：
+## 临时失败与等待
 
 ```bash
-aiwf revise <run_id> --target worldview --reason "补充一条设定规则" \
-  [--mode cascade] [--scope auto] --json
+aiwf fail <root_run_id> --action <最新action.id> --error "具体失败原因" --json
+aiwf resume <root_workflow_id> <root_run_id> --json
 ```
 
-**重做范围如何确定**：引擎根据节点 prompt/requirements 中的 `${var}` 引用及 task
-显式声明的 `consumes`（context key 或按 `$file` 路径匹配的 glob）构建数据依赖图。
+临时工具失败修好后 resume；嵌套子运行一起恢复。质检次数耗尽不能靠 resume
+清零或直接补报 PASS；需要明确修订时加载主入口“修订与重做”。
+定义错误不能靠反复 resume 修好：1.1 运行使用定义快照，修正源定义后新建运行。
 
-- `--scope auto`（默认）：从 target 的输出键沿依赖图求传递闭包——引用了变更内容
-  的节点标 stale 重做；其余已完成的下游节点自动复用（审计记 skipped），不重做。
-- `--scope all`：target 之后所有节点重做。
-- `--scope manual --nodes a,b`：只重做指定节点。
+awaiting_items 表示动态清单等待追加或封口，不能忙循环 resume；
+先按业务更新队列再恢复。实际处理时加载主入口“动态清单”。
+汇总 foreach 时读取结果清单并检查失败项，不数目录。
 
-**两种模式**：
+## 交接与交付
 
-- `--mode cascade`（默认）：沿 edges 前进，stale 节点重做，非 stale 节点自动跳过，
-  走完 stale 清单后修订关闭、流程恢复正常。
-- `--mode return`：只重做 target 本身，完成后直接跳回发起修订时所在节点。
+交接时读取根运行 `context.md`，再 `current --json`。文件索引定位产物，
+`runs show/events` 查看历史；不要从目录里推断哪个章节已验收。
 
-**修改已完成节点的输入**（如世界观的灵感从"玄幻"改成"未来世界"）：直接对该
-节点 provide 并加 `--node`，引擎会自动开启 cascade 修订：
+交付时报告状态、关键产物链接、实际验证结果；未完成时明确停在哪个动作。
+流程完成只代表状态机走完，不自动证明正文质量、代码正确或所有批量项成功。
+等待真实用户回答/验收时保留根 run_id、问题或要求，收到回复后继续。
 
-```bash
-aiwf provide <run_id> --node worldview -p inspiration="未来世界" --reason "换方向"
-```
+## 常见误用速查
 
-约束：target 必须是已成功执行过的 task；同一时间只允许一个活跃修订。
+| 现象 | 处理 |
+|---|---|
+| complete 要求 action | 使用本次 current 返回的 action.id |
+| action stale | 重读 current，确认任务和结果匹配后再上报 |
+| ref missing | 查实际 context；确认父子 inputs 和前置节点是否执行 |
+| 文件输出被驳回 | 检查顶层 $file、声明路径和文件存在性 |
+| 把正文传 --output-file 后解析失败 | 该参数要求结果 JSON；正文应通过 $file 引用 |
+| PASS 后还在 awaiting_review | 等待用户结论，再用 review，不重复提交 PASS |
+| 不知道子 run 怎么切换 | 1.1 使用根 run_id，任务包直接给叶子动作 |
+| 旧 run 没有 action | 加载主入口“集成与兼容”的 1.0 协议 |
 
-## 4. 失败处理
-
-```bash
-aiwf fail <run_id> --error "失败原因"
-aiwf resume <wf_id> <run_id>
-```
-
-失败节点的记录入审计；续跑从失败节点重新执行，已完成节点不重跑，上下文从记录恢复。
-进程可随时中断，`aiwf current` 查看当前 phase 后继续。
-
-先看失败信封的 `error` 判断类型，再决定动作：
-
-- **可恢复失败**（工具临时故障、执行步骤出错）：排除原因后 `aiwf resume`，从失败
-  节点重跑。
-- **定义/条件类失败**（`condition variable ... not found`、模板变量无来源、
-  routes 目标错误）：resume 会原样再炸——需要修正工作流定义（变量写法见
-  [create-workflow.md](create-workflow.md)）或改用 revise/正确的协议命令，不要
-  盲目重试。
-- **子流程失败**：abort 时父级随之 failed，resume 父级会同时重开失败实例；
-  on_fail=continue 时已自动跳过，失败留在 foreach 清单。
-
-## 5. 共享与交接：context.md
-
-每次状态变更，引擎都会把运行概况自动写入该次运行文件夹的 `context.md`：状态与
-当前节点、输入、共享上下文（内联短值）、以及全部 `$file` 产物的**索引与来源
-节点**。它无需 LLM 生成、始终与记录同步：
-
-- 中途换人/换 agent 时，先读 `context.md` 即可拿到当前进度和所有产物位置；
-- 不确定某个产物路径时，查它的「产物索引」，再用读文件工具打开。
-
-审计检索见 [inspect-runs.md](inspect-runs.md)。
+状态变更和 current 使用 --json；runs show 支持 --json，
+runs list/events/search 输出文本。不要给所有子命令机械追加 --json。

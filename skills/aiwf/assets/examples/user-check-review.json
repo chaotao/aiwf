@@ -1,0 +1,32 @@
+{
+  "schema_version": "1.1",
+  "id": "user-check-review",
+  "name": "提问、有限质检与人工验收",
+  "max_steps": 50,
+  "input_schema": {
+    "type": "object",
+    "required": ["idea"],
+    "properties": {"idea": {"type": "string"}}
+  },
+  "nodes": [
+    {
+      "id": "draft",
+      "type": "task",
+      "user_input_schema": {
+        "type": "object",
+        "required": ["tone"],
+        "properties": {
+          "tone": {"type": "string", "enum": ["冷峻", "温暖"], "title": "叙事风格"}
+        }
+      },
+      "inputs": {"idea": {"ref": "idea"}, "tone": {"ref": "tone"}},
+      "prompt": "按 idea 与 tone 创作开篇，正文汉字数 300–500，不计标点与空白。先实测字数再上报。",
+      "output": {"file": "${run.dir}/opening.md"},
+      "check": {
+        "criteria": ["正文汉字数实测在 300–500 之间", "风格符合用户选择", "结尾有明确悬念"],
+        "max_attempts": 3
+      },
+      "review": {"requirements": ["风格和冲突符合预期，可以定稿"]}
+    }
+  ]
+}

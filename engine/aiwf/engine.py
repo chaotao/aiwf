@@ -6,9 +6,9 @@ an external AI agent (and human reviewers) via this protocol:
     start()    validate, create a run record, enter the start node
     spec()     render the current node info:
                  executing      -> task/branch/start/end node spec
-                 awaiting_input -> questions from a task node's input_schema
+                 awaiting_input -> questions from a task node's user_input_schema
                  awaiting_review-> acceptance requirements for a human
-    provide()  agent supplies user answers for a node's input_schema;
+    provide()  agent supplies user answers for a node's user_input_schema;
                changing an already-completed node's input auto-opens a revision
     complete() agent reports a task/branch output -> audit, context, routing
                (task output is checked against output_schema; a branch with
@@ -28,6 +28,8 @@ run is a normal run, nested physically inside the parent run folder.
 Persistence is the JSON run record, rewritten after every transition.
 """
 import fnmatch
+import copy
+import hashlib
 import json
 import os
 import re
@@ -36,6 +38,7 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 
 from .schema import (
     _jsonschema_validate,
+    node_user_input_schema,
     validate_inputs,
     validate_run_record,
     validate_workflow,
@@ -73,6 +76,20 @@ def is_file_ref(value: Any) -> bool:
 
 def file_ref_path(value: Any) -> Optional[str]:
     return value[FILE_REF_KEY] if is_file_ref(value) else None
+
+
+def file_ref_paths(value: Any) -> Set[str]:
+    paths: Set[str] = set()
+    if isinstance(value, dict):
+        path = file_ref_path(value)
+        if isinstance(path, str):
+            paths.add(path)
+        for child in value.values():
+            paths.update(file_ref_paths(child))
+    elif isinstance(value, list):
+        for child in value:
+            paths.update(file_ref_paths(child))
+    return paths
 
 
 def _stringify_context_value(value: Any) -> str:
@@ -144,6 +161,31 @@ def render(value: Any, context: Dict[str, Any]) -> Any:
     return value
 
 
+def resolve_data(value: Any, context: Dict[str, Any]) -> Any:
+    """Typed references are data; templates remain text. Never dereference files."""
+    if isinstance(value, dict):
+        if set(value) == {"ref"}:
+            return copy.deepcopy(resolve_dotted(context, value["ref"]))
+        return {k: resolve_data(v, context) for k, v in value.items()}
+    if isinstance(value, list):
+        return [resolve_data(v, context) for v in value]
+    return render(value, context)
+
+
+def data_refs(value: Any) -> Set[str]:
+    refs = template_refs(value)
+    if isinstance(value, dict):
+        if set(value) == {"ref"}:
+            refs.add(value["ref"])
+        else:
+            for v in value.values():
+                refs.update(data_refs(v))
+    elif isinstance(value, list):
+        for v in value:
+            refs.update(data_refs(v))
+    return refs
+
+
 def template_refs(value: Any) -> Set[str]:
     """Collect every ${var} referenced inside strings of a JSON-like value."""
     refs: Set[str] = set()
@@ -179,6 +221,8 @@ COMPARISON_OPS = {
 
 def resolve_condition_value(value: Any, context: Dict[str, Any]) -> Any:
     """Literal, or {"var": "key"} read from context (optional default)."""
+    if isinstance(value, dict) and set(value) == {"ref"}:
+        return resolve_data(value, context)
     if isinstance(value, dict) and "var" in value:
         key = value["var"]
         try:
@@ -220,7 +264,7 @@ def eval_condition(cond: Dict[str, Any], context: Dict[str, Any]) -> bool:
 
 def condition_refs(cond: Any) -> Set[str]:
     """Collect every {"var": "..."} reference inside a condition tree."""
-    refs: Set[str] = set()
+    refs: Set[str] = data_refs(cond)
     if isinstance(cond, dict):
         if "var" in cond and isinstance(cond["var"], str):
             refs.add(cond["var"])
@@ -310,7 +354,11 @@ class WorkflowEngine:
         consumers: Dict[str, Set[str]] = {}
         glob_consumers: Dict[str, Set[str]] = {}
         for node in workflow["nodes"]:
-            nrefs: Set[str] = set()
+            nrefs = data_refs(node.get("inputs", {}))
+            nrefs.update(data_refs(node.get("output", {})))
+            nrefs.update(data_refs(node.get("check", {})))
+            nrefs.update(condition_refs(node.get("when")))
+            nrefs.update(data_refs(node.get("items")))
             if node["type"] in ("task", "branch"):
                 nrefs.update(template_refs(node.get("prompt", "")))
             if node["type"] == "task":
@@ -347,11 +395,13 @@ class WorkflowEngine:
         available: Set[str] = set(
             (workflow.get("input_schema") or {}).get("properties", {}).keys()
         )
+        if workflow["schema_version"] == "1.1":
+            available.add("run")
         for n in workflow["nodes"]:
             if n["type"] == "task":
                 available.add(n.get("output_key", n["id"]))
                 available.update(
-                    (n.get("input_schema") or {}).get("properties", {}).keys()
+                    node_user_input_schema(n).get("properties", {}).keys()
                 )
             elif n["type"] == "subflow":
                 available.add(n.get("output_key", n["id"]))
@@ -359,7 +409,7 @@ class WorkflowEngine:
                 available.add(n.get("outputs_key", n["id"]))
 
         def check(node: Dict[str, Any], refs: Set[str]) -> None:
-            injected = (node.get("as", "item"), node.get("index_as", "index"))
+            injected = (node.get("as", "item"), node.get("index_as", "index"), "previous")
             for ref in refs:
                 root = ref.split(".", 1)[0]
                 if node["type"] == "foreach" and root in injected:
@@ -368,12 +418,15 @@ class WorkflowEngine:
                     raise ValueError(
                         f"node {node['id']!r} references undefined context key "
                         f"${{{ref}}}; provide it via run inputs, an earlier "
-                        f"node output, or this node's input_schema"
+                        f"node output, or this node's user_input_schema"
                     )
 
         for node in workflow["nodes"]:
             ntype = node["type"]
-            refs: Set[str] = set()
+            refs = data_refs(node.get("inputs", {}))
+            refs.update(data_refs(node.get("output", {})))
+            refs.update(data_refs(node.get("check", {})))
+            refs.update(data_refs(node.get("items")))
             if ntype in ("task", "branch"):
                 refs.update(template_refs(node.get("prompt", "")))
             if ntype == "branch" and node.get("when"):
@@ -490,11 +543,11 @@ class WorkflowEngine:
         pending = set(changed_keys)
 
         def match_globs(key: str) -> None:
-            path = file_ref_path(context.get(key))
-            if path is None:
+            paths = file_ref_paths(context.get(key))
+            if not paths:
                 return
             for pattern, nodes in glob_consumers.items():
-                if not fnmatch.fnmatch(path, pattern):
+                if not any(fnmatch.fnmatch(path, pattern) for path in paths):
                     continue
                 for node_id in nodes:
                     if node_id in affected:
@@ -538,7 +591,10 @@ class WorkflowEngine:
     ) -> str:
         id_field = node.get("id_field")
         if id_field and isinstance(item, dict) and id_field in item:
-            return str(item[id_field])
+            key = str(item[id_field])
+            if not re.fullmatch(r"[A-Za-z0-9_-]+", key):
+                raise ValueError(f"invalid instance key {key!r}; use letters, digits, _ or -")
+            return key
         return str(index)
 
     def _new_single_state(
@@ -563,6 +619,8 @@ class WorkflowEngine:
             self._make_instance(self._instance_key(node, i, item), i)
             for i, item in enumerate(items)
         ]
+        if len({i["key"] for i in instances}) != len(instances):
+            raise ValueError("foreach instance keys must be unique")
         return {
             "node_id": node["id"], "status": "active", "kind": "foreach",
             "subflow_id": child_wf["id"], "inline": bool(node.get("nodes")),
@@ -584,19 +642,23 @@ class WorkflowEngine:
         src = node["items"]
         if isinstance(src, list):
             value: Any = src
+        elif isinstance(src, dict) and "ref" in src:
+            value = resolve_data(src, ctx)
         elif isinstance(src, dict) and "var" in src:
             key = src["var"]
-            if key not in ctx:
-                raise KeyError(f"items variable {key!r} not found in context")
-            value = ctx[key]
+            value = resolve_dotted(ctx, key)
         elif isinstance(src, dict) and "$file" in src:
-            value = self.storage.read_json_file(src["$file"])
+            value = render(src, ctx)
         else:
-            raise ValueError("unsupported items source; use an array, {var} or {$file}")
+            raise ValueError("unsupported items source; use an array, {ref} or {$file}")
+        if is_file_ref(value):
+            value = self.storage.read_json_file(value["$file"])
         if isinstance(value, list):
             return "static", value, False
         if isinstance(value, dict) and isinstance(value.get("items"), list):
-            return "dynamic", value["items"], bool(value.get("done", False))
+            if not isinstance(value.get("done"), bool):
+                raise ValueError("dynamic items require an explicit boolean done")
+            return "dynamic", value["items"], value["done"]
         raise ValueError("items source must be an array or {\"done\":...,\"items\":[...]}")
 
     def _merge_items(
@@ -610,6 +672,14 @@ class WorkflowEngine:
                 f"items count {len(items)} exceeds max_instances {cap}"
             )
         existing = state["instances"]
+        if state.get("items_snapshot"):
+            previous = self.storage.read_json_file(state["items_snapshot"])
+            if items[:len(previous)] != previous:
+                raise ValueError("dynamic items are append-only; existing items changed or removed")
+            keys = [self._instance_key(node, i, item) for i, item in enumerate(items)]
+            if len(set(keys)) != len(keys):
+                raise ValueError("foreach instance keys must be unique")
+            self.storage.write_json_file(state["items_snapshot"], items)
         if len(items) > len(existing):
             for i in range(len(existing), len(items)):
                 existing.append(
@@ -675,7 +745,8 @@ class WorkflowEngine:
         props[node.get("as", "item")] = {}
         props[node.get("index_as", "index")] = {}
         wf = {
-            "schema_version": "1.0",
+            "schema_version": parent_workflow["schema_version"],
+            "max_steps": parent_workflow.get("max_steps", 50),
             "id": f'{parent_workflow["id"]}.{node["id"]}',
             "name": f'inline:{node["id"]}',
             "input_schema": {
@@ -700,17 +771,18 @@ class WorkflowEngine:
     ) -> List[Dict[str, str]]:
         first_id, last_id = body[0]["id"], body[-1]["id"]
         raw = node.get("edges")
-        if raw:
+        if raw is not None:
             edges = [dict(e) for e in raw]
         else:
             edges = [
                 {"from": body[i]["id"], "to": body[i + 1]["id"]}
                 for i in range(len(body) - 1)
+                if body[i]["type"] not in ("branch", "review")
             ]
         pairs = {(e["from"], e["to"]) for e in edges}
         if ("start", first_id) not in pairs:
             edges.append({"from": "start", "to": first_id})
-        if (last_id, "end") not in pairs:
+        if (last_id, "end") not in pairs and body[-1]["type"] not in ("branch", "review"):
             edges.append({"from": last_id, "to": "end"})
         return edges
 
@@ -773,12 +845,21 @@ class WorkflowEngine:
         child_wf = self._child_wf_for_state(workflow, record, node, state)
         scope = dict(record["context"])
         if state["kind"] == "foreach":
-            item_value = self._item_at(
-                node, record["context"], inst["index"]
-            )
+            if state.get("items_snapshot"):
+                item_value = self.storage.read_json_file(state["items_snapshot"])[inst["index"]]
+            else:
+                item_value = self._item_at(node, record["context"], inst["index"])
             scope[state["as"]] = item_value
             scope[state["index_as"]] = inst["index"]
-        resolved = render(node.get("inputs", {}), scope)
+            scope["previous"] = (
+                copy.deepcopy(state["instances"][inst["index"] - 1]["exports"])
+                if inst["index"] else None
+            )
+        resolved = (
+            resolve_data(node.get("inputs", {}), scope)
+            if workflow["schema_version"] == "1.1"
+            else render(node.get("inputs", {}), scope)
+        )
         if state["kind"] == "foreach":
             # the current item is part of the child contract context
             resolved[state["as"]] = item_value
@@ -786,7 +867,13 @@ class WorkflowEngine:
         validate_inputs(child_wf, resolved)
         self._assert_chain_ok(record, child_wf["id"])
 
-        run_id = inst["run_id"] or make_run_id()
+        prior = None
+        prior_path = os.path.join(
+            self.storage.child_dir(record, node["id"], inst["key"]), "record.json"
+        )
+        if workflow["schema_version"] == "1.1" and os.path.isfile(prior_path):
+            prior = self.storage.read_json_file(prior_path)
+        run_id = inst["run_id"] or (prior["run_id"] if prior else make_run_id())
         inst.update(
             run_id=run_id, status="running", started_at=now_iso(),
             error=None, exports={},
@@ -806,6 +893,11 @@ class WorkflowEngine:
         child_record = self._new_child_record(
             child_wf, resolved, run_id, link
         )
+        if prior:
+            child_record["started_at"] = prior["started_at"]
+            child_record["node_runs"] = prior["node_runs"]
+            child_record["events"] = prior["events"] + child_record["events"]
+        self._initialize_protocol(child_wf, child_record)
         self._enter_node(child_wf, child_record)
 
     def _new_child_record(
@@ -922,9 +1014,14 @@ class WorkflowEngine:
             return self._finish_foreach_node(
                 parent_wf, parent_record, node, state
             )
-        mode, items, done = self._resolve_items(node, parent_record["context"])
-        if mode == "dynamic":
-            self._merge_items(state, items, done, node)
+        try:
+            if state["items_mode"] == "dynamic":
+                mode, items, done = self._resolve_items(node, parent_record["context"])
+                if mode != "dynamic":
+                    raise ValueError("dynamic items source changed mode")
+                self._merge_items(state, items, done, node)
+        except (ValueError, KeyError, OSError) as e:
+            return self._fail(parent_wf, parent_record, f"foreach items invalid: {e}")
         nxt = self._next_pending(state)
         if nxt is not None:
             self._save(parent_wf, parent_record)
@@ -1029,6 +1126,11 @@ class WorkflowEngine:
             state = self._new_foreach_state(
                 node, child_wf, items_mode, items, done
             )
+            if workflow["schema_version"] == "1.1":
+                state["items_snapshot"] = os.path.join(
+                    self.storage.run_dir_for_record(record), f"foreach-{node['id']}-items.json"
+                )
+                self.storage.write_json_file(state["items_snapshot"], items)
             if not items and (items_mode == "static" or done):
                 record["subflow_state"] = state
                 self._finish_foreach_node(workflow, record, node, state)
@@ -1115,6 +1217,10 @@ class WorkflowEngine:
         validate_workflow(workflow)
         inputs = inputs or {}
         validate_inputs(workflow, inputs)
+        if workflow["schema_version"] == "1.1":
+            if "run" in inputs:
+                raise ValueError("'run' is reserved for runtime metadata")
+            self.references_check(workflow)
 
         record = {
             "schema_version": SCHEMA_VERSION,
@@ -1139,12 +1245,125 @@ class WorkflowEngine:
             "subflow_state": None,
         }
         self._append_event(record, "run_started")
+        self._initialize_protocol(workflow, record)
         self._enter_node(workflow, record)
         return record
+
+    def _initialize_protocol(self, workflow, record):
+        record["workflow_version"] = workflow["schema_version"]
+        if workflow["schema_version"] == "1.1":
+            record["context"]["run"] = {
+                "id": record["run_id"],
+                "dir": self.storage.run_dir_for_record(record),
+            }
+            self.storage.write_json_file(
+                os.path.join(self.storage.run_dir_for_record(record), "workflow.json"),
+                workflow,
+            )
+
+    def root_record(self, record):
+        while record.get("parent"):
+            record = self.storage.find_run(record["parent"]["run_id"])
+        return record
+
+    def _leaf_record(self, record):
+        while record["status"] == "running":
+            state = record.get("subflow_state")
+            if not (state and state["status"] == "active"
+                    and state["node_id"] == record["next_node"]):
+                break
+            inst = self._active_instance(state)
+            if not inst or not inst.get("run_id"):
+                break
+            try:
+                record = self.storage.find_run(inst["run_id"])
+            except FileNotFoundError:
+                break
+        return record
+
+    def action_spec(self, run_id):
+        """Read-only root-to-leaf task packet; no scheduling or reconciliation."""
+        root = self.root_record(self.storage.find_run(run_id))
+        leaf = self._leaf_record(root)
+        workflow = self.storage.load_workflow_for_record(leaf)
+        spec = self.node_spec(workflow, leaf)
+        spec["run_id"] = root["run_id"]
+        spec["root_workflow_id"] = root["workflow_id"]
+        spec["action"] = None
+        if leaf["status"] == "running":
+            kind = {
+                "awaiting_input": "provide", "awaiting_review": "review",
+                "awaiting_items": "resume", "awaiting_check": "check",
+            }.get(leaf["phase"], "complete")
+            node = self._node(workflow, leaf["next_node"])
+            if node["type"] in ("start", "end", "subflow", "foreach") or node.get("when"):
+                if leaf["phase"] == "executing":
+                    kind = "resume"
+            digest = hashlib.sha256(json.dumps(
+                [leaf, workflow], sort_keys=True, ensure_ascii=False
+            ).encode()).hexdigest()[:24]
+            spec["action"] = {
+                "id": digest, "run_id": leaf["run_id"],
+                "node_id": leaf["next_node"], "kind": kind,
+            }
+        return spec
+
+    def settle(self, run_id):
+        """Explicit mutation boundary: recover children, audit mechanical steps."""
+        root_id = self.root_record(self.storage.find_run(run_id))["run_id"]
+        while True:
+            root = self.storage.find_run(root_id)
+            if root["status"] != "running":
+                return root
+            record = root
+            moved = False
+            while record["status"] == "running":
+                workflow = self.storage.load_workflow_for_record(record)
+                state = record.get("subflow_state")
+                if not (state and state["status"] == "active"
+                        and state["node_id"] == record["next_node"]
+                        and record["phase"] != "awaiting_items"):
+                    break
+                node = self._node(workflow, state["node_id"])
+                if self._reconcile_state(workflow, record, node, state):
+                    moved = True
+                    break
+                inst = self._active_instance(state)
+                if not inst or not inst.get("run_id"):
+                    break
+                record = self.storage.find_run(inst["run_id"])
+            if moved:
+                continue
+            workflow = self.storage.load_workflow_for_record(record)
+            if record["status"] != "running" or record["phase"] != "executing":
+                return self.storage.find_run(root_id)
+            node = self._node(workflow, record["next_node"])
+            if node["type"] not in ("start", "end") and not (
+                node["type"] == "branch" and node.get("when")
+            ):
+                return self.storage.find_run(root_id)
+            self.complete(workflow, record["run_id"])
+
+    def act(self, run_id, action_id, command, **kwargs):
+        """Guard an agent/human response against the current leaf identity."""
+        spec = self.action_spec(run_id)
+        action = spec["action"]
+        if not action or not action_id or action_id != action["id"]:
+            raise RuntimeError("missing or stale action; fetch `current --json` again")
+        expected = "complete" if action["kind"] == "check" else action["kind"]
+        if command not in (expected, "fail"):
+            raise RuntimeError(f"current action requires {expected}, not {command}")
+        record = self.storage.find_run(action["run_id"])
+        workflow = self.storage.load_workflow_for_record(record)
+        getattr(self, command)(workflow, record["run_id"], **kwargs)
+        self.settle(spec["run_id"])
+        return self.action_spec(spec["run_id"])
 
     def resume(self, workflow: Dict[str, Any], run_id: str) -> Dict[str, Any]:
         validate_workflow(workflow)
         record = self.storage.load_run(workflow["id"], run_id)
+        if record.get("workflow_version") == "1.1":
+            workflow = self.storage.load_workflow_for_record(record)
         if record["status"] == "completed":
             raise RuntimeError(f"run {run_id} is already completed")
         state = record.get("subflow_state")
@@ -1164,6 +1383,8 @@ class WorkflowEngine:
             raise RuntimeError(f"run {run_id} has no next_node to resume from")
         record["status"] = "running"
         record["error"] = None
+        record["ended_at"] = None
+        record["duration_ms"] = None
         self._append_event(record, "run_resumed")
         # phase/pending state already describes the node; only reset its timer
         record["node_started_at"] = now_iso()
@@ -1174,15 +1395,14 @@ class WorkflowEngine:
             )
             if failed and failed.get("run_id"):
                 child_record = self.storage.find_run(failed["run_id"])
-                child_record["status"] = "running"
-                child_record["error"] = None
-                self._append_event(child_record, "run_resumed")
+                child_wf = self.storage.load_workflow_for_record(child_record)
+                self.resume(child_wf, child_record["run_id"])
                 failed.update(
                     status="running", error=None, started_at=now_iso()
                 )
-                child_wf = self.storage.load_workflow_for_record(child_record)
-                self._save(child_wf, child_record)
         self._save(workflow, record)
+        if state and state.get("status") == "active":
+            self._reconcile_state(workflow, record, node, state)
         return record
 
     # ---- protocol: node spec -----------------------------------------
@@ -1203,25 +1423,21 @@ class WorkflowEngine:
             return envelope
 
         node = self._node(workflow, current)
-        state = record.get("subflow_state")
-        if (
-            state and state.get("status") == "active"
-            and state.get("node_id") == current
-        ):
-            moved = self._reconcile_state(workflow, record, node, state)
-            if moved:
-                return self.node_spec(workflow, record)
-
         if record["phase"] == "awaiting_input":
             envelope["input_request"] = self._input_request(node, record["context"])
             return envelope
 
         if record["phase"] == "awaiting_review":
-            envelope["review_request"] = record["pending_review"]
+            envelope["review_request"] = {
+                **record["pending_review"],
+                "output": self._last_output(record, node["id"]),
+            }
             envelope["node"] = self._basic_node(node, record, workflow, include_outputs=False)
             return envelope
 
         envelope["node"] = self._basic_node(node, record, workflow)
+        if record["phase"] == "awaiting_check":
+            envelope["check_request"] = record["pending_check"]
         return envelope
 
     def _basic_node(self, node: Dict[str, Any], record: Dict[str, Any],
@@ -1246,6 +1462,9 @@ class WorkflowEngine:
                 feedback=record.get("last_feedback"),
                 under_revision=bool(self._active_revision(record)),
             )
+            if workflow["schema_version"] == "1.1":
+                spec["inputs"] = self._materials(node, ctx)
+                spec["output"] = resolve_data(node.get("output"), ctx)
         elif ntype == "branch":
             spec.update(
                 model_hint=node.get("model") or workflow.get("default_model"),
@@ -1255,6 +1474,8 @@ class WorkflowEngine:
             )
             if node.get("when"):
                 spec.update(deterministic=True, when=node["when"])
+            if workflow["schema_version"] == "1.1":
+                spec["inputs"] = self._materials(node, ctx)
         elif ntype in ("subflow", "foreach"):
             state = record.get("subflow_state")
             spec["subflow_ref"] = node.get("workflow")
@@ -1311,8 +1532,20 @@ class WorkflowEngine:
         # start / end: id/type/name only
         return spec
 
+    @staticmethod
+    def _materials(node, ctx):
+        materials = {}
+        for name, value in node.get("inputs", {}).items():
+            try:
+                materials[name] = resolve_data(value, ctx)
+            except KeyError as e:
+                raise ValueError(
+                    f"node {node['id']!r} input {name!r}: {e}"
+                ) from e
+        return materials
+
     def _input_request(self, node: Dict[str, Any], ctx: Dict[str, Any]) -> Dict[str, Any]:
-        schema = node["input_schema"]
+        schema = node_user_input_schema(node)
         missing = self._missing_node_inputs(node, ctx)
         props = schema.get("properties", {})
         fields = []
@@ -1359,7 +1592,7 @@ class WorkflowEngine:
             node = self._node(workflow, target_id)
             merged = dict(record["context"])
             merged.update(values)
-            _jsonschema_validate(merged, node["input_schema"])
+            _jsonschema_validate(merged, node_user_input_schema(node))
             record["context"].update(values)
             missing = self._missing_node_inputs(node, record["context"])
             self._append_event(
@@ -1384,9 +1617,10 @@ class WorkflowEngine:
             raise ValueError(f"node {node_id!r} is not a task node")
         if not self._has_success(record, node_id):
             raise RuntimeError(f"task node {node_id!r} has not been executed yet")
-        if node.get("input_schema"):
+        user_schema = node_user_input_schema(node)
+        if user_schema:
             _jsonschema_validate(
-                {**record["context"], **values}, node["input_schema"]
+                {**record["context"], **values}, user_schema
             )
         self._begin_revision(
             workflow, record,
@@ -1408,14 +1642,21 @@ class WorkflowEngine:
         tokens: Optional[Dict[str, int]] = None,
     ) -> Dict[str, Any]:
         record = self._load_running(workflow, run_id)
+        if record["phase"] == "awaiting_check":
+            return self._check_result(workflow, record, output)
         if record["phase"] != "executing":
             raise RuntimeError(
                 f"run is in phase {record['phase']!r}, not accepting task output"
             )
+        if workflow["schema_version"] == "1.1" and len(record["node_runs"]) >= workflow.get("max_steps", 50):
+            return self._fail(workflow, record, "max_steps exceeded before accepting output")
         validate_output_size(output)
         current = record["next_node"]  # type: ignore[assignment]
         node = self._node(workflow, current)
         ended = datetime.now()
+        pending = record.get("pending_check")
+        if pending and pending.get("exhausted"):
+            raise RuntimeError("check attempts exhausted; revise explicitly or start a new run")
 
         # while a child run is live the parent node cannot be driven directly
         sub_state = record.get("subflow_state")
@@ -1454,6 +1695,14 @@ class WorkflowEngine:
             except Exception as e:
                 return self._reject_output(
                     workflow, record, node, ended, output, str(e)
+                )
+        if node["type"] == "task" and node.get("output"):
+            expected = resolve_data(node["output"], record["context"])["file"]
+            path = file_ref_path(output)
+            if path != expected or not isinstance(path, str) or not os.path.isfile(path):
+                return self._reject_output(
+                    workflow, record, node, ended, output,
+                    f"expected existing file {expected!r}, got {path!r}",
                 )
 
         decision: Optional[Dict[str, str]] = None
@@ -1506,13 +1755,31 @@ class WorkflowEngine:
                 )
             return self._complete(workflow, record)
 
-        if len(record["node_runs"]) >= workflow.get("max_steps", 50):
+        if workflow["schema_version"] == "1.0" and len(record["node_runs"]) >= workflow.get("max_steps", 50):
             return self._fail(
                 workflow, record,
                 f"max_steps ({workflow.get('max_steps', 50)}) exceeded; "
                 f"possible infinite loop",
             )
 
+        if node["type"] == "task" and node.get("check"):
+            attempt = pending["attempt"] + 1 if pending else 1
+            record["pending_check"] = {
+                "node_id": node["id"], "attempt": attempt,
+                "max_attempts": node["check"]["max_attempts"],
+                "criteria": render(node["check"]["criteria"], record["context"]),
+                "output": output, "started_at": now_iso(),
+            }
+            record["phase"] = "awaiting_check"
+            self._append_event(record, "check_requested", node_id=node["id"],
+                               attempt=attempt)
+            self._save(workflow, record)
+            return record
+
+        return self._after_execution(workflow, record, node, decision)
+
+    def _after_execution(self, workflow, record, node, decision=None):
+        rev = self._active_revision(record)
         # embedded human acceptance gate
         if node["type"] == "task" and node.get("review"):
             rendered_req = render(node["review"]["requirements"], record["context"])
@@ -1540,6 +1807,43 @@ class WorkflowEngine:
             return record
 
         self._advance(workflow, record, node, decision)
+        return record
+
+    def _check_result(self, workflow, record, output):
+        validate_output_size(output)
+        _jsonschema_validate(output, {
+            "type": "object", "required": ["verdict", "reason"],
+            "additionalProperties": False,
+            "properties": {
+                "verdict": {"enum": ["PASS", "REVISE"]},
+                "reason": {"type": "string", "minLength": 1},
+            },
+        })
+        if not output["reason"].strip():
+            raise ValueError("check reason must not be blank")
+        pending = record["pending_check"]
+        if pending.get("exhausted"):
+            raise RuntimeError("check attempts exhausted; revise explicitly or start a new run")
+        node = self._node(workflow, pending["node_id"])
+        self._append_event(
+            record, "check_decided", node_id=node["id"], attempt=pending["attempt"],
+            verdict=output["verdict"], reason=output["reason"],
+            started_at=pending["started_at"],
+            duration_ms=_elapsed_between(pending["started_at"], datetime.now()),
+            input={"criteria": pending["criteria"], "output": pending["output"]},
+            output=output, summary=make_summary(output),
+        )
+        if output["verdict"] == "PASS":
+            record["pending_check"] = None
+            record["last_feedback"] = None
+            return self._after_execution(workflow, record, node)
+        record["last_feedback"] = output["reason"]
+        if pending["attempt"] >= pending["max_attempts"]:
+            pending["exhausted"] = True
+            return self._fail(workflow, record,
+                              f"check max_attempts ({pending['max_attempts']}) exhausted: "
+                              f"{output['reason']}")
+        self._enter_node(workflow, record)
         return record
 
     def _reject_output(
@@ -1633,6 +1937,15 @@ class WorkflowEngine:
         # restart the child from its start node, same directory/run_id
         child_record["status"] = "running"
         child_record["error"] = None
+        if child_wf["schema_version"] == "1.1":
+            child_record["context"] = {
+                **child_record["inputs"], "run": child_record["context"]["run"],
+            }
+            child_record["pending_check"] = None
+            child_record["pending_review"] = None
+            child_record["subflow_state"] = None
+            child_record["ended_at"] = None
+            child_record["duration_ms"] = None
         self._append_event(child_record, "run_resumed")
         self._move_to(child_wf, child_record, self.start_node_id(child_wf))
         return record
@@ -1679,6 +1992,11 @@ class WorkflowEngine:
         if label == "APPROVE":
             record["last_feedback"] = None
             target = routes["APPROVE"]
+            if (rev and rev["mode"] == "return" and subject_id == rev["target"]
+                    and target is None):
+                self._close_revision(record)
+                self._move_to(workflow, record, rev["return_to"])
+                return record
             if target is None:
                 # embedded gate: follow normal flow from the task node
                 subject = self._node(workflow, subject_id)
@@ -1790,13 +2108,20 @@ class WorkflowEngine:
         self._append_event(record, event_type, **event_kwargs)
 
         record["next_node"] = target["id"]
+        if workflow["schema_version"] == "1.1":
+            record["pending_check"] = None
+            record["last_feedback"] = reason
+            # Invalidated values must not survive a different branch on replay.
+            for nid in stale:
+                for key in self.produced_keys(self._node(workflow, nid)):
+                    record["context"].pop(key, None)
         self._enter_node(workflow, record)
         return record
 
     # ---- internals: node entry / movement ----------------------------
     @staticmethod
     def _missing_node_inputs(node: Dict[str, Any], ctx: Dict[str, Any]) -> List[str]:
-        schema = node.get("input_schema") or {}
+        schema = node_user_input_schema(node)
         return [k for k in schema.get("required", []) if k not in ctx]
 
     def _enter_node(self, workflow: Dict[str, Any], record: Dict[str, Any]) -> None:
@@ -1804,6 +2129,22 @@ class WorkflowEngine:
         current = record["next_node"]
         node = self._node(workflow, current)
         record["node_started_at"] = now_iso()
+        if workflow["schema_version"] == "1.1":
+            record["activation_id"] = make_run_id()
+        if workflow["schema_version"] == "1.1" and len(record["node_runs"]) >= workflow.get("max_steps", 50):
+            self._fail(workflow, record, f"max_steps ({workflow.get('max_steps', 50)}) exceeded")
+            return
+        if (workflow["schema_version"] == "1.1"
+                and node["type"] in ("task", "branch", "review")
+                and not self._missing_node_inputs(node, record["context"])):
+            try:
+                self._materials(node, record["context"])
+                render(node.get("prompt", ""), record["context"])
+                render(node.get("requirements"), record["context"])
+                resolve_data(node.get("output"), record["context"])
+            except (KeyError, ValueError) as e:
+                self._fail(workflow, record, f"node {current!r} inputs unresolved: {e}")
+                return
 
         if node["type"] == "task":
             if self._missing_node_inputs(node, record["context"]):
@@ -1826,7 +2167,10 @@ class WorkflowEngine:
             )
         elif node["type"] in ("subflow", "foreach"):
             self._save(workflow, record)
-            self._activate_subflow_node(workflow, record, node)
+            try:
+                self._activate_subflow_node(workflow, record, node)
+            except (ValueError, KeyError, OSError) as e:
+                self._fail(workflow, record, f"node {current!r} activation failed: {e}")
             return
         else:
             record["phase"] = "executing"
@@ -1845,10 +2189,21 @@ class WorkflowEngine:
         else:
             nexts = self.build_adjacency(workflow).get(current, [])
             if not nexts:
-                self._fail(
-                    workflow, record,
-                    f"node {current!r} has no successor; expected an end node or edge",
-                )
+                if workflow["schema_version"] == "1.1":
+                    if record.get("parent"):
+                        try:
+                            exports = self._collect_exports(workflow, record)
+                        except Exception as e:
+                            self._propagate_child_failure(workflow, record, f"exports contract unmet: {e}")
+                        else:
+                            self._propagate_child_success(workflow, record, datetime.now(), exports)
+                    else:
+                        self._complete(workflow, record)
+                else:
+                    self._fail(
+                        workflow, record,
+                        f"node {current!r} has no successor; expected an end node or edge",
+                    )
                 return
             nxt = nexts[0]
         self._move_to(workflow, record, nxt)
@@ -1857,6 +2212,8 @@ class WorkflowEngine:
                  target_id: str) -> None:
         """Move toward target; during a cascade revision auto-skip reused nodes."""
         nxt = target_id
+        if workflow["schema_version"] == "1.1":
+            record["pending_check"] = None
         rev = self._active_revision(record)
         while rev and rev["mode"] == "cascade":
             if nxt in rev["stale_nodes"]:
@@ -1866,6 +2223,9 @@ class WorkflowEngine:
                 break
             prior = self._last_success_node_run(record, nxt)
             if prior is not None:
+                if len(record["node_runs"]) >= workflow.get("max_steps", 50):
+                    self._fail(workflow, record, "max_steps exceeded during reuse")
+                    return
                 record["node_runs"].append(self._skipped_run(record, prior))
                 self._append_event(record, "node_reused", node_id=nxt)
                 node = self._node(workflow, nxt)
@@ -1874,8 +2234,7 @@ class WorkflowEngine:
                     continue
                 nexts = self.build_adjacency(workflow).get(nxt, [])
                 if not nexts:
-                    self._fail(workflow, record,
-                               f"reused node {nxt!r} has no successor")
+                    self._advance(workflow, record, node, None)
                     return
                 nxt = nexts[0]
                 continue
@@ -2012,7 +2371,10 @@ class WorkflowEngine:
     def _audited_input_for(self, record: Dict[str, Any], node: Dict[str, Any]) -> Any:
         ntype = node["type"]
         if ntype == "task":
-            return {"prompt": render(node.get("prompt", ""), record["context"])}
+            result = {"prompt": render(node.get("prompt", ""), record["context"])}
+            if node.get("inputs"):
+                result["inputs"] = self._materials(node, record["context"])
+            return result
         if ntype == "branch":
             return {"prompt": render(node.get("prompt", ""), record["context"])}
         if ntype in ("subflow", "foreach"):
@@ -2111,7 +2473,7 @@ class WorkflowEngine:
                 if path not in seen:
                     seen.add(path)
                     found.append((path, origin))
-            elif isinstance(value, dict):
+            if isinstance(value, dict):
                 for v in value.values():
                     scan(v, origin)
             elif isinstance(value, list):
@@ -2128,8 +2490,11 @@ class WorkflowEngine:
                 origin = f"{state['node_id']} items 源"
                 if "$file" in src:
                     scan({FILE_REF_KEY: src["$file"]}, origin)
-                elif "var" in src:
-                    scan(record["context"].get(src["var"]), origin)
+                elif "var" in src or "ref" in src:
+                    try:
+                        scan(resolve_dotted(record["context"], src.get("ref", src.get("var"))), origin)
+                    except KeyError:
+                        pass
             if depth < MAX_SUBFLOW_DEPTH:
                 for inst in state["instances"]:
                     rid = inst.get("run_id")

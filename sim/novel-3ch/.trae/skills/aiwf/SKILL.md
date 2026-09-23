@@ -1,63 +1,56 @@
 ---
 name: aiwf
-description: Create, run, and inspect aiwf workflows in the current project. Use when the user asks to 创建/新建/定义/修改 工作流，运行/执行/跑/续跑 工作流，或查看运行状态、检索历史执行记录、审计回溯. Covers workflow authoring, agent-driven execution with human review, and run-record inspection.
+description: 创建、运行与审计 aiwf 工作流。用户要求创建或修改工作流、执行或续跑流程、查看运行记录时使用；一次性短任务无需固化为工作流。
 ---
 
 # aiwf 工作流
 
-aiwf 是 schema 驱动的 AI 工作流引擎：工作流是一份 JSON 定义，描述一串节点
-（`start / task / branch / review / end`），用于把可复用流程固化下来。
+先判断流程是否有恢复、复用、批量或验收价值；一次性短任务直接完成。
+引擎是纯状态机，不调用 LLM 或业务工具。由你获取任务包、执行任务、报告结果，
+引擎负责推进、校验与文件审计。
 
-**核心架构：引擎是纯状态机**——不调用 LLM、不执行工具。由你（AI agent）
-驱动一次运行，并在需要时把人接入：向引擎获取当前状态 → 自己执行，或向用户
-收集信息/请人验收 → 上报，引擎负责审计、上下文更新与节点推进。
+## 加载顺序
 
-运行中 `status=running` 时有四种 phase：
+只读当前意图对应的指南。创建时先读入门，再从范例目录选最接近的一份；
+遇到字段或能力问题才补读专题。执行时优先读执行指南，不预读全部创作指南。
+修改本 Skill 时更新仓库的 `skills/aiwf` 源目录，再同步项目安装副本。
 
-- `executing`：正常，按节点 spec 执行；
-- `awaiting_input`：任务需要用户先提供信息，你提问后用 provide 回报；
-- `awaiting_review`：等待人工验收结论，用 review 回报；
-- `awaiting_items`：仅动态 foreach——当前条目跑完、源里还没有新条目，外部补充后 resume。
+### 入门与日常使用
 
-两条跨场景约定：**大产物（正文/剧本等）写文件、只回引用** `{"$file": "路径"}`
-（单节点输出 ≤2000 字符，引擎强校验）；每次运行独立成文件夹，内含自动生成的
-`context.md`，是人和 agent 共享进度/产物索引的入口。
+| 意图 | 读取 |
+|---|---|
+| 新建、修改定义；第一次使用 | [创建入门](references/create-workflow.md) |
+| 找完整范例；小说、短剧、游戏、修代码 | [范例目录](references/examples.md) — 选中后再读取或复制 assets 中的 JSON |
+| 启动、执行、接管、临时失败续跑 | [执行指南](references/run-workflow.md) |
+| 查看进度、记录、产物、耗时、失败原因 | [审计与检索](references/inspect-runs.md) |
 
-## 命令约定
+### 常用专题
 
-按优先级：仓库中的 `engine/bin/aiwf` → PATH 上的 `aiwf`（pip 安装）→
-`PYTHONPATH=engine python3 -m aiwf`，三者等价。状态变更命令建议加 `--json`。
+| 疑问 / 能力 | 读取 |
+|---|---|
+| inputs 能放什么、ref 引用范围、变量与字段命名 | [字段与数据作用域](references/data-reference.md) |
+| 单文件、多文件、结构化结果、修代码节点 output 怎么写 | [产物设计](references/outputs.md) |
+| 运行前入参、途中提问、Agent 质检、人工验收 | [输入与验收](references/interaction.md) |
+| 批量章节 / 资源、上一项结果、复用子工作流 | [批量与子流程](references/patterns.md) |
+| 条件判断、Agent 分类、多出口 | [分支与路由](references/routing.md) |
 
-## 按场景加载详细指南（渐进式披露）
+### 高阶玩法（有需要再读）
 
-先判断用户意图，再读取对应参考文件，不要一次性加载全部：
+| 需求 | 读取 |
+|---|---|
+| 数量事先未知、运行中追加章节 / 条目 | [动态清单](references/advanced-dynamic.md) |
+| 改已完成任务、依赖级联、局部重做、修改历史输入 | [修订与重做](references/advanced-revisions.md) |
+| SDK 驱动、显式 edges、模型提示、旧 1.0 迁移 | [集成与兼容](references/advanced-integration.md) |
 
-| 用户意图 | 加载 |
-|---------|------|
-| 创建 / 新建 / 定义 / 修改工作流，把流程固化为可复用工作流 | [references/create-workflow.md](references/create-workflow.md) |
-| 运行 / 执行 / 跑工作流，收集用户输入、人工验收、计划外回跳修订、续跑 | [references/run-workflow.md](references/run-workflow.md) |
-| 查看运行状态、列出历史、检索记录、审计、回溯某次运行 | [references/inspect-runs.md](references/inspect-runs.md) |
+## 始终遵守
 
-多个意图时按需依次加载。最小命令速查：
+- 新定义用 `schema_version: "1.1"`；从顺序 task 开始，末任务自然结束。
+- `inputs` 是材料；顶层 `input_schema` 校验启动入参；task `user_input_schema` 收集用户信息。
+- `{"ref":"key"}` 保留数据类型，`${key}` 仅文字插值；大产物落文件，结果回 `$file`。
+- 单节点输出 ≤2000 字符；优先把运行产物放 `${run.dir}`，代码修改仍落实际项目文件。
+- 使用根 run_id 和最新 `action.id` 驱动；依据 `action.kind` 选择命令，不把 phase 当命令。
+- `check` 由 Agent 实际检查；`review` 的结论来自用户，不能自行代批。
+- `.aiwf/runs/` 保留并纳入版本管理；交接先看 `context.md`，再 `current --json`。
 
-```bash
-aiwf init                              # 初始化 .aiwf 存储
-aiwf validate <file>                   # 校验工作流定义
-aiwf workflows                         # 列出已有工作流
-aiwf run <wf_id> --input-file f.json   # 启动运行，返回当前状态
-aiwf current <run_id>                  # 重新查看当前状态（任意 phase）
-aiwf complete <run_id> --output "..."  # 上报任务/分支结果（--output-file / --empty）
-aiwf provide <run_id> -p k=v           # 回报用户提供的信息（--node 改已完成节点）
-aiwf review <run_id> --verdict APPROVE # 人工验收结论（--feedback）
-aiwf revise <run_id> --target n        # 计划外回跳（--mode cascade|return）
-aiwf fail <run_id> --error "..."       # 上报失败
-aiwf resume <wf_id> <run_id>           # 续跑失败运行
-aiwf runs list [wf_id]                 # 列出运行
-aiwf runs show <run_id>                # 查看运行（--node / --json）
-aiwf runs events <run_id>              # 查看事件流（纯文本，不支持 --json）
-aiwf runs search <query>               # 检索历史
-aiwf skills install                    # 安装本 skill 到项目 .trae/skills
-```
-
-> `--json`：状态变更命令建议加（信封还带 `error` 字段，失败时直接含原因）；
-> `runs show/search` 支持，`runs list/events` 不支持。
+命令优先用本仓库 `engine/bin/aiwf`，其次 PATH 的 `aiwf`，或在仓库中
+`PYTHONPATH=engine python3 -m aiwf`。下文统一写 `aiwf`；状态变更命令加 `--json`。

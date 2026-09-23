@@ -1,0 +1,52 @@
+{
+  "schema_version": "1.1",
+  "id": "condition-routing",
+  "name": "确定性条件：按测试退出码分流",
+  "input_schema": {
+    "type": "object",
+    "required": ["project_dir"],
+    "properties": {"project_dir": {"type": "string"}}
+  },
+  "nodes": [
+    {
+      "id": "tests",
+      "type": "task",
+      "inputs": {"project_dir": {"ref": "project_dir"}, "artifact_dir": "${run.dir}"},
+      "prompt": "读取项目约定，实际运行适当测试，保存报告到 artifact_dir，返回真实 exit_code 和 report 文件引用。无法执行时如实 fail，不虚构结果。",
+      "output_schema": {
+        "type": "object",
+        "required": ["exit_code", "report"],
+        "properties": {
+          "exit_code": {"type": "integer"},
+          "report": {"type": "object", "required": ["$file"], "properties": {"$file": {"type": "string"}}}
+        }
+      }
+    },
+    {
+      "id": "gate",
+      "type": "branch",
+      "when": {"eq": [{"ref": "tests.exit_code"}, 0]},
+      "routes": {"TRUE": "deliver", "FALSE": "diagnose"}
+    },
+    {
+      "id": "deliver",
+      "type": "task",
+      "inputs": {"tests": {"ref": "tests"}},
+      "prompt": "读取报告，归纳测试通过的范围和未覆盖项。",
+      "output": {"file": "${run.dir}/passed.md"}
+    },
+    {
+      "id": "diagnose",
+      "type": "task",
+      "inputs": {"tests": {"ref": "tests"}},
+      "prompt": "读取失败报告，定位原因并给出后续修复建议；本流程只交付诊断，不将失败伪装为通过。",
+      "output": {"file": "${run.dir}/diagnosis.md"}
+    },
+    {"id": "end", "type": "end"}
+  ],
+  "edges": [
+    {"from": "tests", "to": "gate"},
+    {"from": "deliver", "to": "end"},
+    {"from": "diagnose", "to": "end"}
+  ]
+}

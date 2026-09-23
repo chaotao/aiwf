@@ -1,0 +1,25 @@
+{
+  "schema_version": "1.1",
+  "id": "subflow-parent",
+  "name": "单次子工作流调用",
+  "input_schema": {
+    "type": "object",
+    "required": ["text"],
+    "properties": {"text": {"type": "string"}}
+  },
+  "nodes": [
+    {
+      "id": "analyze",
+      "type": "subflow",
+      "workflow": "analyze-piece",
+      "inputs": {"text": {"ref": "text"}}
+    },
+    {
+      "id": "deliver",
+      "type": "task",
+      "inputs": {"summary": {"ref": "analyze.analysis.summary"}},
+      "prompt": "把分析摘要整理成可交付说明。",
+      "output": {"file": "${run.dir}/analysis.md"}
+    }
+  ]
+}

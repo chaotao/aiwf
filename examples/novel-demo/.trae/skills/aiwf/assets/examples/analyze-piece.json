@@ -1,0 +1,30 @@
+{
+  "schema_version": "1.1",
+  "id": "analyze-piece",
+  "name": "可复用子流程：文本分析",
+  "input_schema": {
+    "type": "object",
+    "required": ["text"],
+    "properties": {"text": {"type": "string"}}
+  },
+  "exports": {
+    "analysis": {
+      "type": "object",
+      "required": ["summary"],
+      "properties": {"summary": {"type": "string"}}
+    }
+  },
+  "nodes": [
+    {
+      "id": "analysis",
+      "type": "task",
+      "inputs": {"text": {"ref": "text"}},
+      "prompt": "分析 text 的主题，返回含 summary 字符串的短 JSON。",
+      "output_schema": {
+        "type": "object",
+        "required": ["summary"],
+        "properties": {"summary": {"type": "string", "maxLength": 160}}
+      }
+    }
+  ]
+}

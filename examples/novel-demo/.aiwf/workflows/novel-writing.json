@@ -1,161 +1,124 @@
 {
-  "schema_version": "1.0",
+  "schema_version": "1.1",
   "id": "novel-writing",
   "name": "通用小说创作",
-  "description": "题材无关的小说创作流程：立项 → 世界观 → 人物 → 大纲 → 逐章创作（自动质检+人工验收）→ 汇总定稿。",
+  "description": "立项、世界观、人物、大纲、按清单逐章创作与有限返工、人工验收、汇总成书。",
   "max_steps": 200,
   "input_schema": {
-    "type": "object",
-    "required": ["idea"],
-    "properties": {
-      "idea": {
-        "type": "string",
-        "description": "一句话灵感或题材方向，如「末日后，主角拥有无限重生的能力」"
-      }
-    }
+    "type": "object", "required": ["idea"],
+    "properties": {"idea": {"type": "string", "description": "一句话灵感或题材方向"}}
   },
   "nodes": [
-    { "id": "start", "type": "start", "name": "开始" },
     {
-      "id": "concept",
-      "type": "task",
-      "name": "构思立项",
-      "input_schema": {
-        "type": "object",
-        "required": ["genre", "tone", "target_chapters"],
+      "id": "concept", "type": "task", "name": "构思立项",
+      "user_input_schema": {
+        "type": "object", "required": ["genre", "tone", "target_chapters"],
         "properties": {
-          "genre": {
-            "type": "string",
-            "title": "题材类型",
-            "description": "如：科幻 / 奇幻 / 末世 / 悬疑 / 都市"
-          },
-          "tone": {
-            "type": "string",
-            "title": "风格基调",
-            "description": "如：热血、压抑黑暗、轻松幽默、冷峻硬核"
-          },
-          "target_chapters": {
-            "type": "integer",
-            "title": "目标章节数",
-            "minimum": 1,
-            "default": 3
-          }
+          "genre": {"type": "string", "title": "题材"},
+          "tone": {"type": "string", "title": "风格基调"},
+          "target_chapters": {"type": "integer", "minimum": 1, "maximum": 100, "title": "目标章节数"}
         }
       },
-      "prompt": "基于灵感：${idea}\n题材类型：${genre}；风格基调：${tone}；计划篇幅：${target_chapters} 章。\n产出「概念简报」：1) 一句话核心卖点（logline）；2) 主角初始处境；3) 贯穿全书的核心冲突；4) 主题表达；5) 区别于同类作品的新意。\n将简报写入 novel/00-concept.md；完成后只输出文件引用：{\"$file\": \"novel/00-concept.md\"}"
+      "inputs": {
+        "idea": {"ref": "idea"}, "genre": {"ref": "genre"},
+        "tone": {"ref": "tone"}, "target_chapters": {"ref": "target_chapters"}
+      },
+      "prompt": "写概念简报，包含核心卖点、主角初始处境、贯穿全书的冲突、主题与新意。",
+      "output": {"file": "${run.dir}/novel/00-concept.md"}
     },
     {
-      "id": "worldbuilding",
-      "type": "task",
-      "name": "世界观设定",
-      "prompt": "请先用读文件工具读取概念简报：${concept}\n构建世界观设定：1) 时代与地理环境；2) 主要势力/组织及其关系；3) 核心规则体系（如异能、科技、魔法的运作方式与边界）；4) 社会结构与日常风貌；5) 禁忌、代价与世界的裂缝（为冲突埋点）。\n要求规则成体系、可推演。写入 novel/01-worldbuilding.md；完成后只输出 {\"$file\": \"novel/01-worldbuilding.md\"}",
-      "review": {
-        "requirements": [
-          "世界观方向是否与概念简报 ${concept} 一致",
-          "规则体系是否自洽、能力边界是否清晰",
-          "是否为核心冲突提供了舞台、代价与悬念来源"
-        ]
-      }
+      "id": "worldbuilding", "type": "task", "name": "世界观",
+      "inputs": {"concept": {"ref": "concept"}},
+      "prompt": "读取概念简报，构建设定：时代地理、势力关系、核心规则与能力边界、社会日常、禁忌与代价。规则必须自洽且可推演。",
+      "output": {"file": "${run.dir}/novel/01-worldbuilding.md"},
+      "review": {"requirements": ["与概念方向一致", "规则与能力边界自洽", "为冲突提供舞台、代价和悬念"]}
     },
     {
-      "id": "characters",
-      "type": "task",
-      "name": "人物设定",
-      "prompt": "请先读取 ${concept} 与 ${worldbuilding}。\n设计人物体系：1) 主角：外在目标、内在缺陷、核心能力与代价、性格、成长弧线；2) 2-3 名主要配角（各自立场与欲望）；3) 主要反派（动机要站得住）；4) 人物关系网与关键关系变化。\n写入 novel/02-characters.md；完成后只输出 {\"$file\": \"novel/02-characters.md\"}",
-      "review": {
-        "requirements": [
-          "人物是否与概念 ${concept} 及世界观 ${worldbuilding} 契合",
-          "主角是否有明确欲望、缺陷与成长空间",
-          "反派动机是否成立、人物关系是否能产生张力"
-        ]
-      }
+      "id": "characters", "type": "task", "name": "人物",
+      "inputs": {"concept": {"ref": "concept"}, "worldbuilding": {"ref": "worldbuilding"}},
+      "prompt": "设计主角的目标、缺陷、能力代价与成长弧线；2-3 名有独立欲望的配角；动机成立的反派；人物关系网及变化。",
+      "output": {"file": "${run.dir}/novel/02-characters.md"},
+      "review": {"requirements": ["符合世界观", "主角欲望、缺陷与成长明确", "反派动机成立、关系有张力"]}
     },
     {
-      "id": "outline",
-      "type": "task",
-      "name": "总大纲与分章规划",
-      "prompt": "请先读取 ${concept}、${worldbuilding}、${characters}。\n产出全书大纲：1) 主线结构（起承转合/三幕），标注关键转折与高潮；2) 核心悬念链如何层层揭开；3) 分章规划：恰好 ${target_chapters} 章，逐章给出「章标题 + 一句话梗概 + 该章推进的冲突 + 章尾钩子」。\n写入 novel/03-outline.md；完成后只输出 {\"$file\": \"novel/03-outline.md\"}",
-      "review": {
-        "requirements": [
-          "主线是否完整、转折与高潮是否清晰",
-          "分章规划是否恰好 ${target_chapters} 章且节奏均衡",
-          "每章是否有冲突推进与钩子",
-          "人物弧线是否在分章规划中落地"
-        ]
-      }
+      "id": "outline", "type": "task", "name": "全书大纲与章节清单",
+      "inputs": {
+        "concept": {"ref": "concept"}, "worldbuilding": {"ref": "worldbuilding"},
+        "characters": {"ref": "characters"}, "count": {"ref": "target_chapters"}
+      },
+      "prompt": "写完整大纲，覆盖起承转合、转折高潮、悬念链和人物弧线。另写章节清单到 ${run.dir}/novel/chapters.json，恰好 ${target_chapters} 项，number 从1连续编号，每项含 number/title/summary/key_events/hook。输出 {$file:大纲路径,chapters:{$file:清单路径}}；不得把大纲或整份清单内联。",
+      "output": {"file": "${run.dir}/novel/03-outline.md"},
+      "output_schema": {
+        "type": "object", "required": ["$file", "chapters"],
+        "properties": {
+          "$file": {"type": "string"},
+          "chapters": {"type": "object", "required": ["$file"], "properties": {"$file": {"type": "string"}}}
+        }
+      },
+      "check": {
+        "criteria": ["用工具读取清单，确认实际项数等于目标章节数且编号连续唯一", "大纲、关键事件、人物弧线和章尾钩子完整"],
+        "max_attempts": 3
+      },
+      "review": {"requirements": ["主线完整、转折高潮清晰", "恰好 ${target_chapters} 章且节奏均衡", "冲突、钩子与人物弧线落地"]}
     },
     {
-      "id": "chapter_outline",
-      "type": "task",
-      "name": "章节细纲",
-      "prompt": "先用文件工具列出 novel/chapters/ 目录，统计已完成章节数 N（目录不存在则 N=0），本次要写的是第 N+1 章。\n读取总大纲 ${outline}，并按需参考 ${worldbuilding} 与 ${characters}，为第 N+1 章撰写细纲：1) 本章在全书中的作用；2) 场景序列（时间/地点）；3) 关键事件与冲突；4) 重要对白要点；5) 视点人物；6) 章尾钩子。\n写入 novel/plans/chapter-<N+1>.md（用实际章号替换）；完成后只输出该文件的 $file 引用。"
-    },
-    {
-      "id": "chapter_draft",
-      "type": "task",
-      "name": "章节正文",
-      "prompt": "先读取本章细纲 ${chapter_outline}，并按需读取 ${worldbuilding}、${characters}；如存在上一章，读取 novel/chapters/ 中序号紧邻的前一章以保持衔接。\n严格按细纲写出本章完整正文（2000-3000 字）：场景化呈现、对白与动作结合、人物行为符合设定、避免大段说明。\n写入与细纲章号一致的 novel/chapters/chapter-<N>.md；完成后只输出 {\"$file\": \"novel/chapters/chapter-<N>.md\"}（用实际章号替换）。"
-    },
-    {
-      "id": "chapter_qc",
-      "type": "branch",
-      "name": "章节自动质检",
-      "prompt": "先用读文件工具读取本章正文 ${chapter_draft}，并对照细纲 ${chapter_outline}。\n逐项自检：1) 冲突是否有实质推进；2) 章尾是否有钩子；3) 是否偏离细纲或与既有设定矛盾；4) 是否存在水文、逻辑断裂或人物崩坏。\n全部合格回答 PASS，任一不合格回答 REVISE。只回答 PASS 或 REVISE，不要解释。",
-      "routes": { "PASS": "chapter_review", "REVISE": "chapter_revise" },
-      "default": "chapter_review"
-    },
-    {
-      "id": "chapter_revise",
-      "type": "task",
-      "name": "章节修订",
-      "output_key": "chapter_draft",
-      "prompt": "先读取本章正文 ${chapter_draft}（必要时对照细纲 ${chapter_outline}），针对不足修订：强化冲突与章尾钩子、修补与设定/前文的矛盾、删减水文。直接更新原文件并保持章号路径不变；完成后只输出该文件的 $file 引用。"
-    },
-    {
-      "id": "chapter_review",
-      "type": "review",
-      "name": "章节人工验收",
-      "requirements": [
-        "通读本章正文 ${chapter_draft}：剧情是否落实细纲 ${chapter_outline}",
-        "人物行为与口吻是否符合 ${characters}",
-        "章尾是否让人想继续读",
-        "与前一章（若有）是否连贯"
+      "id": "chapters", "type": "foreach", "name": "逐章创作与验收",
+      "items": {"ref": "outline.chapters"}, "id_field": "number", "max_instances": 100,
+      "inputs": {
+        "outline": {"ref": "outline"}, "worldbuilding": {"ref": "worldbuilding"},
+        "characters": {"ref": "characters"}, "previous": {"ref": "previous"}
+      },
+      "nodes": [
+        {
+          "id": "chapter_outline", "type": "task", "name": "章节细纲",
+          "inputs": {
+            "chapter": {"ref": "item"}, "outline": {"ref": "outline"},
+            "worldbuilding": {"ref": "worldbuilding"}, "characters": {"ref": "characters"},
+            "previous": {"ref": "previous"}
+          },
+          "prompt": "按当前 chapter 写细纲：本章作用、场景时间地点、事件冲突、对白要点、视点、章尾钩子。previous 非空时读取前章正文，记录衔接状态；不从目录推断章号。",
+          "output": {"file": "${run.dir}/plan.md"}
+        },
+        {
+          "id": "draft", "type": "task", "name": "正文与修订",
+          "inputs": {
+            "chapter": {"ref": "item"}, "plan": {"ref": "chapter_outline"},
+            "worldbuilding": {"ref": "worldbuilding"}, "characters": {"ref": "characters"},
+            "previous": {"ref": "previous"}
+          },
+          "prompt": "严格按细纲创作本章 2000-3000 汉字正文，场景化呈现、对白动作结合、避免大段说明。读取前章（若有）确保衔接。返工按 feedback 修改同一文件。用工具统计实际汉字数，输出 {$file:正文路径,word_count:实测字数}。",
+          "output": {"file": "${run.dir}/chapter-${item.number}.md"},
+          "output_schema": {
+            "type": "object", "required": ["$file", "word_count"],
+            "properties": {
+              "$file": {"type": "string"},
+              "word_count": {"type": "integer", "minimum": 2000, "maximum": 3000}
+            }
+          },
+          "check": {
+            "criteria": [
+              "实际正文为2000-3000汉字，工具测量与上报一致",
+              "关键事件与细纲完整落实、冲突有实质推进且章尾有钩子",
+              "人物行为、口吻、世界规则与前章衔接一致",
+              "没有水文、逻辑断裂或人物崩坏；不合格必须给出具体段落和修订理由"
+            ],
+            "max_attempts": 3
+          },
+          "review": {"requirements": ["剧情落实细纲", "人物行为和口吻符合设定", "章尾吸引继续阅读", "与前章连续"]}
+        }
       ],
-      "routes": { "APPROVE": "next_chapter", "REJECT": "chapter_draft" }
+      "exports": ["draft"],
+      "outputs_key": "chapter_results"
     },
     {
-      "id": "next_chapter",
-      "type": "branch",
-      "name": "是否继续下一章",
-      "prompt": "先用文件工具列出 novel/chapters/ 目录，统计已完成的章节数；再读取大纲 ${outline} 核对分章规划（计划共 ${target_chapters} 章）。\n若计划章节已全部完成，回答 DONE；否则回答 CONTINUE。只回答 CONTINUE 或 DONE，不要解释。",
-      "routes": { "CONTINUE": "chapter_outline", "DONE": "assemble" },
-      "default": "assemble"
-    },
-    {
-      "id": "assemble",
-      "type": "task",
-      "name": "汇总定稿",
-      "consumes": [{ "glob": "novel/chapters/*.md" }],
-      "prompt": "读取 novel/chapters/ 目录下全部章节文件，按章号从小到大排序，组装为完整书稿：1) 书名与一句话简介（可参考 ${concept}）；2) 生成目录；3) 正文按序拼接，检查章节衔接。\n写入 novel/full-novel.md；完成后只输出 {\"$file\": \"novel/full-novel.md\"}",
-      "review": {
-        "requirements": [
-          "章节是否齐全（目标 ${target_chapters} 章）、排序与目录是否正确",
-          "章节衔接处是否通顺、无断裂或重复",
-          "全书是否构成完整故事"
-        ]
-      }
-    },
-    { "id": "end", "type": "end", "name": "完成" }
-  ],
-  "edges": [
-    { "from": "start", "to": "concept" },
-    { "from": "concept", "to": "worldbuilding" },
-    { "from": "worldbuilding", "to": "characters" },
-    { "from": "characters", "to": "outline" },
-    { "from": "outline", "to": "chapter_outline" },
-    { "from": "chapter_outline", "to": "chapter_draft" },
-    { "from": "chapter_draft", "to": "chapter_qc" },
-    { "from": "chapter_revise", "to": "chapter_qc" },
-    { "from": "assemble", "to": "end" }
+      "id": "assemble", "type": "task", "name": "汇总定稿",
+      "inputs": {
+        "concept": {"ref": "concept"}, "results": {"ref": "chapter_results"},
+        "target": {"ref": "target_chapters"}
+      },
+      "prompt": "读取结果清单，确认恰好目标数量且每项success，再按清单顺序读取各章。添加书名、简介和目录，拼接全书并检查衔接，不使用目录计数。",
+      "output": {"file": "${run.dir}/novel/full-novel.md"},
+      "review": {"requirements": ["共 ${target_chapters} 章、顺序目录正确", "衔接通顺，无断裂重复", "全书构成完整故事"]}
+    }
   ]
 }

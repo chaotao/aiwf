@@ -1,0 +1,47 @@
+{
+  "schema_version": "1.1",
+  "id": "subjective-routing",
+  "name": "短剧：Agent 选择叙事节奏",
+  "input_schema": {
+    "type": "object",
+    "required": ["idea"],
+    "properties": {"idea": {"type": "string"}}
+  },
+  "nodes": [
+    {
+      "id": "choose",
+      "type": "branch",
+      "inputs": {"idea": {"ref": "idea"}},
+      "prompt": "判断 idea 更适合快节奏冲突还是缓慢悬念，只返回 FAST 或 SLOW。",
+      "routes": {"FAST": "fast_script", "SLOW": "slow_script"}
+    },
+    {
+      "id": "fast_script",
+      "type": "task",
+      "inputs": {"idea": {"ref": "idea"}},
+      "prompt": "写快节奏短剧开场，尽早呈现冲突。",
+      "output_key": "script",
+      "output": {"file": "${run.dir}/fast-script.md"}
+    },
+    {
+      "id": "slow_script",
+      "type": "task",
+      "inputs": {"idea": {"ref": "idea"}},
+      "prompt": "写悬念渐进的短剧开场，用细节积累紧张感。",
+      "output_key": "script",
+      "output": {"file": "${run.dir}/slow-script.md"}
+    },
+    {
+      "id": "accept",
+      "type": "review",
+      "requirements": ["查看 script 产物，节奏是否适合该创意"],
+      "routes": {"APPROVE": "end", "REJECT": "choose"}
+    },
+    {"id": "end", "type": "end"}
+  ],
+  "edges": [
+    {"from": "fast_script", "to": "accept"},
+    {"from": "slow_script", "to": "accept"}
+  ],
+  "max_steps": 50
+}
