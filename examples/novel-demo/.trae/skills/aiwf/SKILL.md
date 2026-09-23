@@ -12,11 +12,12 @@ aiwf 是 schema 驱动的 AI 工作流引擎：工作流是一份 JSON 定义，
 驱动一次运行，并在需要时把人接入：向引擎获取当前状态 → 自己执行，或向用户
 收集信息/请人验收 → 上报，引擎负责审计、上下文更新与节点推进。
 
-运行中 `status=running` 时还有三种 phase：
+运行中 `status=running` 时有四种 phase：
 
 - `executing`：正常，按节点 spec 执行；
 - `awaiting_input`：任务需要用户先提供信息，你提问后用 provide 回报；
-- `awaiting_review`：等待人工验收结论，用 review 回报。
+- `awaiting_review`：等待人工验收结论，用 review 回报；
+- `awaiting_items`：仅动态 foreach——当前条目跑完、源里还没有新条目，外部补充后 resume。
 
 两条跨场景约定：**大产物（正文/剧本等）写文件、只回引用** `{"$file": "路径"}`
 （单节点输出 ≤2000 字符，引擎强校验）；每次运行独立成文件夹，内含自动生成的
@@ -53,7 +54,10 @@ aiwf fail <run_id> --error "..."       # 上报失败
 aiwf resume <wf_id> <run_id>           # 续跑失败运行
 aiwf runs list [wf_id]                 # 列出运行
 aiwf runs show <run_id>                # 查看运行（--node / --json）
-aiwf runs events <run_id>              # 查看事件流
+aiwf runs events <run_id>              # 查看事件流（纯文本，不支持 --json）
 aiwf runs search <query>               # 检索历史
 aiwf skills install                    # 安装本 skill 到项目 .trae/skills
 ```
+
+> `--json`：状态变更命令建议加（信封还带 `error` 字段，失败时直接含原因）；
+> `runs show/search` 支持，`runs list/events` 不支持。

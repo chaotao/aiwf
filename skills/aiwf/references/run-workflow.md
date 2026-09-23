@@ -20,8 +20,16 @@ aiwf current <run_id> --json              # 中断后重新查看
   "status": "running|completed|failed",
   "phase": "executing|awaiting_input|awaiting_review|awaiting_items",
   "revision": { "...当前修订信息，无则 null" },
+  "error": "失败原因（status=failed 时直接在此，无需另查 runs show）",
   "node": { "..." }, "input_request": null, "review_request": null }
 ```
+
+**接管正在跑的 foreach（中途换 agent 最常见）**，三步：
+
+1. `aiwf current <父run_id> --json`：信封节点是 foreach 时看 `node.child.run_id`
+   （或父 `context.md` 的「子工作流」小节）；
+2. `aiwf current <child_run_id> --json`：拿到子级当前节点；
+3. 按子级自己的 phase 驱动，直到子级 end——会自动传播回父级并创建下一实例。
 
 ## 2. 按 phase / node 行动
 
@@ -35,9 +43,12 @@ aiwf current <run_id> --json              # 中断后重新查看
     上游产物，先用读文件工具读取再使用。
   - `previous_output`（修订/重做时为上次原稿或原引用）在此基础上改，不要从零生成。
   - 短结果（一句话、小 JSON）可直接作为输出；产物最终存入 `output_key`。
-- **branch**：用 `node.prompt` 调用你自己的模型。若 prompt 给的是文件路径，先
-  读文件；回答必须是 `routes` 中的标签（取首行、忽略标点大小写）；你不需要决定
-  下一节点，引擎算路由。
+- **branch**：分两种，看信封字段：
+  - **模型分支**（无 `deterministic`）：用 `node.prompt` 调用你自己的模型。若
+    prompt 给的是文件路径，先读文件；回答必须是 `routes` 中的标签（取首行、忽略
+    标点大小写），`complete --output 标签`；你不需要决定下一节点，引擎算路由。
+  - **确定性分支**（`deterministic=true`，配了 `when`）：引擎自己求值，不要回答
+    标签，直接 `complete <run_id> --empty`，结果按 TRUE/FALSE 路由。
 - **start / end**：无需执行。
 
 然后上报：
@@ -70,6 +81,9 @@ aiwf provide <run_id> --data-file answers.json --json
 `requirements`（字符串或检查项清单）、`routes`（APPROVE/REJECT 去向）、
 `attempt`。把验收要求和待审产物展示给人，拿到结论后：
 
+> 注意：独立 `review` 检查点本身**不出现在 node_runs**，只在事件流留
+> `review_requested/review_decided`；内嵌验收则在被审 task 的记录里体现。
+
 ```bash
 aiwf review <run_id> --verdict APPROVE --feedback "可选意见" --json
 aiwf review <run_id> --verdict REJECT --feedback "需要改什么" --json
@@ -78,6 +92,8 @@ aiwf review <run_id> --verdict REJECT --feedback "需要改什么" --json
 - APPROVE：按 routes 前进；
 - REJECT：指针回到 routes 指定节点（缺省重做被验收的 task），反馈随下次 spec
   下发（`node.feedback`），按意见修改。
+- 若 complete 时产物不符节点的 `output_schema`，引擎直接**驳回**（run 不失败、
+  不走人工）：node_runs 记 `rejected`、`node.feedback` 给原因，按反馈改完重报即可。
 
 ### 子工作流节点：转去驱动子级
 
@@ -146,6 +162,17 @@ aiwf resume <wf_id> <run_id>
 
 失败节点的记录入审计；续跑从失败节点重新执行，已完成节点不重跑，上下文从记录恢复。
 进程可随时中断，`aiwf current` 查看当前 phase 后继续。
+
+先看失败信封的 `error` 判断类型，再决定动作：
+
+- **可恢复失败**（工具临时故障、执行步骤出错）：排除原因后 `aiwf resume`，从失败
+  节点重跑。
+- **定义/条件类失败**（`condition variable ... not found`、模板变量无来源、
+  routes 目标错误）：resume 会原样再炸——需要修正工作流定义（变量写法见
+  [create-workflow.md](create-workflow.md)）或改用 revise/正确的协议命令，不要
+  盲目重试。
+- **子流程失败**：abort 时父级随之 failed，resume 父级会同时重开失败实例；
+  on_fail=continue 时已自动跳过，失败留在 foreach 清单。
 
 ## 5. 共享与交接：context.md
 

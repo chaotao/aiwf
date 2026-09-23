@@ -52,9 +52,16 @@
 
 ### 模板变量
 
-字符串中用 `${var}` 引用 context（运行输入 + 之前 task 的输出）。引擎下发前完成
-渲染；文件引用渲染为路径，其它非字符串值自动 JSON 序列化；变量缺失运行时报错
-——定义时保证每个引用有来源。
+字符串中用 `${var}` 引用 context（运行输入 + 之前 task 的输出），支持**点路径**
+深入对象/数组：
+
+- `${item.number}`：foreach 注入的当前条目字段；
+- `${plan.chapter_count}`：某 task 产物（整体存于其 `output_key`）的内部字段；
+- `${items.0}`：数组按下标取值。
+
+引擎下发前完成渲染；文件引用渲染为路径，其它非字符串值自动 JSON 序列化；变量
+（含点路径中间段）缺失即报错。`aiwf validate` 会静态检查每个变量根键有来源
+（运行输入、某节点产出键、或节点 input_schema 字段）。
 
 ### 大产物外置：文件引用（重要约定）
 
@@ -72,8 +79,12 @@
   明确要求「先用读文件工具读取该路径」。
 - 交付物写到项目目录（如 `novel/`），中间产物可放入该次运行文件夹；引用统一用
   项目相对路径。
-- 引擎在每次落盘时把全部引用汇总到运行文件夹的 `context.md`，作为人和 agent 的
-  共享/交接入口（无需在工作流里额外加节点）。
+- **一个输出含多个文件时，每个路径都用 `{"$file": ...}` 标记**（可挂在不同键
+  上），例如 `{"$file":"a.md","plan_file":{"$file":"b.md"}}`——context.md 的产物
+  索引只识别 `$file` 标记，普通字符串路径不会被收集。
+- 引擎在每次落盘时把全部引用（含嵌套 `$file`、foreach items 源、各子运行产物）
+  汇总到运行文件夹的 `context.md`，作为人和 agent 的共享/交接入口（无需额外加
+  节点）。
 
 ### task 节点的两个人机触点（均为可选）
 
@@ -100,11 +111,22 @@
 
 branch 和独立 review 都不能再连出 edges，路由完全由 routes/default 决定。
 
+路由字段的值有严格语义（validate 会检查）：
+
+- **branch 的 `routes`：值必须是目标节点 id（string），不允许 null**——null 的
+  「沿 edges 前进」语义只属于 task 内嵌 review，不要类推。
+- branch 的 `default`：值也是**兜底目标节点 id**（回答不匹配任何标签时去这里），
+  不是默认标签，如 `"default": "finish-chapter"`。
+- 独立 review 的 `routes`：APPROVE 去向必须显式给出；REJECT 可给节点 id。
+- 内联 foreach 的循环体不能定义 start/end；branch 想结束循环体时，把 PASS 指向
+  一个产出 exports 的真实 task（通常是"定稿"节点），不要指向 end。
+
 ### 产物契约：output_schema（可选）
 
 task 可挂标准 JSON Schema，`complete` 时引擎自动校验上报产物；不合格则**驳回**：
-节点保持 executing、`last_feedback` 写入原因（agent 重新执行，不失败运行、不占用
-人工验收）。适合结构化产物（如 `{"status":"PASS","$file":"..."}`）。
+运行不失败、不占人工验收，node_runs 记一条 `rejected`、事件流记 `output_rejected`，
+`last_feedback` 写入原因并随下次 spec 下发；你按反馈修正后重新 complete 同一节点
+即可，run_id/目录不变。适合结构化产物（如 `{"status":"PASS","$file":"..."}`）。
 
 ```json
 "output_schema": {
@@ -278,6 +300,117 @@ TRUE/FALSE 路由；agent 只需对该分支执行 `complete --empty`。
       "prompt": "以风格 ${tone} 为主题《${topic}》写 300 字开篇，并存入 novel/opening.md",
       "review": { "requirements": ["开头是否有悬念"] }
     }
+  ]
+}
+```
+
+## 完整模式示例：逐章创作（外引子流程 + 自动质检返工 + 人工验收）
+
+父工作流 `short-novel.json`：企划产出章节清单 → foreach 外引子流程逐章写 → 汇总。
+
+```json
+{
+  "schema_version": "1.0",
+  "id": "short-novel",
+  "name": "短篇小说逐章创作",
+  "max_steps": 100,
+  "input_schema": {
+    "type": "object",
+    "required": ["idea"],
+    "properties": { "idea": { "type": "string" } }
+  },
+  "nodes": [
+    { "id": "start", "type": "start" },
+    {
+      "id": "outline", "type": "task", "name": "大纲与分章",
+      "input_schema": {
+        "type": "object",
+        "required": ["target_chapters"],
+        "properties": {
+          "target_chapters": { "type": "integer", "title": "章节数" }
+        }
+      },
+      "prompt": "基于 ${idea} 写大纲并拆分 ${target_chapters} 章；章节清单（每项含 title/summary）写入 novel/chapters.json，大纲写入 novel/outline.md。只输出 {\"$file\":\"novel/outline.md\"}",
+      "review": { "requirements": ["分章是否合理"] }
+    },
+    {
+      "id": "chapters", "type": "foreach", "name": "逐章写作",
+      "items": { "$file": "novel/chapters.json" },
+      "workflow": "chapter-wf",
+      "inputs": {
+        "chapter": "${item}",
+        "plan_file": "novel/outline.md"
+      },
+      "outputs_key": "chapter_results"
+    },
+    {
+      "id": "assemble", "type": "task", "name": "汇总成书",
+      "consumes": [{ "glob": "novel/chapter-*.md" }],
+      "prompt": "读取清单 ${chapter_results} 与 novel/chapter-*.md，按序汇编为 novel/full-novel.md。只输出 {\"$file\":\"novel/full-novel.md\"}"
+    },
+    { "id": "end", "type": "end" }
+  ],
+  "edges": [
+    { "from": "start", "to": "outline" },
+    { "from": "outline", "to": "chapters" },
+    { "from": "chapters", "to": "assemble" },
+    { "from": "assemble", "to": "end" }
+  ]
+}
+```
+
+子工作流 `chapter-wf.json`：写正文 → QC 分支（REVISE 回到写）→ 人工验收 → 定稿，
+定稿产物经 exports 回传父级。
+
+```json
+{
+  "schema_version": "1.0",
+  "id": "chapter-wf",
+  "name": "单章写作子流程",
+  "input_schema": {
+    "type": "object",
+    "required": ["chapter", "plan_file"],
+    "properties": {
+      "chapter": { "type": "object" },
+      "plan_file": { "type": "string" }
+    }
+  },
+  "exports": { "chapter": {} },
+  "nodes": [
+    { "id": "start", "type": "start" },
+    {
+      "id": "write", "type": "task", "name": "章节正文",
+      "prompt": "读取大纲 ${plan_file}，按《${chapter.title}》（${chapter.summary}）写 800-1200 字正文到 novel/chapter 文件。只输出 {\"$file\":\"路径\",\"word_count\":实际字数}",
+      "output_schema": {
+        "type": "object",
+        "required": ["$file", "word_count"],
+        "properties": {
+          "$file": { "type": "string" },
+          "word_count": { "type": "integer", "minimum": 800, "maximum": 1200 }
+        }
+      }
+    },
+    {
+      "id": "qc", "type": "branch", "name": "自动质检",
+      "prompt": "读取本章正文与大纲，合格只回答 PASS，不合格只回答 REVISE。",
+      "routes": { "PASS": "review", "REVISE": "write" }
+    },
+    {
+      "id": "review", "type": "review", "name": "人工验收",
+      "requirements": ["剧情是否落实、章尾是否有钩子"],
+      "routes": { "APPROVE": "finish", "REJECT": "write" }
+    },
+    {
+      "id": "finish", "type": "task", "name": "章节定稿",
+      "output_key": "chapter",
+      "prompt": "确认本章文件完整，只输出 {\"$file\":\"该章路径\"}"
+    },
+    { "id": "end", "type": "end" }
+  ],
+  "edges": [
+    { "from": "start", "to": "write" },
+    { "from": "write", "to": "qc" },
+    { "from": "finish", "to": "end" }
   ]
 }
 ```

@@ -53,7 +53,10 @@ FILE_REF_KEY = "$file"
 # Maximum nesting depth of subflow chains.
 MAX_SUBFLOW_DEPTH = 8
 DEFAULT_MAX_INSTANCES = 1000
-TEMPLATE_RE = re.compile(r"\$\{\s*([A-Za-z_][A-Za-z0-9_]*)\s*\}")
+# Variable reference, optionally dotted: ${var}, ${item.number}, ${plan.chapter_count}.
+TEMPLATE_RE = re.compile(
+    r"\$\{\s*([A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z0-9_]+)*)\s*\}"
+)
 
 
 def now_iso() -> str:
@@ -97,18 +100,42 @@ def validate_output_size(output: Any) -> None:
         )
 
 
+def resolve_dotted(context: Dict[str, Any], dotted: str) -> Any:
+    """Resolve 'a.b.c' against context: dict keys, numeric list indices.
+
+    The root key must exist; a missing root/intermediate segment is a hard
+    error naming the unresolved path.
+    """
+    parts = dotted.split(".")
+    root = parts[0]
+    if root not in context:
+        raise KeyError(
+            f"template variable ${{{dotted}}} not found in workflow context"
+        )
+    cur = context[root]
+    walked = root
+    for seg in parts[1:]:
+        walked += f".{seg}"
+        if isinstance(cur, dict) and seg in cur:
+            cur = cur[seg]
+        elif isinstance(cur, list) and seg.isdigit() and int(seg) < len(cur):
+            cur = cur[int(seg)]
+        else:
+            raise KeyError(
+                f"template variable ${{{walked}}} not found in workflow context"
+            )
+    return cur
+
+
 def render(value: Any, context: Dict[str, Any]) -> Any:
-    """Substitute ${var} in strings; recurse into dict/list.
+    """Substitute ${var}/${a.b} in strings; recurse into dict/list.
 
     Non-string context values are JSON-encoded (file refs render as paths);
-    a missing key is a hard error.
+    a missing variable is a hard error.
     """
     if isinstance(value, str):
         def sub(m: re.Match) -> str:
-            key = m.group(1)
-            if key not in context:
-                raise KeyError(f"template variable ${{{key}}} not found in workflow context")
-            return _stringify_context_value(context[key])
+            return _stringify_context_value(resolve_dotted(context, m.group(1)))
         return TEMPLATE_RE.sub(sub, value)
     if isinstance(value, dict):
         return {k: render(v, context) for k, v in value.items()}
@@ -154,11 +181,14 @@ def resolve_condition_value(value: Any, context: Dict[str, Any]) -> Any:
     """Literal, or {"var": "key"} read from context (optional default)."""
     if isinstance(value, dict) and "var" in value:
         key = value["var"]
-        if key not in context:
-            if "default" in value:
+        try:
+            return resolve_dotted(context, key)
+        except KeyError:
+            # default applies when the root key is absent; a broken inner path
+            # is a definition error and must surface
+            if "default" in value and key.split(".", 1)[0] not in context:
                 return value["default"]
-            raise KeyError(f"condition variable {key!r} not found in workflow context")
-        return context[key]
+            raise
     return value
 
 
@@ -186,6 +216,20 @@ def eval_condition(cond: Dict[str, Any], context: Dict[str, Any]) -> bool:
     if op == "not":
         return not eval_condition(arg, context)
     raise ValueError(f"unknown condition operator: {op!r}")
+
+
+def condition_refs(cond: Any) -> Set[str]:
+    """Collect every {"var": "..."} reference inside a condition tree."""
+    refs: Set[str] = set()
+    if isinstance(cond, dict):
+        if "var" in cond and isinstance(cond["var"], str):
+            refs.add(cond["var"])
+        for value in cond.values():
+            refs.update(condition_refs(value))
+    elif isinstance(cond, list):
+        for item in cond:
+            refs.update(condition_refs(item))
+    return refs
 
 
 def normalize_answer(raw: Any) -> str:
@@ -287,8 +331,67 @@ class WorkflowEngine:
                     nrefs.add(items_src["var"])
             refs[node["id"]] = nrefs
             for key in nrefs:
-                consumers.setdefault(key, set()).add(node["id"])
+                # a.b refs depend on the whole node output stored under root a
+                consumers.setdefault(key.split(".", 1)[0], set()).add(node["id"])
         return refs, consumers, glob_consumers
+
+    @staticmethod
+    def references_check(workflow: Dict[str, Any]) -> None:
+        """Static reference sanity: every ${var} root (and foreach items var)
+        must resolve to a run input, a node output, or a node-collected input.
+
+        A global pool (not ordering) is used deliberately: branches and loops
+        make precise dominance analysis fragile; this catches typos and
+        missing producers without false positives on legal forward references.
+        """
+        available: Set[str] = set(
+            (workflow.get("input_schema") or {}).get("properties", {}).keys()
+        )
+        for n in workflow["nodes"]:
+            if n["type"] == "task":
+                available.add(n.get("output_key", n["id"]))
+                available.update(
+                    (n.get("input_schema") or {}).get("properties", {}).keys()
+                )
+            elif n["type"] == "subflow":
+                available.add(n.get("output_key", n["id"]))
+            elif n["type"] == "foreach":
+                available.add(n.get("outputs_key", n["id"]))
+
+        def check(node: Dict[str, Any], refs: Set[str]) -> None:
+            injected = (node.get("as", "item"), node.get("index_as", "index"))
+            for ref in refs:
+                root = ref.split(".", 1)[0]
+                if node["type"] == "foreach" and root in injected:
+                    continue  # item/index are injected per instance
+                if root not in available:
+                    raise ValueError(
+                        f"node {node['id']!r} references undefined context key "
+                        f"${{{ref}}}; provide it via run inputs, an earlier "
+                        f"node output, or this node's input_schema"
+                    )
+
+        for node in workflow["nodes"]:
+            ntype = node["type"]
+            refs: Set[str] = set()
+            if ntype in ("task", "branch"):
+                refs.update(template_refs(node.get("prompt", "")))
+            if ntype == "branch" and node.get("when"):
+                refs.update(condition_refs(node["when"]))
+            if ntype == "task":
+                if node.get("review"):
+                    refs.update(template_refs(node["review"].get("requirements")))
+                for item in node.get("consumes", []):
+                    if isinstance(item, str):
+                        refs.add(item)
+            elif ntype == "review":
+                refs.update(template_refs(node.get("requirements")))
+            if ntype in ("subflow", "foreach"):
+                refs.update(template_refs(node.get("inputs", {})))
+                items = node.get("items")
+                if ntype == "foreach" and isinstance(items, dict) and "var" in items:
+                    refs.add(items["var"])
+            check(node, refs)
 
     # ---- project-wide validation: call graph + contracts -------------
     def validate_project(self) -> Dict[str, Any]:
@@ -298,13 +401,12 @@ class WorkflowEngine:
             i: self.storage.load_workflow(i)
             for i in self.storage.list_workflows()
         }
-        for wf in defs.values():
-            validate_workflow(wf)
-
         graph: Dict[str, set] = {wid: set() for wid in defs}
         queue = list(defs.values())
         while queue:
             wf = queue.pop()
+            validate_workflow(wf)
+            self.references_check(wf)
             for node in wf["nodes"]:
                 if node["type"] not in ("subflow", "foreach"):
                     continue
@@ -568,13 +670,17 @@ class WorkflowEngine:
         else:
             exports_map = dict(raw_exports or {})
         input_keys = list((node.get("inputs") or {}).keys())
+        props = {k: {} for k in input_keys}
+        # item/index are injected per instance even without an inputs mapping
+        props[node.get("as", "item")] = {}
+        props[node.get("index_as", "index")] = {}
         wf = {
             "schema_version": "1.0",
             "id": f'{parent_workflow["id"]}.{node["id"]}',
             "name": f'inline:{node["id"]}',
             "input_schema": {
                 "type": "object",
-                "properties": {k: {} for k in input_keys},
+                "properties": props,
                 "required": input_keys,
             },
             "exports": exports_map,
@@ -1087,6 +1193,7 @@ class WorkflowEngine:
             "status": record["status"],
             "phase": record["phase"],
             "revision": self._revision_brief(record),
+            "error": record.get("error"),
             "node": None,
             "input_request": None,
             "review_request": None,
@@ -1159,8 +1266,14 @@ class WorkflowEngine:
             if ntype == "subflow":
                 spec["output_key"] = node.get("output_key", node["id"])
             else:
+                try:
+                    f_mode, f_items, _f_done = self._resolve_items(node, ctx)
+                except Exception:
+                    f_mode, f_items = "unresolved", []
                 spec.update(
-                    items=self._items_preview(node, ctx),
+                    items_mode=f_mode,
+                    items=f_items if len(f_items) <= 100 else f_items[:100],
+                    items_truncated=len(f_items) > 100,
                     as_=node.get("as", "item"),
                     index_as=node.get("index_as", "index"),
                     id_field=node.get("id_field"),
@@ -1197,18 +1310,6 @@ class WorkflowEngine:
                 )
         # start / end: id/type/name only
         return spec
-
-    def _items_preview(
-        self, node: Dict[str, Any], ctx: Dict[str, Any]
-    ) -> str:
-        try:
-            mode, items, _done = self._resolve_items(node, ctx)
-        except Exception:
-            return "unresolved"
-        head = ", ".join(repr(x)[:24] for x in items[:5])
-        if len(items) > 5:
-            head += ", ..."
-        return f"{mode}[{len(items)}]: {head}"
 
     def _input_request(self, node: Dict[str, Any], ctx: Dict[str, Any]) -> Dict[str, Any]:
         schema = node["input_schema"]
@@ -1996,6 +2097,55 @@ class WorkflowEngine:
             return ["- （无）"]
         return [f"- **{k}**: {self._inline(v)}" for k, v in obj.items()]
 
+    def _collect_artifacts(
+        self, record: Dict[str, Any], seen: Set[str], depth: int = 0
+    ) -> List[Tuple[str, str]]:
+        """All (path, origin) $file artifacts of a record: direct/nested in
+        node outputs, the foreach items source, and every child run's outputs.
+        """
+        found: List[Tuple[str, str]] = []
+
+        def scan(value: Any, origin: str) -> None:
+            if is_file_ref(value):
+                path = value[FILE_REF_KEY]
+                if path not in seen:
+                    seen.add(path)
+                    found.append((path, origin))
+            elif isinstance(value, dict):
+                for v in value.values():
+                    scan(v, origin)
+            elif isinstance(value, list):
+                for v in value:
+                    scan(v, origin)
+
+        for nr in record.get("node_runs", []):
+            scan(nr.get("output"), f"{nr['node_id']}（{nr.get('node_name', '')}）")
+
+        state = record.get("subflow_state")
+        if state:
+            src = state.get("items_source")
+            if isinstance(src, dict):
+                origin = f"{state['node_id']} items 源"
+                if "$file" in src:
+                    scan({FILE_REF_KEY: src["$file"]}, origin)
+                elif "var" in src:
+                    scan(record["context"].get(src["var"]), origin)
+            if depth < MAX_SUBFLOW_DEPTH:
+                for inst in state["instances"]:
+                    rid = inst.get("run_id")
+                    if not rid:
+                        continue
+                    try:
+                        child = self.storage.find_run(rid)
+                    except FileNotFoundError:
+                        continue
+                    origin = f"子运行 {rid}（{state['node_id']}/{inst['key']}）"
+                    for path, _origin in self._collect_artifacts(
+                        child, seen, depth + 1
+                    ):
+                        found.append((path, origin))
+        return found
+
     def _render_context_md(self, workflow: Dict[str, Any],
                            record: Dict[str, Any]) -> str:
         wf_name = workflow.get("name", record["workflow_id"])
@@ -2036,16 +2186,11 @@ class WorkflowEngine:
         lines.append("")
 
         lines.append("## 产物索引")
-        seen: Set[str] = set()
-        artifacts = []
-        for nr in record.get("node_runs", []):
-            path = file_ref_path(nr.get("output"))
-            if path and path not in seen:
-                seen.add(path)
-                artifacts.append(
-                    f"- `{path}` ← {nr['node_id']}（{nr.get('node_name', '')}）"
-                )
-        lines += artifacts if artifacts else ["- （暂无外置产物）"]
+        artifacts = self._collect_artifacts(record, set())
+        lines += (
+            [f"- `{path}` ← {origin}" for path, origin in artifacts]
+            or ["- （暂无外置产物）"]
+        )
         lines.append("")
 
         state = record.get("subflow_state")

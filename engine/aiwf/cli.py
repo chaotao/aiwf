@@ -251,6 +251,7 @@ def cmd_validate(args, storage: Storage) -> int:
     with open(args.path, "r", encoding="utf-8") as f:
         workflow = json.load(f)
     validate_workflow(workflow)
+    WorkflowEngine(storage).references_check(workflow)
     print(f"valid: {args.path} (workflow {workflow['id']!r}, {len(workflow['nodes'])} nodes)")
     return 0
 

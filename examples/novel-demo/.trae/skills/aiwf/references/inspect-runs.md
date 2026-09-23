@@ -36,7 +36,7 @@ aiwf runs list --all                # 含子工作流实例（标注 "(of <父ru
 aiwf runs show <run_id>                       # 概览：节点耗时与摘要
 aiwf runs show <run_id> --node <node_id>      # 某节点的完整记录
 aiwf runs show <run_id> --json                # 整条记录原始 JSON
-aiwf runs events <run_id>                     # 只看事件流时间线
+aiwf runs events <run_id>                     # 只看事件流时间线（纯文本，不支持 --json）
 ```
 
 父运行含 subflow/foreach 节点时，概览额外列出**实例表**：实例 key、状态、
@@ -47,7 +47,7 @@ exports 摘要、子 run_id 与记录目录；单实例细节用 `runs show <chi
 | 字段 | 说明 |
 |------|------|
 | `status` | `success` / `failed` / `skipped`（修订中复用旧产物）/ `rejected`（产物不符 output_schema，节点未关闭） |
-| `started_at` / `ended_at` / `duration_ms` | 节点级时间，毫秒 |
+| `started_at` / `ended_at` / `duration_ms` | 节点从进入到 complete/fail 的**开放墙钟时间**，毫秒。其中包含 agent 思考、工具执行与等待/交接时间，并不严格等于纯任务计算耗时，不宜直接当作性能指标对比 |
 | `model` | 执行 agent 实际上报的模型；未上报为 null |
 | `tokens` | agent 上报的 prompt/completion/total token；未上报 null |
 | `input` | 实际消费的渲染后 prompt；start/end/skipped 为 null |
@@ -57,6 +57,11 @@ exports 摘要、子 run_id 与记录目录；单实例细节用 `runs show <chi
 | `subflow` | subflow/foreach 专用：子工作流 id、实例进度（success/failed/pending） |
 | `feedback` | 驱动本次（重）执行的验收反馈 |
 | `revision_seq` | 所属修订的序号；非修订为 null |
+
+> 独立 `review` 检查点本身**不产生 node_run**，只在事件流留
+> `review_requested / review_decided`；内嵌验收则体现在被审 task 的记录里。
+> 节点状态为 `rejected`（不符 output_schema）时节点并未关闭，记录中保留被驳回
+> 的产物，修正后重新 complete，run_id 与运行目录均不变。
 
 ### 运行级字段
 
@@ -76,6 +81,7 @@ exports 摘要、子 run_id 与记录目录；单实例细节用 `runs show <chi
 | `input_changed` | 修改已完成节点的输入，自动开启修订 |
 | `review_requested` | 进入验收门（含渲染后 requirements） |
 | `review_decided` | 人的验收结论（verdict + feedback） |
+| `output_rejected` | complete 上报的产物不符节点 output_schema（含 reason；run 不失败，修正后重报） |
 | `revise_requested` | 发起计划外回跳（含 stale/reused 清单、mode、scope） |
 | `node_reused` | 级联修订中某节点跳过、复用旧产物 |
 | `revision_completed` | 修订关闭 |
@@ -99,7 +105,9 @@ aiwf runs search "revision"
 
 与 `record.json` 同目录的 `context.md` 由引擎在每次落盘时自动重写（确定性、
 无 LLM），含：运行状态与当前节点、输入、共享上下文内联短值、**产物索引**
-（每个 `$file` 路径 + 来源节点）。用途：
+（每个 `$file` 路径 + 来源节点）。产物索引递归收集：节点输出与嵌套对象/数组
+中的全部 `$file`、foreach items 源里的文件、以及所有子运行（含更深层嵌套）的
+产物；只有 `{"$file": "..."}` 标记的路径会被收录，普通字符串路径不算。用途：
 
 - 给人看进度：不用翻 JSON，读 context.md 即知当前在哪、产物在哪；
 - 交接给另一个 agent：先读它再用 `current` 接管；
