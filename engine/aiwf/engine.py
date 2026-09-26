@@ -2460,10 +2460,18 @@ class WorkflowEngine:
         return [f"- **{k}**: {self._inline(v)}" for k, v in obj.items()]
 
     def _collect_artifacts(
-        self, record: Dict[str, Any], seen: Set[str], depth: int = 0
+        self,
+        record: Dict[str, Any],
+        seen: Set[str],
+        depth: int = 0,
+        run_dir: Optional[str] = None,
     ) -> List[Tuple[str, str]]:
         """All (path, origin) $file artifacts of a record: direct/nested in
         node outputs, the foreach items source, and every child run's outputs.
+
+        Child records are addressed by derived path (children/<node>/<inst>) and
+        never looked up by scanning the run tree, so rendering stays linear in
+        the number of instances instead of quadratic.
         """
         found: List[Tuple[str, str]] = []
 
@@ -2496,20 +2504,35 @@ class WorkflowEngine:
                     except KeyError:
                         pass
             if depth < MAX_SUBFLOW_DEPTH:
+                base = run_dir or self.storage.run_dir_for_record(record)
                 for inst in state["instances"]:
                     rid = inst.get("run_id")
                     if not rid:
                         continue
-                    try:
-                        child = self.storage.find_run(rid)
-                    except FileNotFoundError:
+                    child_dir = os.path.join(
+                        base, "children", state["node_id"], inst["key"]
+                    )
+                    child = self._read_record_at(child_dir)
+                    if child is None:
                         continue
                     origin = f"子运行 {rid}（{state['node_id']}/{inst['key']}）"
                     for path, _origin in self._collect_artifacts(
-                        child, seen, depth + 1
+                        child, seen, depth + 1, child_dir
                     ):
                         found.append((path, origin))
         return found
+
+    @staticmethod
+    def _read_record_at(run_dir: str) -> Optional[Dict[str, Any]]:
+        """Read a run record by its directory; None when absent or unreadable."""
+        path = os.path.join(run_dir, "record.json")
+        if not os.path.isfile(path):
+            return None
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except (OSError, ValueError):
+            return None
 
     def _render_context_md(self, workflow: Dict[str, Any],
                            record: Dict[str, Any]) -> str:

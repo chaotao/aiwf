@@ -21,6 +21,10 @@ from typing import Any, Dict, List, Optional, Tuple
 MAX_CHAIN_DEPTH = 8
 
 
+def _dump_json(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=False, indent=2) + "\n"
+
+
 class Storage:
     def __init__(self, root: Optional[str] = None):
         self.root = root or os.getenv("AIWF_HOME", ".aiwf")
@@ -32,6 +36,16 @@ class Storage:
         os.makedirs(self.workflows_dir, exist_ok=True)
         os.makedirs(self.runs_dir, exist_ok=True)
         return self
+
+    @staticmethod
+    def _atomic_write_text(path: str, content: str) -> None:
+        """Write via a temp file + rename so a crash mid-write can never
+        truncate an existing record/context file."""
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        tmp = f"{path}.tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(content)
+        os.replace(tmp, path)
 
     # ---- workflow definitions ---------------------------------------
     def workflow_path(self, workflow_id: str) -> str:
@@ -53,9 +67,7 @@ class Storage:
     def save_workflow(self, workflow: Dict[str, Any]) -> str:
         os.makedirs(self.workflows_dir, exist_ok=True)
         path = self.workflow_path(workflow["id"])
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(workflow, f, ensure_ascii=False, indent=2)
-            f.write("\n")
+        self._atomic_write_text(path, _dump_json(workflow))
         return path
 
     def list_workflows(self) -> List[str]:
@@ -116,18 +128,27 @@ class Storage:
         d = self.run_dir_for_record(record)
         os.makedirs(d, exist_ok=True)
         path = os.path.join(d, "record.json")
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(record, f, ensure_ascii=False, indent=2)
-            f.write("\n")
+        self._atomic_write_text(path, _dump_json(record))
         return path
 
     def save_context_doc(self, record: Dict[str, Any], content: str) -> str:
         d = self.run_dir_for_record(record)
         os.makedirs(d, exist_ok=True)
         path = os.path.join(d, "context.md")
-        with open(path, "w", encoding="utf-8") as f:
-            f.write(content)
+        if self._read_text(path) == content:
+            return path
+        self._atomic_write_text(path, content)
         return path
+
+    @staticmethod
+    def _read_text(path: str) -> Optional[str]:
+        if not os.path.isfile(path):
+            return None
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                return f.read()
+        except OSError:
+            return None
 
     def load_run(self, workflow_id: str, run_id: str) -> Dict[str, Any]:
         path = os.path.join(
@@ -217,8 +238,5 @@ class Storage:
             return json.load(f)
 
     def write_json_file(self, path: str, value: Any) -> str:
-        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(value, f, ensure_ascii=False, indent=2)
-            f.write("\n")
+        self._atomic_write_text(path, _dump_json(value))
         return path
