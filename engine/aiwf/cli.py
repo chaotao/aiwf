@@ -446,8 +446,7 @@ def cmd_runs_list(args, storage: Storage) -> int:
     ):
         if not getattr(args, "all", False) and parent_run is not None:
             continue
-        with open(path, "r", encoding="utf-8") as f:
-            r = json.load(f)
+        r = storage.load_record(path)
         if getattr(args, "status", None) and r["status"] != args.status:
             continue
         rows.append((r["started_at"], rid, wf, r["status"], r.get("duration_ms"),
@@ -495,8 +494,7 @@ def cmd_runs_search(args, storage: Storage) -> int:
     query = args.query.lower()
     hits = 0
     for wf, rid, path, _parent in storage.iter_run_files():
-        with open(path, "r", encoding="utf-8") as f:
-            r = json.load(f)
+        r = storage.load_record(path)
         haystack = json.dumps(
             {
                 "workflow_id": r["workflow_id"],

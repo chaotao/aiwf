@@ -872,7 +872,7 @@ class WorkflowEngine:
             self.storage.child_dir(record, node["id"], inst["key"]), "record.json"
         )
         if workflow["schema_version"] == "1.1" and os.path.isfile(prior_path):
-            prior = self.storage.read_json_file(prior_path)
+            prior = self.storage.load_record(prior_path, cache=True)
         run_id = inst["run_id"] or (prior["run_id"] if prior else make_run_id())
         inst.update(
             run_id=run_id, status="running", started_at=now_iso(),
@@ -2522,15 +2522,13 @@ class WorkflowEngine:
                         found.append((path, origin))
         return found
 
-    @staticmethod
-    def _read_record_at(run_dir: str) -> Optional[Dict[str, Any]]:
+    def _read_record_at(self, run_dir: str) -> Optional[Dict[str, Any]]:
         """Read a run record by its directory; None when absent or unreadable."""
         path = os.path.join(run_dir, "record.json")
         if not os.path.isfile(path):
             return None
         try:
-            with open(path, "r", encoding="utf-8") as f:
-                return json.load(f)
+            return self.storage.load_record(path)
         except (OSError, ValueError):
             return None
 

@@ -1,23 +1,33 @@
 # 审计 / 检索工作流运行记录
 
-1.1 的 `current <根run_id> --json` 是只读叶子任务包；`runs show` 仍读取指定
-run 的原始记录。`workflow.json` 是该运行的定义快照，修改源定义不会改写快照。
+1.1 的 `current <根run_id> --json` 是只读叶子任务包；`runs show` 读取指定 run 的
+完整记录（快照 + 回放增量日志）。`workflow.json` 是该运行的定义快照，修改源定义
+不会改写快照。
 `check_requested/check_decided` 记录 Agent 质检次数、原始输入/输出、理由、起始时间、
 耗时和摘要；`review_decided` 记录人工结论，两者不得混淆。
 
 所有执行记录都在 `.aiwf/runs/<workflow_id>/<run_id>/` 下：**每次运行一个独立
-文件夹**，含 `record.json`（审计记录）与 `context.md`（自动生成的共享上下文）。
-同一工作流多次执行各自成目录，每次状态变更立即落盘。记录分两层：**events
-事件流**（用户输入、验收、修订的全过程）和 **node_runs 节点执行记录**。
+文件夹**，含 `record.json`（审计记录）、`context.md`（自动生成的共享上下文）
+与 `record.log.jsonl`（增量日志）。同一工作流多次执行各自成目录，每次状态变更
+立即落盘。记录分两层：**events 事件流**（用户输入、验收、修订的全过程）和
+**node_runs 节点执行记录**。
+
+`record.json` 是快照，`record.log.jsonl` 是它之后每次状态变更的一行增量；
+引擎每 64 次落盘（或运行结束时）重写一次快照并清空日志。因此**运行中**的
+`record.json` 最多落后日志 64 次变更，**运行结束后必然与全量状态一致**。
+自己读盘时不要只读 `record.json`：用 `runs show/events/search` 或
+`storage.load_record()`，它们会自动回放日志；直接读文件只在运行已结束可靠。
 
 **子工作流记录嵌套在父运行目录内**，不另开顶层目录：
 
 ```
 runs/<父wf>/<父rid>/
   record.json, context.md, workflow.json  # 1.1 定义快照
+  record.log.jsonl                         # 快照之后的增量日志
   foreach-<node>-results.json              # foreach 实例结果清单
   children/<node>/subflow.json             # 内联 nodes 合成的子流程定义
   children/<node>/<instance>/record.json   # 每个实例一份子记录（single 固定 "0"）
+  children/<node>/<instance>/record.log.jsonl
 ```
 
 子记录的 `parent` 字段指向父 run 与节点；查找时引擎沿该链定位。
