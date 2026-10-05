@@ -1,0 +1,61 @@
+{
+  "schema_version": "1.1",
+  "id": "std.review-check",
+  "name": "按标准评审",
+  "description": "对一个对象按给定标准做一次评审，输出结论与问题清单。作为可复用的复检环节被其他工作流以 subflow 调用。",
+  "input_schema": {
+    "type": "object",
+    "required": ["subject", "criteria"],
+    "properties": {
+      "subject": {
+        "type": "string",
+        "description": "待评审对象：文件路径，或一段文本摘要"
+      },
+      "criteria": {
+        "type": "string",
+        "description": "评审标准，逐条列出"
+      }
+    }
+  },
+  "exports": {
+    "review": {
+      "type": "object",
+      "required": ["verdict", "issues"]
+    }
+  },
+  "nodes": [
+    {
+      "id": "start",
+      "type": "start",
+      "name": "开始"
+    },
+    {
+      "id": "review",
+      "type": "task",
+      "name": "评审",
+      "prompt": "评审对象：\n${subject}\n\n评审标准：\n${criteria}\n\n按以下步骤执行，每步都要落到实际内容：\n1. 先完整读一遍对象——是文件路径就打开读，不要只看文件名或开头几行就下结论。\n2. 逐条对照标准，为每条标准指出对象中的具体位置（引用原文、行号或小节标题）作为依据。\n3. 判定每条标准是否满足；没有依据支撑的结论不要写。\n4. 输出 JSON：{\"verdict\": \"PASS\" 或 \"REVISE\", \"issues\": [\"问题描述\", ...]}。\n   - 只有全部标准都满足时才给 PASS。\n   - 判定 REVISE 时 issues 必须非空，每条要说清\"哪条标准、在哪个位置、怎么改\"，不要只描述现象。",
+      "output_key": "review",
+      "output_schema": {
+        "type": "object",
+        "required": ["verdict", "issues"],
+        "properties": {
+          "verdict": {
+            "type": "string",
+            "enum": ["PASS", "REVISE"]
+          },
+          "issues": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "end",
+      "type": "end",
+      "name": "结束"
+    }
+  ]
+}

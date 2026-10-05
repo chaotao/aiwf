@@ -2,6 +2,7 @@
   "schema_version": "1.1",
   "id": "sequential",
   "name": "入门：规划与交付",
+  "max_steps": 50,
   "input_schema": {
     "type": "object",
     "required": ["idea"],

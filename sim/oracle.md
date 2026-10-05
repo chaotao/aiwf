@@ -21,7 +21,7 @@
 3. 进入第二章 previous_output 为空，previous 材料包含第一章已通过产物。
 4. 质检到上限必须失败；resume 不可绕过；人工 review 不可用 complete 跳过。
 5. 重放旧 action.id 被拒；current 不写磁盘。
-6. 嵌套失败可从根 resume；动态清单等待新增，done=true 才结束。
+6. 嵌套失败可从根 resume；引擎队列等待投喂，`seal` 后才收尾。
 7. 输出文件不存在、路径不符、Schema错误均驳回；漏字段不得静默变空串。
 8. 最终 completed，清单三项success，章节顺序和产物索引完整。
 

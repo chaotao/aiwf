@@ -13,7 +13,8 @@
       "type": "branch",
       "inputs": {"idea": {"ref": "idea"}},
       "prompt": "判断 idea 更适合快节奏冲突还是缓慢悬念，只返回 FAST 或 SLOW。",
-      "routes": {"FAST": "fast_script", "SLOW": "slow_script"}
+      "routes": {"FAST": "fast_script", "SLOW": "slow_script"},
+      "default": "fast_script"
     },
     {
       "id": "fast_script",
@@ -34,7 +35,7 @@
     {
       "id": "accept",
       "type": "review",
-      "requirements": ["查看 script 产物，节奏是否适合该创意"],
+      "requirements": ["查看 ${script} 产物，节奏是否适合该创意"],
       "routes": {"APPROVE": "end", "REJECT": "choose"}
     },
     {"id": "end", "type": "end"}

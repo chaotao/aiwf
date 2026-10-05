@@ -4,12 +4,20 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 import unittest
 
 from aiwf import Storage, WorkflowEngine
 from aiwf.engine import resolve_data
 from aiwf.schema import validate_workflow
+
+
+REPO = Path(__file__).resolve().parents[1]
+# Drive the CLI through the current interpreter: the POSIX engine/bin/aiwf
+# cannot be executed directly on Windows.
+CLI = [sys.executable, "-m", "aiwf"]
+CLI_ENV = {"PYTHONPATH": str(REPO / "engine")}
 
 
 def workflow(nodes, **extra):
@@ -288,22 +296,18 @@ class UsabilityTest(unittest.TestCase):
         self.assertNotEqual(resumed["action"]["id"], old)
         self.assertEqual(self.act("fixed")["status"], "completed")
 
-    def test_dynamic_wait_done_and_static_empty(self):
-        manifest = os.path.join(self.tmp.name, "items.json")
-        self.storage.write_json_file(manifest, {"done": False, "items": []})
+    def test_queue_waits_until_sealed_and_static_empty_ends(self):
         wf = workflow([{
-            "id": "batch", "type": "foreach", "items": {"$file": manifest},
+            "id": "batch", "type": "foreach", "items": {"queue": True},
             "nodes": [task()],
         }])
         spec = self.start(wf)
         self.assertEqual(spec["phase"], "awaiting_items")
-        self.storage.write_json_file(manifest, {"done": False, "items": [1]})
-        self.engine.resume(wf, self.rid)
+        self.engine.queue_add(self.rid, "batch", [{"id": "a", "name": "one"}])
         self.engine.settle(self.rid)
         spec = self.act("one")
         self.assertEqual(spec["phase"], "awaiting_items")
-        self.storage.write_json_file(manifest, {"done": True, "items": [1]})
-        self.engine.resume(wf, self.rid)
+        self.engine.queue_seal(self.rid, "batch")
         self.engine.settle(self.rid)
         self.assertEqual(self.engine.action_spec(self.rid)["status"], "completed")
         wf["nodes"][0]["items"] = []
@@ -349,7 +353,7 @@ class UsabilityTest(unittest.TestCase):
         self.assertIn("source", spec["error"])
         self.assertNotIn("source", self.storage.find_run(self.rid)["context"])
 
-    def test_static_items_snapshot_and_dynamic_append_only(self):
+    def test_static_items_are_read_once_from_their_source(self):
         path = os.path.join(self.tmp.name, "source.json")
         self.storage.write_json_file(path, [1, 2])
         wf = workflow([{
@@ -357,15 +361,40 @@ class UsabilityTest(unittest.TestCase):
             "nodes": [task(inputs={"item": {"ref": "item"}})],
         }])
         self.start(wf)
+        # a static source is snapshotted at the node boundary; editing the file
+        # afterwards must not reach back into a queue that already exists
         self.storage.write_json_file(path, [9])
         self.assertEqual(self.act("one")["node"]["inputs"]["item"], 2)
         self.assertEqual(self.act("two")["status"], "completed")
-        self.storage.write_json_file(path, {"done": False, "items": [1]})
+
+    def test_a_queue_item_is_editable_until_its_instance_starts(self):
+        wf = workflow([{
+            "id": "batch", "type": "foreach", "items": {"queue": True},
+            "nodes": [task(inputs={"item": {"ref": "item"}})],
+        }])
         self.start(wf)
-        self.storage.write_json_file(path, {"done": False, "items": [9, 2]})
-        spec = self.act("one")
-        self.assertEqual(spec["status"], "failed")
-        self.assertIn("append-only", spec["error"])
+        self.engine.queue_add(self.rid, "batch", [
+            {"id": "a", "name": "one"}, {"id": "b", "name": "two"},
+        ])
+        self.engine.settle(self.rid)
+        # 'a' is running; 'b' has no instance yet, so it is still the caller's
+        table = self.engine.queue_table(self.rid, "batch")
+        self.assertEqual(
+            [(r["id"], r["editable"]) for r in table["items"]],
+            [("a", False), ("b", True)],
+        )
+        self.engine.queue_update(self.rid, "batch", "b", {"name": "two revised"})
+        with self.assertRaisesRegex(RuntimeError, "already started"):
+            self.engine.queue_update(self.rid, "batch", "a", {"name": "nope"})
+
+        # an item's status *is* its instance's status -- one vocabulary, no copy
+        record = self.storage.find_run(self.rid)
+        by_key = {i["key"]: i["status"] for i in record["subflow_state"]["instances"]}
+        table = self.engine.queue_table(self.rid, "batch")
+        self.assertEqual([r["status"] for r in table["items"]],
+                         ["running", "pending"])
+        for row in table["items"]:
+            self.assertEqual(row["status"], by_key.get(row["id"], "pending"))
 
     def test_rejected_outputs_also_have_step_budget(self):
         wf = workflow([task(output_schema={"type": "integer"})], max_steps=2)
@@ -461,14 +490,13 @@ class UsabilityTest(unittest.TestCase):
 
     def test_cli_three_chapter_fixture(self):
         """Protocol fixture only: prose/checks/reviews here are simulated."""
-        repo = Path(__file__).resolve().parents[1]
-        cli = str(repo / "engine/bin/aiwf")
+        repo = REPO
         wf = json.loads((repo / "sim/novel-3ch/.aiwf/workflows/novel-3ch.json").read_text())
         self.storage.save_workflow(wf)
-        env = dict(os.environ, AIWF_HOME=self.storage.root)
+        env = dict(os.environ, AIWF_HOME=self.storage.root, **CLI_ENV)
         calls = []
         def call(command, *args):
-            proc = subprocess.run([cli, command, *args, "--json"], env=env,
+            proc = subprocess.run([*CLI, command, *args, "--json"], env=env,
                                   text=True, capture_output=True, check=True)
             calls.append(command)
             return json.loads(proc.stdout)
@@ -545,16 +573,15 @@ class UsabilityTest(unittest.TestCase):
         self.assertTrue((Path(self.storage.run_dir_for_record(root)) / "novel.md").is_file())
 
     def test_cli_root_action_roundtrip(self):
-        cli = str(Path(__file__).resolve().parents[1] / "engine/bin/aiwf")
         self.storage.save_workflow(workflow([task()]))
-        env = dict(os.environ, AIWF_HOME=self.storage.root)
+        env = dict(os.environ, AIWF_HOME=self.storage.root, **CLI_ENV)
         def call(*args):
-            proc = subprocess.run([cli, *args, "--json"], env=env,
+            proc = subprocess.run([*CLI, *args, "--json"], env=env,
                                   text=True, capture_output=True, check=True)
             return json.loads(proc.stdout)
         spec = call("run", "usability")
         missing_action = subprocess.run(
-            [cli, "complete", spec["run_id"], "--output", "late", "--json"],
+            [*CLI, "complete", spec["run_id"], "--output", "late", "--json"],
             env=env, text=True, capture_output=True,
         )
         self.assertEqual(missing_action.returncode, 2)

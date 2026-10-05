@@ -15,7 +15,25 @@ The CLI is the boundary between an AI agent / human and the engine state machine
     aiwf fail RUN_ID --error "..."       report node failure
     aiwf resume WF_ID RUN_ID             reopen a failed run
     aiwf runs list|show|search ...       inspect audit records
+    aiwf items list|add|update|remove|move|seal
+                                         the engine-owned foreach queue behind
+                                         `items: {"queue": true}`; the engine is
+                                         its only writer, started items are
+                                         immutable, `add`/`seal` resume a run
+                                         that was waiting for items
     aiwf skills list|install ...         package agent skills
+    aiwf wf list|show|install|diff|...   bundled workflow template library
+    aiwf inbox add|list|show|resolve|... park a thought/problem without
+                                         blocking the current work; project
+                                         level, never part of a run
+    aiwf plan list|show|check|status     long-running task list: goals, scope,
+                                         tasks, dependencies; project level,
+                                         spans many runs
+    aiwf plan new|task add|focus|sync    create, extend and reconcile a plan;
+                                         sync is a dry run until --write
+
+`aiwf runs show` renders a workflow's declared `view` -- the business stages a
+human cares about -- above the raw node stream; `--view` prints only that.
 
 Every state-changing command prints the resulting spec so an agent can loop
 without re-querying. --json emits machine-readable spec envelopes.
@@ -27,6 +45,10 @@ import shutil
 import sys
 from typing import Any, Dict, List, Optional
 
+from . import inbox as inbox_store
+from . import library as template_library
+from . import plan as plan_store
+from . import view as view_mod
 from .engine import WorkflowEngine
 from .schema import validate_workflow
 from .storage import Storage
@@ -153,7 +175,7 @@ def print_spec(spec_envelope: Dict[str, Any], as_json: bool) -> None:
         print("action   : no execution needed; run `aiwf complete <run_id> --empty`")
 
 
-def _print_record_table(record: Dict[str, Any]) -> None:
+def _print_record_table(record: Dict[str, Any], storage: Optional[Storage] = None) -> None:
     wf = record["workflow_id"]
     print(f"run_id     : {record['run_id']}")
     print(f"workflow   : {wf}")
@@ -165,6 +187,12 @@ def _print_record_table(record: Dict[str, Any]) -> None:
     if record.get("error"):
         print(f"error      : {record['error']}")
     print(f"record dir : {Storage().run_dir_for_record(record)}")
+    derived, view_error = _derive_view(record, storage)
+    if derived:
+        _print_view(derived)
+    elif view_error:
+        # Never fail silently: a view that is missing for a reason must say so.
+        print(f"view       : (unavailable: {view_error})")
     if record["node_runs"]:
         print("nodes:")
         for nr in record["node_runs"]:
@@ -181,6 +209,76 @@ def _print_record_table(record: Dict[str, Any]) -> None:
                 f"{nr['node_name']}  -- {nr['summary']}"
             )
     _print_subflow_table(record)
+
+
+# Instance status -> the stage vocabulary the view speaks.
+_ROW_STATUS = {
+    "success": "done", "running": "active",
+    "failed": "failed", "pending": "pending",
+}
+
+
+def _derive_view(
+    record: Dict[str, Any], storage: Optional[Storage]
+) -> tuple:
+    """``(derived, error)``.
+
+    ``(None, None)`` means the definition resolved and simply declares no view.
+    A non-empty ``error`` means the definition itself could not be resolved --
+    a legacy record whose run predates ``workflow_version``, say -- which is a
+    different answer from "no view" and must not be swallowed.
+    """
+    if storage is None:
+        return None, None
+    try:
+        workflow = storage.load_workflow_for_record(record)
+    except Exception as e:
+        return None, str(e)
+    return view_mod.derive(workflow, record, storage), None
+
+
+def _print_view(derived: Dict[str, Any]) -> None:
+    """Stages in node order; a loop's items indent under the stage they feed,
+    and a gate prints the exact command a human would run to clear it."""
+    print("view       :")
+    for stage in derived["stages"]:
+        tag = view_mod.mark(stage["status"]).ljust(4)
+        suffix = f"  -- {stage['detail']}" if stage["detail"] else ""
+        print(f"  [{tag}] {stage['name']}{suffix}")
+        queue = stage.get("queue")
+        if queue:
+            for row in queue["items"]:
+                rtag = view_mod.mark(
+                    _ROW_STATUS.get(row["status"], "pending")
+                ).ljust(4)
+                note = ""
+                if row["current"]:
+                    note = "  <- 当前"
+                    if queue.get("current_stage"):
+                        note += f"（{queue['current_stage']}）"
+                print(f"    [{rtag}] {row['key']}  {row['label']}{note}")
+        if stage["status"] == "waiting" and stage.get("action"):
+            print(f"    -> {_gate_command(stage['action'])}")
+
+
+def _gate_command(action: Dict[str, Any]) -> str:
+    """The exact command that clears a gate -- action id included.
+
+    Without ``--action`` the engine rejects the instruction as stale, so a
+    command that omits it is worse than no command: it looks runnable and is
+    not.
+    """
+    kind, run_id, aid = action["kind"], action["run_id"], action.get("id")
+    if kind == "review":
+        return f"aiwf review {run_id} --action {aid} --verdict APPROVE|REJECT"
+    if kind == "check":
+        return (f"aiwf complete {run_id} --action {aid} "
+                "--output '{\"verdict\":\"PASS\",\"reason\":\"...\"}'")
+    if kind == "provide":
+        return f"aiwf provide {run_id} --action {aid} -p key=value"
+    if kind == "resume":
+        return f"aiwf resume {action.get('workflow_id')} {run_id}"
+    return f"aiwf current {run_id} --json"
 
 
 def _print_subflow_table(record: Dict[str, Any]) -> None:
@@ -226,8 +324,29 @@ def _read_data(args) -> Dict[str, Any]:
     return values
 
 
-def _collect_inputs(args) -> Dict[str, Any]:
-    inputs: Dict[str, Any] = {}
+def _declared_inputs(workflow: Dict[str, Any]) -> set:
+    """Keys the definition itself declares - what run_defaults may fill."""
+    schema = workflow.get("input_schema") or {}
+    return set(schema.get("properties") or {}) | set(schema.get("required") or [])
+
+
+def _collect_inputs(
+    args, workflow: Dict[str, Any], storage: Storage
+) -> Dict[str, Any]:
+    """Start-up inputs, later sources winning:
+
+        project run_defaults  ->  --input-file  ->  -p/--param
+
+    Defaults are filtered to keys the definition declares, so one project's
+    settings never leak into unrelated workflows. A value the project does not
+    configure simply stays missing, and the input_schema check reports it.
+    """
+    declared = _declared_inputs(workflow)
+    inputs: Dict[str, Any] = {
+        key: value
+        for key, value in storage.run_defaults().items()
+        if key in declared
+    }
     if getattr(args, "input_file", None):
         with open(args.input_file, "r", encoding="utf-8") as f:
             loaded = json.load(f)
@@ -275,12 +394,37 @@ def cmd_init(args, storage: Storage) -> int:
     return 0
 
 
+def _report_run_defaults(storage: Storage) -> None:
+    """Advisory only, never a failure: which required inputs the project's
+    run_defaults does not fill, and which configured keys no definition
+    declares (usually a typo). Both are normal while a project is still being
+    set up, so they are printed as notes rather than raised."""
+    defaults = storage.run_defaults()
+    declared_any: set = set()
+    needed: List[str] = []
+    for wid in storage.list_workflows():
+        workflow = storage.load_workflow(wid)
+        declared_any |= _declared_inputs(workflow)
+        required = (workflow.get("input_schema") or {}).get("required") or []
+        needed += [
+            f"{wid}.{key}" for key in sorted(required) if key not in defaults
+        ]
+    if needed:
+        print("  required inputs not covered by run_defaults "
+              f"(pass them with -p at run time): {', '.join(needed)}")
+    unused = sorted(set(defaults) - declared_any)
+    if unused:
+        print("  run_defaults keys no definition declares: "
+              f"{', '.join(unused)}")
+
+
 def cmd_validate(args, storage: Storage) -> int:
     if args.project:
         result = WorkflowEngine(storage).validate_project()
         print(f"valid project: {len(result['workflows'])} workflow(s)")
         for src, targets in result["edges"].items():
             print(f"  {src} -> {', '.join(targets)}")
+        _report_run_defaults(storage)
         return 0
     if not args.path:
         raise SystemExit("validate needs a PATH, or use --project")
@@ -306,7 +450,7 @@ def cmd_workflows(args, storage: Storage) -> int:
 def cmd_run(args, storage: Storage) -> int:
     workflow = storage.load_workflow(args.workflow_id)
     engine = WorkflowEngine(storage)
-    record = engine.start(workflow, _collect_inputs(args))
+    record = engine.start(workflow, _collect_inputs(args, workflow, storage))
     return _emit(engine, record, args)
 
 
@@ -439,6 +583,78 @@ def cmd_redo(args, storage: Storage) -> int:
     return _emit(engine, record, args)
 
 
+#: Instance status -> row mark for `aiwf items list`. The status vocabulary is
+#: the engine's own instance one, so it matches `view --json` exactly.
+_ITEM_MARKS = {"pending": "  ", "running": ">>", "success": "ok", "failed": "!!"}
+
+
+def _items_text(table: Dict[str, Any]) -> str:
+    seal = "sealed" if table["done"] else "open"
+    lines = [f"queue {table['node']}  ({table['total']} items, {seal})"]
+    for row in table["items"]:
+        mark = _ITEM_MARKS.get(row["status"], "??")
+        lines.append(f"  [{mark}] {row['id']}  {row['name']}  ({row['status']})")
+    if not table["items"]:
+        lines.append("  (empty)")
+    return "\n".join(lines)
+
+
+def _json_arg(raw: str) -> Any:
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError as e:
+        raise SystemExit(f"expected a JSON argument, got {raw!r}: {e}")
+
+
+def cmd_items(args, storage: Storage) -> int:
+    """The engine-owned foreach queue -- the engine is its only writer.
+
+    ``list`` is read-only; every other verb mutates the queue and then reports
+    where the run stands, because an edit may be exactly what the run was
+    waiting for (``add``/``seal`` on an ``awaiting_items`` run resume it).
+    """
+    engine = WorkflowEngine(storage)
+    root = engine.root_record(storage.find_run(args.run_id))
+    leaf = engine._leaf_record(root)
+    node, verb = args.node, args.items_command
+
+    if verb == "list":
+        table = engine.queue_table(leaf["run_id"], node)
+    elif verb == "add":
+        if not args.item:
+            raise SystemExit("items add needs at least one --item '<json>'")
+        table = engine.queue_add(
+            leaf["run_id"], node, [_json_arg(raw) for raw in args.item]
+        )
+    elif verb == "update":
+        table = engine.queue_update(
+            leaf["run_id"], node, args.id, _json_arg(args.set)
+        )
+    elif verb == "remove":
+        table = engine.queue_remove(leaf["run_id"], node, args.id)
+    elif verb == "move":
+        table = engine.queue_move(leaf["run_id"], node, args.id, args.to)
+    else:  # seal
+        table = engine.queue_seal(leaf["run_id"], node)
+
+    spec = None
+    if verb != "list":
+        if _new_protocol(engine, root):
+            engine.settle(root["run_id"])
+            spec = engine.action_spec(root["run_id"])
+        else:
+            leaf = engine._leaf_record(storage.find_run(root["run_id"]))
+            spec = engine.node_spec(storage.load_workflow_for_record(leaf), leaf)
+    if args.json:
+        print(json.dumps({"queue": table, "spec": spec}, ensure_ascii=False, indent=2))
+    else:
+        print(_items_text(table))
+        if spec is not None:
+            print()
+            print_spec(spec, False)
+    return 1 if spec and spec["status"] == "failed" else 0
+
+
 def cmd_runs_list(args, storage: Storage) -> int:
     rows = []
     for wf, rid, path, parent_run in storage.iter_run_files(
@@ -462,6 +678,19 @@ def cmd_runs_list(args, storage: Storage) -> int:
 
 def cmd_runs_show(args, storage: Storage) -> int:
     record = storage.find_run(args.run_id)
+    if getattr(args, "view", False):
+        derived, error = _derive_view(record, storage)
+        if error:
+            print(f"error: {error}", file=sys.stderr)
+            return 2
+        if derived is None:
+            print(f"run {args.run_id}: workflow declares no view", file=sys.stderr)
+            return 1
+        if args.json:
+            print(json.dumps(derived, ensure_ascii=False, indent=2))
+        else:
+            _print_view(derived)
+        return 0
     if args.json:
         print(json.dumps(record, ensure_ascii=False, indent=2))
         return 0
@@ -472,7 +701,7 @@ def cmd_runs_show(args, storage: Storage) -> int:
                 return 0
         print(f"node {args.node!r} not found in run {args.run_id}", file=sys.stderr)
         return 1
-    _print_record_table(record)
+    _print_record_table(record, storage)
     return 0
 
 
@@ -554,6 +783,517 @@ def cmd_skills_install(args, storage: Storage) -> int:
         print(f"installed: {dst}")
     print(f"\n{len(installed)} skill(s) installed. Ensure the aiwf CLI is reachable "
           f"(add engine/bin to PATH, pip install, or use PYTHONPATH=engine python3 -m aiwf).")
+    return 0
+
+
+# ---- template library ----------------------------------------------------
+def cmd_wf_list(args, storage: Storage) -> int:
+    entries = template_library.load_library(args.library)
+    base = template_library.library_dir(args.library)
+    if not entries:
+        print(f"(no templates in {base})")
+        return 0
+    installed = set(storage.list_workflows())
+    print(f"library: {base}")
+    print(f"{'ID':<24} {'MATURITY':<13} {'LOCAL':<6} SUMMARY")
+    for entry_id in sorted(entries):
+        meta = entries[entry_id]["meta"] or {}
+        summary = (meta.get("summary")
+                   or entries[entry_id]["definition"].get("description", ""))
+        print(f"{entry_id:<24} {str(meta.get('maturity') or '-'):<13} "
+              f"{'yes' if entry_id in installed else '-':<6} {summary[:70]}")
+    return 0
+
+
+def cmd_wf_show(args, storage: Storage) -> int:
+    entries = template_library.load_library(args.library)
+    entry = entries.get(args.template_id)
+    if entry is None:
+        raise ValueError(
+            f"template {args.template_id!r} not found in the library at "
+            f"{template_library.library_dir(args.library)}"
+        )
+    meta = entry["meta"] or {}
+    definition = entry["definition"]
+    state = next(
+        (r for r in template_library.status(storage, args.library)
+         if r["id"] == args.template_id),
+        None,
+    )
+    deps = [d for d in template_library.dependency_closure(
+        args.template_id, entries) if d != args.template_id]
+
+    print(f"id        : {args.template_id}")
+    print(f"name      : {definition.get('name', '')}")
+    print(f"maturity  : {meta.get('maturity', 'unspecified')}")
+    if meta.get("summary"):
+        print(f"summary   : {meta['summary']}")
+    print(f"source    : {entry['path']}")
+    print(f"schema    : {definition.get('schema_version')}")
+    if state is None:
+        print("local     : not installed")
+    else:
+        print(f"local     : {state['state']} ({state['path']})")
+        print(f"upstream  : {state['upstream']}")
+    print(f"deps      : {', '.join(deps) if deps else '(none)'}")
+
+    inputs = definition.get("input_schema") or {}
+    required = inputs.get("required") or []
+    optional = [k for k in (inputs.get("properties") or {}) if k not in required]
+    print(f"inputs    : required={', '.join(required) if required else '(none)'}"
+          f"  optional={', '.join(optional) if optional else '(none)'}")
+    for label, key in (("scenarios", "scenarios"), ("not_for", "not_for")):
+        for value in meta.get(key) or []:
+            print(f"{label:<10}: {value}")
+    return 0
+
+
+def cmd_wf_install(args, storage: Storage) -> int:
+    installed = template_library.install(
+        storage,
+        args.template_id,
+        as_id=getattr(args, "as_id", None),
+        force=args.force,
+        with_deps=not args.no_deps,
+        library=args.library,
+    )
+    for item in installed:
+        tag = "dependency" if item["dependency"] else "template"
+        how = "updated" if item["updated"] else "installed"
+        print(f"{how:<9} [{tag}] {item['id']} -> {item['path']}")
+    print(f"\nledger   : {template_library.ledger_path(storage)}")
+    print("next     : aiwf validate --project")
+    return 0
+
+
+def cmd_wf_diff(args, storage: Storage) -> int:
+    rendered, _local, _upstream = template_library.diff(
+        storage, args.template_id, args.library
+    )
+    if not rendered:
+        print(f"{args.template_id}: identical to the library version")
+        return 0
+    print(rendered, end="" if rendered.endswith("\n") else "\n")
+    return 0
+
+
+def cmd_wf_status(args, storage: Storage) -> int:
+    rows = template_library.status(storage, args.library)
+    if not rows:
+        print("(no templates installed from the library)")
+        return 0
+    print(f"{'ID':<24} {'LOCAL':<9} {'UPSTREAM':<10} {'MATURITY':<13} INSTALLED_AT")
+    for row in rows:
+        print(f"{row['id']:<24} {row['state']:<9} {row['upstream']:<10} "
+              f"{str(row['maturity'] or '-'):<13} {row['installed_at'] or '-'}")
+    print("\nLOCAL=edited 表示本地已改动，重装需 --force；"
+          "UPSTREAM=updated 表示库里有新版本")
+    return 0
+
+
+def cmd_wf_index(args, storage: Storage) -> int:
+    path = template_library.index_path(args.library)
+    storage._atomic_write_text(path, template_library.render_index(args.library))
+    print(f"wrote {path}")
+    return 0
+
+
+# ---- inbox ---------------------------------------------------------------
+def _inbox_source(args) -> Optional[str]:
+    """前两项是 run 记录标识，第三项才是工作流名；自由文本，不校验存在性。"""
+    parts = [p for p in (getattr(args, "run", None), getattr(args, "node", None),
+                         getattr(args, "source", None)) if p]
+    return " / ".join(parts) if parts else None
+
+
+def _inbox_dump(args, payload: Dict[str, Any]) -> None:
+    print(json.dumps(payload, ensure_ascii=False, indent=2))
+
+
+def cmd_inbox_add(args, storage: Storage) -> int:
+    note = None
+    if args.note_file:
+        with open(args.note_file, "r", encoding="utf-8") as handle:
+            note = handle.read()
+    elif args.note:
+        note = args.note
+    entry = inbox_store.add(
+        storage.inbox_dir,
+        " ".join(args.text).strip(),
+        reason=args.why,
+        type_=args.type,
+        source=_inbox_source(args),
+        merge_into=args.merge_into,
+        split_from=args.split_from,
+        related=args.related,
+        note=note,
+    )
+    if getattr(args, "json", False):
+        _inbox_dump(args, entry)
+        return 0
+    if args.merge_into:
+        print(f"merged into {entry['id']} (吸收)：{entry.get('summary', '').splitlines()[0][:60]}")
+    else:
+        print(f"recorded {entry['id']}：{entry.get('summary', '').splitlines()[0][:60]}")
+    print(f"type     : {entry.get('type', '')}")
+    print(f"parked   : {entry.get('reason', '')}")
+    print(f"source   : {entry.get('source') or '(none)'}")
+    print("current run/work is unaffected - keep going.")
+    print(f"ledger   : {inbox_store.ledger_path(storage.inbox_dir)}")
+    return 0
+
+
+def _inbox_rows(entry: Dict[str, Any]) -> str:
+    lines = (entry.get("summary") or "").splitlines()
+    first = lines[0] if lines else ""
+    parked = entry.get("reason") or entry.get("target") or ""
+    return (f"{inbox_store.pad_display(entry['id'], 9)}"
+            f"{inbox_store.pad_display(entry.get('status', ''), 7)}"
+            f"{inbox_store.pad_display(entry.get('type', ''), 5)}"
+            f"{inbox_store.pad_display(entry.get('date', ''), 11)}"
+            f"{inbox_store.pad_display(parked, 15)} {first}")
+
+
+def cmd_inbox_list(args, storage: Storage) -> int:
+    data = inbox_store.load(storage.inbox_dir)
+    rows = list(data["open"])
+    if args.type:
+        rows = [r for r in rows if r.get("type") == args.type]
+    if args.run:
+        rows = [r for r in rows if args.run in (r.get("source") or "")]
+    archived = list(data["archived"])
+    if args.run:
+        archived = [r for r in archived if args.run in (r.get("source") or "")]
+
+    if getattr(args, "json", False):
+        _inbox_dump(args, {"open": rows, "archived": archived if args.all else []})
+        return 0
+
+    if not rows:
+        print(f"(no open items in {storage.inbox_dir})")
+    else:
+        print(f"{inbox_store.pad_display('ID', 9)}{inbox_store.pad_display('STATUS', 7)}"
+              f"{inbox_store.pad_display('TYPE', 5)}{inbox_store.pad_display('DATE', 11)}"
+              f"{inbox_store.pad_display('PARKED', 15)} SUMMARY")
+        for entry in rows:
+            print(_inbox_rows(entry))
+    if args.all and archived:
+        print("\narchived:")
+        for entry in archived:
+            print(_inbox_rows(entry))
+    return 0
+
+
+def cmd_inbox_show(args, storage: Storage) -> int:
+    entry = inbox_store.find(storage.inbox_dir, args.entry_id)
+    if entry is None:
+        raise ValueError(
+            f"no item {args.entry_id} in {storage.inbox_dir}; see `aiwf inbox list`"
+        )
+    if getattr(args, "json", False):
+        _inbox_dump(args, entry)
+        return 0
+    print(f"### {entry['id']}")
+    for key, label in (("status", "状态"), ("type", "类型"), ("date", "日期"),
+                       ("source", "来源"), ("summary", "摘要"), ("reason", "为何停放"),
+                       ("split_from", "拆自"), ("absorbed", "吸收"),
+                       ("related", "相关"), ("note", "备注"), ("target", "去向")):
+        value = str(entry.get(key) or "").strip()
+        if value:
+            print(f"- {label}：{value}")
+    return 0
+
+
+def cmd_inbox_resolve(args, storage: Storage) -> int:
+    entry = inbox_store.resolve(
+        storage.inbox_dir,
+        args.entry_id,
+        status=args.status,
+        target=args.to,
+        split_into=args.split_into,
+    )
+    if getattr(args, "json", False):
+        _inbox_dump(args, entry)
+        return 0
+    print(f"archived {entry['id']} as {entry['status']}")
+    print(f"went to  : {entry['target']}")
+    print(f"history  : {inbox_store.history_path(storage.inbox_dir)}")
+    return 0
+
+
+def cmd_inbox_check(args, storage: Storage) -> int:
+    problems = inbox_store.check(storage.inbox_dir)
+    if getattr(args, "json", False):
+        _inbox_dump(args, {"ok": not problems, "problems": problems})
+        return 0
+    if problems:
+        print(f"inbox check failed ({len(problems)} problem(s)):")
+        for problem in problems:
+            print(f"  - {problem}")
+        return 2
+    data = inbox_store.load(storage.inbox_dir)
+    print(f"inbox ok: {len(data['open'])} open, {len(data['archived'])} archived")
+    return 0
+
+
+def cmd_inbox_path(args, storage: Storage) -> int:
+    if getattr(args, "json", False):
+        _inbox_dump(args, {"dir": storage.inbox_dir,
+                           "ledger": inbox_store.ledger_path(storage.inbox_dir),
+                           "history": inbox_store.history_path(storage.inbox_dir)})
+        return 0
+    print(storage.inbox_dir)
+    return 0
+
+
+# ---- plan ----------------------------------------------------------------
+# A plan is a long-running task list at <root>/plans/<id>/index.md. Like the
+# inbox it is project level and never part of a run; unlike the inbox it does
+# read runs -- to derive execution status, which prose cannot keep honest.
+def _plans_dir(args, storage: Storage) -> str:
+    return getattr(args, "dir", None) or storage.plans_dir
+
+
+def _plan_dump(args, payload: Any) -> None:
+    print(json.dumps(payload, ensure_ascii=False, indent=2))
+
+
+def _plan_row(plan: Dict[str, Any]) -> str:
+    tally = plan_store.counts(plan)
+    status = (plan["info"].get("状态") or "?").strip()
+    focus = plan_store.focus_task_id(plan) or "—"
+    done = "%d/%d" % (tally.get("已完成", 0), tally["total"])
+    return (f"{inbox_store.pad_display(str(plan['id']), 22)}"
+            f"{inbox_store.pad_display(status, 10)}"
+            f"{inbox_store.pad_display(done, 8)}"
+            f"{inbox_store.pad_display(focus, 10)} {plan['name']}")
+
+
+def _plan_json(plan: Dict[str, Any], derived: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    payload = {
+        "id": plan["id"],
+        "name": plan["name"],
+        "path": plan.get("path"),
+        "status": plan["info"].get("状态"),
+        "goal": plan["info"].get("目标"),
+        "scope": plan["info"].get("范围"),
+        "focus": plan_store.focus_task_id(plan),
+        "counts": plan_store.counts(plan),
+        "tasks": [
+            {"id": t["id"], "name": t["name"], "status": t["status"], "deps": t["deps"]}
+            for t in plan["tasks"]
+        ],
+        "outstanding": [t["id"] for t in plan_store.outstanding(plan)],
+    }
+    if derived is not None:
+        payload["derived"] = derived
+    return payload
+
+
+def cmd_plan_list(args, storage: Storage) -> int:
+    root = _plans_dir(args, storage)
+    plans = plan_store.load_all(root)
+    if getattr(args, "json", False):
+        _plan_dump(args, {"dir": root, "plans": [_plan_json(p) for p in plans]})
+        return 0
+    if not plans:
+        print(f"(no plans in {root})")
+        return 0
+    print(f"{inbox_store.pad_display('PLAN', 22)}{inbox_store.pad_display('STATUS', 10)}"
+          f"{inbox_store.pad_display('DONE', 8)}{inbox_store.pad_display('FOCUS', 10)} NAME")
+    for plan in plans:
+        print(_plan_row(plan))
+    return 0
+
+
+def cmd_plan_show(args, storage: Storage) -> int:
+    root = _plans_dir(args, storage)
+    plan = plan_store.load(root, args.plan_id)
+    derived: Dict[str, Any] = {}
+    if not getattr(args, "no_runs", False):
+        derived = plan_store.derive_from_runs(storage, plan["id"])
+    if getattr(args, "json", False):
+        _plan_dump(args, _plan_json(plan, derived))
+        return 0
+
+    info = plan["info"]
+    print(f"# {plan['name']}  ({plan['id']})")
+    for key in ("游戏", "状态", "目标", "范围", "创建日期", "最近更新"):
+        if info.get(key):
+            print(f"{inbox_store.pad_display(key, 10)}: {info[key]}")
+
+    focus = plan.get("focus") or {}
+    if focus:
+        print("\n当前焦点")
+        for key, value in focus.items():
+            head, _, rest = str(value).partition("\n")
+            print(f"  {inbox_store.pad_display(key, 8)}: {head}")
+            for line in rest.splitlines():
+                print(f"    {line}")
+
+    print("\n任务")
+    for task in plan["tasks"]:
+        line = f"  {task['id']}  {inbox_store.pad_display(task['status'], 6)}  {task['name']}"
+        run = derived.get(task["id"])
+        if run and run["status"] != task["status"]:
+            line += f"   [run {run['run_id']} → {run['status']}]"
+        print(line)
+
+    tally = plan_store.counts(plan)
+    pending = plan_store.outstanding(plan)
+    print(f"\n进度  {tally.get('已完成', 0)}/{tally['total']} 已完成")
+    print(f"待办  {', '.join(t['id'] for t in pending) if pending else '无'}")
+    return 0
+
+
+def cmd_plan_check(args, storage: Storage) -> int:
+    root = _plans_dir(args, storage)
+    problems = plan_store.check(root, getattr(args, "plan_id", None))
+    if getattr(args, "json", False):
+        _plan_dump(args, {"ok": not problems, "dir": root, "problems": problems})
+        return 0
+    if problems:
+        print(f"plan check failed ({len(problems)} problem(s)):")
+        for problem in problems:
+            print(f"  - {problem}")
+        return 2
+    plans = plan_store.load_all(root)
+    total = sum(len(p["tasks"]) for p in plans)
+    print(f"plan ok: {len(plans)} plan(s), {total} task(s) in {root}")
+    return 0
+
+
+def cmd_plan_status(args, storage: Storage) -> int:
+    """Execution status derived from runs, next to what the document says."""
+    root = _plans_dir(args, storage)
+    want = getattr(args, "plan_id", None)
+    rows = []
+    for plan in plan_store.load_all(root):
+        if want and plan["id"] != want:
+            continue
+        derived = plan_store.derive_from_runs(storage, plan["id"])
+        for task in plan["tasks"]:
+            run = derived.get(task["id"])
+            if run:
+                rows.append((plan["id"], task["id"], task["status"],
+                             run["status"], run["run_id"]))
+    if getattr(args, "json", False):
+        _plan_dump(args, {"dir": root, "rows": [
+            {"plan": p, "task": t, "document": doc, "derived": der, "run_id": rid}
+            for p, t, doc, der, rid in rows]})
+        return 0
+    if not rows:
+        print("(no runs linked to a task; a run links via inputs.plan / inputs.task)")
+        return 0
+    print(f"{inbox_store.pad_display('PLAN', 22)}{inbox_store.pad_display('TASK', 10)}"
+          f"{inbox_store.pad_display('DOC', 10)}{inbox_store.pad_display('RUN STATUS', 12)} RUN_ID")
+    for p, t, doc, der, rid in rows:
+        mark = "" if doc == der else "  <- drift"
+        print(f"{inbox_store.pad_display(p, 22)}{inbox_store.pad_display(t, 10)}"
+              f"{inbox_store.pad_display(doc, 10)}{inbox_store.pad_display(der, 12)}{rid}{mark}")
+    return 0
+
+
+def cmd_plan_path(args, storage: Storage) -> int:
+    root = _plans_dir(args, storage)
+    ids = plan_store.iter_plan_ids(root)
+    if getattr(args, "json", False):
+        _plan_dump(args, {"dir": root, "plans": [
+            {"id": i, "index": plan_store.index_path(root, i)} for i in ids]})
+        return 0
+    print(root)
+    for i in ids:
+        print(f"  {i}: {plan_store.index_path(root, i)}")
+    return 0
+
+
+def cmd_plan_new(args, storage: Storage) -> int:
+    root = _plans_dir(args, storage)
+    path = plan_store.new_plan(
+        root, args.plan_id, goal=args.goal, scope=args.scope,
+        name=getattr(args, "name", None), status=args.status,
+        game=getattr(args, "game", None),
+    )
+    if getattr(args, "json", False):
+        _plan_dump(args, {"created": path, "id": args.plan_id})
+        return 0
+    print(f"created plan {args.plan_id}: {path}")
+    print(f"next: aiwf plan task add {args.plan_id} TASK-001 --name \"...\"")
+    return 0
+
+
+def cmd_plan_task_add(args, storage: Storage) -> int:
+    root = _plans_dir(args, storage)
+    result = plan_store.add_task(
+        root, args.plan_id, args.task_id, name=args.name, status=args.status,
+        deps=plan_store.parse_deps(args.deps or ""),
+        link=not getattr(args, "no_link", False),
+        note=getattr(args, "note", None),
+    )
+    if getattr(args, "json", False):
+        _plan_dump(args, result)
+        return 0
+    print(f"added {result['task']} to {result['plan']}:")
+    print(f"  {result['line']}")
+    return 0
+
+
+def cmd_plan_focus(args, storage: Storage) -> int:
+    root = _plans_dir(args, storage)
+    result = plan_store.set_focus(
+        root, args.plan_id, args.task_id, status=getattr(args, "status", None)
+    )
+    if getattr(args, "json", False):
+        _plan_dump(args, result)
+        return 0
+    if not result["changes"]:
+        print(f"{result['plan']}: 当前焦点 already {result['focus'] or '无'}")
+        return 0
+    for change in result["changes"]:
+        print(f"{result['plan']}: {change['field']}  {change['old']} -> {change['new']}")
+    return 0
+
+
+def cmd_plan_sync(args, storage: Storage) -> int:
+    """Fold run facts back into the index. Dry by default: rewriting a file the
+    human wrote is the one thing here not undone by typing a command, so it
+    takes an explicit --write."""
+    root = _plans_dir(args, storage)
+    want = getattr(args, "plan_id", None)
+    write = getattr(args, "write", False)
+    renumber = getattr(args, "renumber", False)
+
+    reports = []
+    for plan in plan_store.load_all(root):
+        if want and plan["id"] != want:
+            continue
+        derived = plan_store.derive_from_runs(storage, plan["id"])
+        text, changes = plan_store.sync(plan, derived, renumber=renumber)
+        if changes and write:
+            plan_store.save(root, plan["id"], text)
+        reports.append({"plan": plan["id"], "changes": changes,
+                        "written": bool(changes) and write})
+
+    if want and not reports:
+        print(f"no plan {want!r} in {root}", file=sys.stderr)
+        return 2
+    if getattr(args, "json", False):
+        _plan_dump(args, {"dir": root, "write": write, "plans": reports})
+        return 0
+
+    if not any(r["changes"] for r in reports):
+        print(f"plan sync: nothing to do ({len(reports)} plan(s) checked)")
+        return 0
+    for report in reports:
+        if not report["changes"]:
+            continue
+        verb = "wrote" if report["written"] else "would write"
+        print(f"{report['plan']} ({verb} {len(report['changes'])} change(s)):")
+        for change in report["changes"]:
+            run = f"   [run {change['run_id']}]" if change.get("run_id") else ""
+            print(f"  - {change['field']}: {change['old']} -> {change['new']}{run}")
+    if not write:
+        print("(dry run - add --write to apply)")
     return 0
 
 
@@ -647,6 +1387,51 @@ def build_parser() -> argparse.ArgumentParser:
     prd.add_argument("--json", action="store_true")
     prd.set_defaults(func=cmd_redo)
 
+    pit = sub.add_parser(
+        "items",
+        help="engine-owned foreach queue (node declares items: {\"queue\": true})",
+        description="The queue is run state, not a file: items are validated "
+                    "against the fixed schema {id, name, ...extensions} and "
+                    "only the engine writes them. Started items are immutable; "
+                    "seal closes the queue.",
+    )
+    isub = pit.add_subparsers(dest="items_command", required=True)
+
+    def _items_common(parser):
+        parser.add_argument("run_id")
+        parser.add_argument("--node", required=True, help="foreach node id")
+        parser.add_argument("--json", action="store_true")
+        parser.set_defaults(func=cmd_items)
+        return parser
+
+    _items_common(isub.add_parser(
+        "list", help="print the queue and each item's execution status"
+    ))
+    pi_add = _items_common(isub.add_parser(
+        "add", help="append items (never a started one)"
+    ))
+    pi_add.add_argument("--item", action="append", required=True,
+                        help="one item as JSON: '{\"id\": \"T1\", \"name\": \"…\"}'; repeatable")
+    pi_up = _items_common(isub.add_parser(
+        "update", help="edit an item that has not started yet"
+    ))
+    pi_up.add_argument("--id", required=True, help="item id (the instance key)")
+    pi_up.add_argument("--set", required=True, help="patch as a JSON object")
+    pi_rm = _items_common(isub.add_parser(
+        "remove", help="drop an item that has not started yet"
+    ))
+    pi_rm.add_argument("--id", required=True, help="item id (the instance key)")
+    pi_mv = _items_common(isub.add_parser(
+        "move", help="reorder an item that has not started yet"
+    ))
+    pi_mv.add_argument("--id", required=True, help="item id (the instance key)")
+    pi_mv.add_argument("--to", required=True, type=int,
+                       help="destination index (0-based); must be at or after the "
+                            "first pending slot")
+    _items_common(isub.add_parser(
+        "seal", help="close the queue: no more additions, stop waiting"
+    ))
+
     pruns = sub.add_parser("runs", help="run record operations")
     rsub = pruns.add_subparsers(dest="runs_command", required=True)
 
@@ -656,9 +1441,13 @@ def build_parser() -> argparse.ArgumentParser:
     rl.add_argument("--all", action="store_true", help="include nested child runs")
     rl.set_defaults(func=cmd_runs_list)
 
-    rs = rsub.add_parser("show", help="show one run record")
+    rs = rsub.add_parser(
+        "show", help="show one run record (its declared business view first)"
+    )
     rs.add_argument("run_id")
     rs.add_argument("--node", help="full detail of one node run")
+    rs.add_argument("--view", action="store_true",
+                    help="only the workflow's declared view; with --json, as JSON")
     rs.add_argument("--json", action="store_true", help="full record as JSON")
     rs.set_defaults(func=cmd_runs_show)
 
@@ -676,6 +1465,189 @@ def build_parser() -> argparse.ArgumentParser:
     si = ssub.add_parser("install", help="install skills into a project")
     si.add_argument("--target", help="skills directory (default: .trae/skills)")
     si.set_defaults(func=cmd_skills_install)
+
+    wf_parent = argparse.ArgumentParser(add_help=False)
+    wf_parent.add_argument(
+        "--library",
+        help="template library dir (default: $AIWF_LIBRARY_DIR or "
+             "<repo>/library/workflows)",
+    )
+
+    pwf = sub.add_parser("wf", help="bundled workflow template library")
+    wsub = pwf.add_subparsers(dest="wf_command", required=True)
+
+    wl = wsub.add_parser("list", parents=[wf_parent],
+                         help="list templates available in the library")
+    wl.set_defaults(func=cmd_wf_list)
+
+    ws = wsub.add_parser("show", parents=[wf_parent],
+                         help="show one template's metadata and local state")
+    ws.add_argument("template_id")
+    ws.set_defaults(func=cmd_wf_show)
+
+    wi = wsub.add_parser("install", parents=[wf_parent],
+                         help="copy a template and its dependencies into this project")
+    wi.add_argument("template_id")
+    wi.add_argument("--as", dest="as_id", metavar="NEW_ID",
+                    help="install under a different workflow id")
+    wi.add_argument("--force", action="store_true",
+                    help="overwrite a locally edited copy")
+    wi.add_argument("--no-deps", action="store_true",
+                    help="install only this template, without its dependencies")
+    wi.set_defaults(func=cmd_wf_install)
+
+    wd = wsub.add_parser("diff", parents=[wf_parent],
+                         help="diff the local copy against the library version")
+    wd.add_argument("template_id")
+    wd.set_defaults(func=cmd_wf_diff)
+
+    wt = wsub.add_parser("status", parents=[wf_parent],
+                         help="installed templates vs the library")
+    wt.set_defaults(func=cmd_wf_status)
+
+    wx = wsub.add_parser("index", parents=[wf_parent],
+                         help="regenerate library/INDEX.md from metadata")
+    wx.set_defaults(func=cmd_wf_index)
+
+    # ---- inbox: project-level parking, deliberately unrelated to runs ----
+    inbox_parent = argparse.ArgumentParser(add_help=False)
+    inbox_parent.add_argument("--json", action="store_true",
+                              help="machine-readable output")
+
+    pin = sub.add_parser("inbox", help="park thoughts/problems without blocking current work")
+    isub = pin.add_subparsers(dest="inbox_command", required=True)
+
+    ia = isub.add_parser("add", parents=[inbox_parent],
+                         help="park one item (refuses an item with no 为何停放)")
+    ia.add_argument("text", nargs="+", help="what to park; keep it under 500 chars")
+    ia.add_argument("--why", required=True,
+                    help="为何停放: " + " / ".join(inbox_store.PARK_REASONS))
+    ia.add_argument("--type", default="想法", choices=inbox_store.TYPES)
+    ia.add_argument("--source", help="where it came from, free text (default: 对话)")
+    ia.add_argument("--run", help="source run id (recorded only; not validated)")
+    ia.add_argument("--node", help="source node id (recorded only)")
+    ia.add_argument("--merge-into", metavar="INB-NNN",
+                    help="fold into an existing open item instead of a new id")
+    ia.add_argument("--split-from", metavar="INB-NNN",
+                    help="this item was split out of that one")
+    ia.add_argument("--related", metavar="INB-NNN")
+    ia.add_argument("--note", help="one extra line of context")
+    ia.add_argument("--note-file", help="read the extra context from a file (utf-8)")
+    ia.set_defaults(func=cmd_inbox_add)
+
+    il = isub.add_parser("list", parents=[inbox_parent],
+                         help="open items (never reads history unless --all)")
+    il.add_argument("--all", action="store_true", help="also show archived items")
+    il.add_argument("--type", choices=inbox_store.TYPES)
+    il.add_argument("--run", help="only items whose 来源 mentions this run id")
+    il.set_defaults(func=cmd_inbox_list)
+
+    ish = isub.add_parser("show", parents=[inbox_parent], help="print one item")
+    ish.add_argument("entry_id", metavar="INB-NNN")
+    ish.set_defaults(func=cmd_inbox_show)
+
+    ir = isub.add_parser("resolve", parents=[inbox_parent],
+                         help="archive one item: status + history + ledger, one step")
+    ir.add_argument("entry_id", metavar="INB-NNN")
+    ir.add_argument("--status", default="已交接", choices=inbox_store.ARCHIVED)
+    ir.add_argument("--to", help="去向: where it went (handoff, not completion)")
+    ir.add_argument("--split-into", metavar="INB-NNN,INB-NNN",
+                    type=lambda s: [p.strip() for p in s.split(",") if p.strip()],
+                    help="record that the parts went to these ids (does not create them)")
+    ir.set_defaults(func=cmd_inbox_resolve)
+
+    ic = isub.add_parser("check", parents=[inbox_parent],
+                         help="verify the inbox format (read-only)")
+    ic.set_defaults(func=cmd_inbox_check)
+
+    ip = isub.add_parser("path", parents=[inbox_parent],
+                         help="print the inbox directory")
+    ip.set_defaults(func=cmd_inbox_path)
+
+    # ---- plan: project-level long-running task list ----------------------
+    plan_parent = argparse.ArgumentParser(add_help=False)
+    plan_parent.add_argument("--json", action="store_true",
+                             help="machine-readable output")
+    plan_parent.add_argument("--dir", metavar="PATH",
+                             help="plans directory (default: <AIWF_HOME>/plans, "
+                                  "i.e. .aiwf/plans)")
+
+    pp = sub.add_parser("plan", help="long-running task lists (goals, tasks, deps)")
+    psub = pp.add_subparsers(dest="plan_command", required=True)
+
+    ppl = psub.add_parser("list", parents=[plan_parent],
+                          help="every plan with status, progress and focus")
+    ppl.set_defaults(func=cmd_plan_list)
+
+    pps = psub.add_parser("show", parents=[plan_parent],
+                          help="one plan: goal, scope, focus, tasks, backlog")
+    pps.add_argument("plan_id")
+    pps.add_argument("--no-runs", action="store_true",
+                     help="skip deriving status from run records")
+    pps.set_defaults(func=cmd_plan_show)
+
+    ppc = psub.add_parser("check", parents=[plan_parent],
+                          help="verify status vocabulary and dependency graph")
+    ppc.add_argument("plan_id", nargs="?")
+    ppc.set_defaults(func=cmd_plan_check)
+
+    ppt = psub.add_parser("status", parents=[plan_parent],
+                          help="status derived from runs vs the document")
+    ppt.add_argument("plan_id", nargs="?")
+    ppt.set_defaults(func=cmd_plan_status)
+
+    ppp = psub.add_parser("path", parents=[plan_parent],
+                          help="print the plans directory")
+    ppp.set_defaults(func=cmd_plan_path)
+
+    ppn = psub.add_parser("new", parents=[plan_parent],
+                          help="create an empty plan (goal + scope)")
+    ppn.add_argument("plan_id")
+    ppn.add_argument("--goal", required=True, metavar="TEXT",
+                     help="what the plan is for (the required 目标 field)")
+    ppn.add_argument("--scope", required=True, metavar="TEXT",
+                     help="what is in and out of scope (the required 范围 field)")
+    ppn.add_argument("--name", metavar="TEXT", help="title (default: the plan id)")
+    ppn.add_argument("--status", default="规划中",
+                     choices=list(plan_store.PLAN_STATUSES))
+    ppn.add_argument("--game", metavar="NAME", help="value for the 游戏 field")
+    ppn.set_defaults(func=cmd_plan_new)
+
+    pptask = psub.add_parser("task", help="edit the task list")
+    ptask_sub = pptask.add_subparsers(dest="task_command", required=True)
+
+    pta = ptask_sub.add_parser("add", parents=[plan_parent],
+                               help="append one task row")
+    pta.add_argument("plan_id")
+    pta.add_argument("task_id", help="TASK-NNN")
+    pta.add_argument("--name", required=True, metavar="TEXT",
+                     help="the ｜名称｜ column")
+    pta.add_argument("--status", default="待开始",
+                     choices=list(plan_store.TASK_STATUSES))
+    pta.add_argument("--deps", metavar="IDS",
+                     help="dependencies, e.g. TASK-001,TASK-002 or TASK-003～005")
+    pta.add_argument("--note", metavar="TEXT",
+                     help="extra ｜…｜ segment after the dependencies")
+    pta.add_argument("--no-link", action="store_true",
+                     help="write a bare id, not [TASK-NNN](tasks/TASK-NNN.md)")
+    pta.set_defaults(func=cmd_plan_task_add)
+
+    ppf = psub.add_parser("focus", parents=[plan_parent],
+                          help="point the plan at a task, or at none")
+    ppf.add_argument("plan_id")
+    ppf.add_argument("task_id", help="TASK-NNN, or 'none'")
+    ppf.add_argument("--status", metavar="STATUS",
+                     help="override 当前状态 (default: the task's own status)")
+    ppf.set_defaults(func=cmd_plan_focus)
+
+    ppsync = psub.add_parser("sync", parents=[plan_parent],
+                             help="write run facts back into the index (dry run)")
+    ppsync.add_argument("plan_id", nargs="?")
+    ppsync.add_argument("--write", action="store_true",
+                        help="apply the changes; without it nothing is written")
+    ppsync.add_argument("--renumber", action="store_true",
+                        help="also reset the 已验收 denominator to the task count")
+    ppsync.set_defaults(func=cmd_plan_sync)
 
     return p
 

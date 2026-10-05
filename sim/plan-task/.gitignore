@@ -1,0 +1,5 @@
+# Debug scratch: run/view dumps and superseded runs archived during the
+# foreach-queue rework. The two evidence runs live in .aiwf/runs/ and ARE
+# committed; this bucket is local only.
+.archive/
+.tmp*

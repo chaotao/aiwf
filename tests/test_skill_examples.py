@@ -3,8 +3,10 @@
 These tests validate engine contracts, not literary quality or real code changes.
 """
 import json
+import os
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 import unittest
 
@@ -14,6 +16,10 @@ from aiwf.schema import validate_run_record, validate_workflow
 
 ROOT = Path(__file__).resolve().parents[1]
 EXAMPLES = ROOT / "skills/aiwf/assets/examples"
+# The POSIX engine/bin/aiwf launcher is not executable on Windows, so drive the
+# module through the current interpreter instead.
+CLI = [sys.executable, "-m", "aiwf"]
+CLI_ENV = dict(os.environ, PYTHONPATH=str(ROOT / "engine"))
 
 
 class SkillExamplesTest(unittest.TestCase):
@@ -53,7 +59,10 @@ class SkillExamplesTest(unittest.TestCase):
     def result(self, spec, exit_code=0):
         node = spec["node"]
         if node.get("output"):
-            return self.file(node["output"]["file"])
+            out = self.file(node["output"]["file"])
+            if "summary" in (node.get("output_schema") or {}).get("required", []):
+                out["summary"] = "Synthetic fixture"
+            return out
         if node["id"] == "plan":
             return {"goal": "fixture", "steps": ["first", "second"]}
         if node["id"] == "analysis":
@@ -103,18 +112,21 @@ class SkillExamplesTest(unittest.TestCase):
             "sequential": {"idea": "fixture"},
             "user-check-review": {"idea": "fixture"},
             "multi-file": {"idea": "fixture"},
-            "code-change": {"project_dir": str(self.base), "request": "fixture"},
-            "novel-chapters": {"chapters": [{"number": 1, "title": "a"}, {"number": 2, "title": "b"}]},
+            "code-change": {
+                "project_dir": str(self.base), "request": "fixture",
+                "conventions_file": "none", "test_cmd": "python -m pytest -q",
+            },
+            "novel-chapters": {"premise": "fixture 题材", "chapters": [{"number": 1, "title": "a"}, {"number": 2, "title": "b"}]},
             "game-resources": {"project_dir": str(self.base), "resources": [{"key": "player", "path": "res://player.tscn"}]},
             "analyze-piece": {"text": "fixture"},
             "subflow-parent": {"text": "fixture"},
             "condition-routing": {"project_dir": str(self.base)},
             "subjective-routing": {"idea": "fixture"},
         }
-        self.assertEqual(set(self.definitions), set(cases) | {"dynamic-items"})
+        self.assertEqual(set(self.definitions), set(cases) | {"queue-items"})
         validated = subprocess.run(
-            [str(ROOT / "engine/bin/aiwf"), "validate", "--project"],
-            cwd=self.base, text=True, capture_output=True,
+            [*CLI, "validate", "--project"],
+            cwd=self.base, env=CLI_ENV, text=True, capture_output=True,
         )
         self.assertEqual(validated.returncode, 0, validated.stdout + validated.stderr)
         for name, inputs in cases.items():
@@ -152,9 +164,16 @@ class SkillExamplesTest(unittest.TestCase):
         self.finish(spec)
 
     def test_previous_exports_and_child_scope(self):
-        spec = self.start("novel-chapters", {"chapters": [
-            {"number": 1, "title": "a"}, {"number": 2, "title": "b"},
-        ]})
+        spec = self.start("novel-chapters", {
+            "premise": "fixture 题材",
+            "chapters": [{"number": 1, "title": "a"}, {"number": 2, "title": "b"}],
+        })
+        # the queue sits behind three preparation nodes; walk them first
+        while spec["action"]["node_id"] != "draft":
+            if spec["action"]["kind"] == "check":
+                spec = self.act({"verdict": "PASS", "reason": "Synthetic fixture"})
+            else:
+                spec = self.act(self.result(spec))
         self.assertIsNone(spec["node"]["inputs"]["previous"])
         first = self.result(spec)
         self.act(first)
@@ -163,24 +182,39 @@ class SkillExamplesTest(unittest.TestCase):
         self.assertEqual(spec["node"]["inputs"]["chapter"]["number"], 2)
         self.finish(spec)
 
-    def test_dynamic_wait_append_and_close(self):
-        queue = self.base / "queue.json"
-        data = json.loads((EXAMPLES / "dynamic-queue.json").read_text())
-        queue.write_text(json.dumps(data))
-        spec = self.start("dynamic-items", {"queue": {"$file": str(queue)}})
-        spec = self.act(self.result(spec))
+    def test_queue_wait_append_and_seal(self):
+        """The queue lives in the run record: `aiwf items` (the engine API) is
+        the only writer, and `seal` is what ends the wait."""
+        spec = self.start("queue-items", {})
+        # the plan node is what feeds the queue; walk it, then the run lands
+        # on the wait instead of starting instances
+        while spec["phase"] != "awaiting_items":
+            if spec["action"]["kind"] == "check":
+                spec = self.act({"verdict": "PASS", "reason": "Synthetic fixture"})
+            else:
+                spec = self.act(self.result(spec))
         self.assertEqual(spec["phase"], "awaiting_items")
-        data["items"].append({"number": 2, "title": "second"})
-        queue.write_text(json.dumps(data))
-        self.engine.resume(self.workflow, self.rid)
+        self.engine.queue_add(self.rid, "chapters", [
+            {"id": "1", "name": "first", "title": "第一章"},
+        ])
         self.engine.settle(self.rid)
         spec = self.engine.action_spec(self.rid)
-        self.assertEqual(spec["node"]["inputs"]["chapter"]["number"], 2)
+        self.assertEqual(spec["node"]["inputs"]["chapter"]["title"], "第一章")
         spec = self.act(self.result(spec))
+        self.assertEqual(spec["action"]["kind"], "check")
+        spec = self.act({"verdict": "PASS", "reason": "Synthetic fixture"})
         self.assertEqual(spec["phase"], "awaiting_items")
-        data["done"] = True
-        queue.write_text(json.dumps(data))
-        self.engine.resume(self.workflow, self.rid)
+        self.engine.queue_add(self.rid, "chapters", [
+            {"id": "2", "name": "second", "title": "第二章"},
+        ])
+        self.engine.settle(self.rid)
+        spec = self.engine.action_spec(self.rid)
+        self.assertEqual(spec["node"]["inputs"]["chapter"]["title"], "第二章")
+        spec = self.act(self.result(spec))
+        self.assertEqual(spec["action"]["kind"], "check")
+        spec = self.act({"verdict": "PASS", "reason": "Synthetic fixture"})
+        self.assertEqual(spec["phase"], "awaiting_items")
+        self.engine.queue_seal(self.rid, "chapters")
         self.engine.settle(self.rid)
         spec = self.engine.action_spec(self.rid)
         self.assertEqual(spec["node"]["id"], "assemble")

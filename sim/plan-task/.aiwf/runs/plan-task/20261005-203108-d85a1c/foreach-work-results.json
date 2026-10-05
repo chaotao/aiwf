@@ -1,0 +1,24 @@
+{
+  "items": [
+    {
+      "key": "TASK-001",
+      "status": "success",
+      "exports": {
+        "execute": {
+          "$file": "plan/wu-gang-ch1/tasks/TASK-001.md",
+          "summary": "核心循环 spec 完成并自检达标"
+        }
+      }
+    },
+    {
+      "key": "TASK-002",
+      "status": "success",
+      "exports": {
+        "execute": {
+          "$file": "plan/wu-gang-ch1/tasks/TASK-002.md",
+          "summary": "潮汐谜题与关卡原型 完成并自检达标"
+        }
+      }
+    }
+  ]
+}

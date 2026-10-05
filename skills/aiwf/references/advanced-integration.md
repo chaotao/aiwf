@@ -35,7 +35,8 @@ branch / 独立 review 使用 routes，不再写出边。显式 start 最多一�
 无 start 则从第一个节点开始。顶层可写 end 表示多个路径的共同出口。
 foreach 内联体自动生成 start/end，不手写它们。
 
-循环和人工拒绝会消耗推进预算 max_steps，默认 50。
+循环和人工拒绝会消耗推进预算 max_steps，默认 200。
+它按 node_runs 记录条数计（start/end、failed、rejected 与修订复用的 skipped 都算一条）。
 它是最后的终止保护，不应代替具体业务的结束条件。
 嵌套深度上限为八层，不支持递归工作流调用；用项目校验检查调用环。
 

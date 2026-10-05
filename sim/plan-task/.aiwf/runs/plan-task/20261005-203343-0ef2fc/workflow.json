@@ -1,0 +1,308 @@
+{
+  "schema_version": "1.1",
+  "id": "plan-task",
+  "name": "计划：诉求驱动 → 制定与执行",
+  "description": "工作流基于用户诉求自行产出计划（任务清单），再逐条执行（执行+自检 → 人工验收），整体验收后交付完成态计划。plan 不是人的输入，而是工作流的第一个产出。任务清单是**引擎维护的队列**（items: {\"queue\": true}），由 plan 节点逐条 `aiwf items add` 投喂、`aiwf items seal` 封口，没有任何人写队列文件。产物分家：给人看的 md 落在项目目录 plan/<plan_name>/，.aiwf 只留引擎运转所需的记录。",
+  "max_steps": 200,
+  "input_schema": {
+    "type": "object",
+    "required": [
+      "requirement"
+    ],
+    "properties": {
+      "requirement": {
+        "type": "string",
+        "description": "用户诉求（自然语言：想要什么 / 约束 / 成功的标准）"
+      }
+    }
+  },
+  "nodes": [
+    {
+      "id": "intake",
+      "type": "task",
+      "name": "立项",
+      "inputs": {
+        "requirement": {
+          "ref": "requirement"
+        }
+      },
+      "prompt": "阅读用户诉求（requirement），提炼成可执行的目标：goal（一句话目标）、scope（范围）、constraints（约束，可空）、acceptance（成功标准，须可验收）、plan_name（本计划的短名 slug，只用小写字母/数字/连字符，用作产物目录名）。立项是小对象，直接上报，不要写文件。输出 {goal, scope, constraints, acceptance, plan_name}。",
+      "output_schema": {
+        "type": "object",
+        "required": [
+          "goal",
+          "scope",
+          "acceptance",
+          "plan_name"
+        ],
+        "properties": {
+          "goal": {
+            "type": "string"
+          },
+          "scope": {
+            "type": "string"
+          },
+          "constraints": {
+            "type": "string"
+          },
+          "acceptance": {
+            "type": "string"
+          },
+          "plan_name": {
+            "type": "string",
+            "pattern": "^[a-z0-9][a-z0-9-]*$"
+          }
+        }
+      },
+      "check": {
+        "criteria": [
+          "目标可执行，且忠于用户诉求",
+          "成功标准可验收，非空泛表述"
+        ],
+        "max_attempts": 3
+      }
+    },
+    {
+      "id": "plan",
+      "type": "task",
+      "name": "制定计划",
+      "inputs": {
+        "brief": {
+          "ref": "intake"
+        }
+      },
+      "prompt": "基于 brief 的目标与成功标准，把工作拆解为有序的任务清单。每项给出 {id: TASK-NNN, name, goal, deps（前置任务 id，用「、」相接，无则「无」）, acceptance（可验收的判定）}，顺序即执行顺序。清单**不写文件**，逐条投给引擎维护的队列：`aiwf items add <run_id> --node work --item '<该任务的 JSON>'`（可重复或一次多条），全部投完后 `aiwf items seal <run_id> --node work` 封口。条目只有 id 与 name 是引擎认定的固定字段，其余键（goal/deps/acceptance）由你拓展、原样透传给执行节点。最后把同一份清单写成给人看的计划书，输出 {$file, summary, task_count}。",
+      "output": {
+        "file": "plan/${intake.plan_name}/plan.md"
+      },
+      "output_schema": {
+        "type": "object",
+        "required": [
+          "$file",
+          "summary",
+          "task_count"
+        ],
+        "properties": {
+          "$file": {
+            "type": "string"
+          },
+          "summary": {
+            "type": "string"
+          },
+          "task_count": {
+            "type": "integer",
+            "minimum": 1
+          }
+        }
+      },
+      "check": {
+        "criteria": [
+          "任务清单能覆盖 brief.acceptance 的全部验收点",
+          "每项任务可独立执行、可验收，依赖关系成链不成环",
+          "队列条目与 plan.md 逐项一致、无凭空增删，且队列已 seal"
+        ],
+        "max_attempts": 3
+      }
+    },
+    {
+      "id": "work",
+      "type": "foreach",
+      "name": "逐条执行",
+      "items": {
+        "queue": true
+      },
+      "max_instances": 12,
+      "inputs": {
+        "plan": {
+          "ref": "plan"
+        },
+        "intake": {
+          "ref": "intake"
+        },
+        "previous": {
+          "ref": "previous"
+        }
+      },
+      "nodes": [
+        {
+          "id": "execute",
+          "type": "task",
+          "name": "执行与自检",
+          "inputs": {
+            "task": {
+              "ref": "item"
+            },
+            "plan": {
+              "ref": "plan"
+            },
+            "intake": {
+              "ref": "intake"
+            },
+            "previous": {
+              "ref": "previous"
+            }
+          },
+          "prompt": "按 task.goal 实施本任务改动；previous 非空时先读上一任务的交接文件，保持衔接。改动完成后自查 task.acceptance 的每条验收点。把「改动说明（做了什么 / 关键决定 / 遗留风险）+ 自检结论」写成一份文件，输出 {$file, summary}。",
+          "output": {
+            "file": "plan/${intake.plan_name}/tasks/${item.id}.md"
+          },
+          "output_schema": {
+            "type": "object",
+            "required": [
+              "$file",
+              "summary"
+            ],
+            "properties": {
+              "$file": {
+                "type": "string"
+              },
+              "summary": {
+                "type": "string"
+              }
+            }
+          },
+          "check": {
+            "criteria": [
+              "改动覆盖 task.acceptance 的验收点",
+              "自检结论逐条对应验收点，有据可查"
+            ],
+            "max_attempts": 3
+          },
+          "review": {
+            "requirements": [
+              "任务目标达成，产物可交付",
+              "与计划范围不冲突"
+            ]
+          }
+        }
+      ],
+      "exports": [
+        "execute"
+      ],
+      "outputs_key": "task_results"
+    },
+    {
+      "id": "accept",
+      "type": "task",
+      "name": "整体验收",
+      "inputs": {
+        "plan": {
+          "ref": "plan"
+        },
+        "intake": {
+          "ref": "intake"
+        },
+        "results": {
+          "ref": "task_results"
+        }
+      },
+      "prompt": "读取各任务结果清单与计划目标，做整体回归：核对每个任务 success、目标是否达成、跨任务有无冲突。写验收报告到输出文件，输出 {$file, summary}。",
+      "output": {
+        "file": "plan/${intake.plan_name}/acceptance.md"
+      },
+      "output_schema": {
+        "type": "object",
+        "required": [
+          "$file",
+          "summary"
+        ],
+        "properties": {
+          "$file": {
+            "type": "string"
+          },
+          "summary": {
+            "type": "string"
+          }
+        }
+      },
+      "review": {
+        "requirements": [
+          "各任务均已达成目标",
+          "整体回归通过，可交付"
+        ]
+      }
+    },
+    {
+      "id": "finalize",
+      "type": "task",
+      "name": "交付完成",
+      "inputs": {
+        "plan": {
+          "ref": "plan"
+        },
+        "brief": {
+          "ref": "intake"
+        },
+        "results": {
+          "ref": "task_results"
+        }
+      },
+      "prompt": "汇总执行结果，产出计划完成报告：目标、逐条任务的达成情况（已完成）、遗留风险、后续建议。把完成态计划写入输出文件，输出 {$file, summary}。",
+      "output": {
+        "file": "plan/${intake.plan_name}/plan-final.md"
+      },
+      "output_schema": {
+        "type": "object",
+        "required": [
+          "$file",
+          "summary"
+        ],
+        "properties": {
+          "$file": {
+            "type": "string"
+          },
+          "summary": {
+            "type": "string"
+          }
+        }
+      },
+      "check": {
+        "criteria": [
+          "任务达成情况与 task_results 一致，无凭空新增行",
+          "遗留风险有出处"
+        ],
+        "max_attempts": 3
+      }
+    }
+  ],
+  "view": {
+    "stages": [
+      {
+        "name": "立项",
+        "nodes": [
+          "intake"
+        ],
+        "detail": "目标：${node.intake.goal}"
+      },
+      {
+        "name": "制定计划",
+        "nodes": [
+          "plan"
+        ],
+        "detail": "拆解为 ${node.plan.task_count} 个任务"
+      },
+      {
+        "name": "逐条执行",
+        "nodes": [
+          "work"
+        ]
+      },
+      {
+        "name": "整体验收",
+        "nodes": [
+          "accept"
+        ],
+        "gate": true
+      },
+      {
+        "name": "交付完成",
+        "nodes": [
+          "finalize"
+        ]
+      }
+    ],
+    "items": {
+      "label": "${item.name}｜依赖：${item.deps}"
+    }
+  }
+}

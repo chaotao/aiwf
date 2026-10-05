@@ -41,6 +41,88 @@ def node_user_input_schema(node: Dict[str, Any]) -> Dict[str, Any]:
     return node.get("user_input_schema", node.get("input_schema")) or {}
 
 
+def _check_view_template(
+    template: Any, known_nodes: set, view_mod, where: str, allow_item: bool
+) -> None:
+    """A ``detail`` typo must fail at validation, not render as a dash later."""
+    if not template:
+        return
+    for key in view_mod.placeholders(template):
+        parts = key.split(".")
+        root = parts[0]
+        if root not in view_mod.NOTE_ROOTS:
+            raise ValueError(
+                f"{where}: unknown placeholder ${{{key}}}; "
+                f"available roots: {list(view_mod.NOTE_ROOTS)}"
+            )
+        if root == "item" and not allow_item:
+            raise ValueError(
+                f"{where}: ${{{key}}} is only valid inside view.items.label"
+            )
+        if root == "node":
+            if len(parts) < 2:
+                raise ValueError(f"{where}: ${{{key}}} needs a node id")
+            if parts[1] not in known_nodes:
+                raise ValueError(
+                    f"{where}: ${{{key}}} references unknown node {parts[1]!r}"
+                )
+        if root == "loop" and (
+            len(parts) < 2 or parts[1] not in view_mod.LOOP_FIELDS
+        ):
+            raise ValueError(
+                f"{where}: ${{{key}}} must be one of "
+                + ", ".join(f"${{loop.{f}}}" for f in view_mod.LOOP_FIELDS)
+            )
+        if root == "run" and len(parts) > 1 and parts[1] not in view_mod.RUN_FIELDS:
+            raise ValueError(
+                f"{where}: ${{{key}}} must be one of "
+                + ", ".join(f"${{run.{f}}}" for f in view_mod.RUN_FIELDS)
+            )
+        if root in ("phase", "status") and len(parts) > 1:
+            raise ValueError(f"{where}: ${{{key}}} takes no field")
+
+
+def _validate_view(workflow: Dict[str, Any], spec: Dict[str, Any]) -> None:
+    """Semantic checks the JSON Schema cannot express.
+
+    Two invariants: every stage points at real nodes, and every node that does
+    work is covered by some stage. An uncovered node would make the view lie by
+    omission, which is worse than having no view at all.
+    """
+    from . import view as view_mod
+
+    known = {n["id"] for n in workflow["nodes"]}
+    covered: set = set()
+    for stage in spec.get("stages", []):
+        unknown = [n for n in stage.get("nodes", []) if n not in known]
+        if unknown:
+            raise ValueError(
+                f"view stage {stage.get('name')!r} references unknown node(s): "
+                f"{unknown}"
+            )
+        covered.update(stage["nodes"])
+
+    required = {
+        n["id"] for n in workflow["nodes"]
+        if n["type"] in ("task", "review", "subflow", "foreach")
+    }
+    missing = sorted(required - covered)
+    if missing:
+        raise ValueError(
+            f"view must cover every task/review/subflow node; missing: {missing}"
+        )
+
+    for stage in spec.get("stages", []):
+        _check_view_template(
+            stage.get("detail"), known, view_mod,
+            where=f"view stage {stage.get('name')!r} detail", allow_item=False,
+        )
+    _check_view_template(
+        (spec.get("items") or {}).get("label"), known, view_mod,
+        where="view.items.label", allow_item=True,
+    )
+
+
 def validate_workflow(workflow: Dict[str, Any]) -> None:
     """Structural validation against workflow.schema.json + semantic checks."""
     _jsonschema_validate(workflow, load_schema("workflow"))
@@ -190,6 +272,10 @@ def validate_workflow(workflow: Dict[str, Any]) -> None:
             if "edges" in node:
                 body_workflow["edges"] = node["edges"]
             validate_workflow(body_workflow)
+
+    view_spec = workflow.get("view")
+    if view_spec is not None:
+        _validate_view(workflow, view_spec)
 
     # top-level exports: key -> JSON Schema fragment
     exports = workflow.get("exports")

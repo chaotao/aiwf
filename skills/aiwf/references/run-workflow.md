@@ -37,7 +37,8 @@ aiwf current <root_run_id> --json
 
 无需查子 run 或维护调用栈；子 run_id 供审计定位。`workflow_id` 对应叶子定义，
 `root_workflow_id` 用于根运行 resume。`current` 只读；若 action.kind 为 resume，
-执行明确的 resume 命令以恢复调度。所有状态变更命令返回下一任务包。
+先分辨是不是队列在等投喂（`awaiting_items`）——是则用 `aiwf items add`，它会自动推进；
+否则执行明确的 resume 命令以恢复调度。所有状态变更命令返回下一任务包。
 
 ## 按 action.kind 行动
 
@@ -47,7 +48,7 @@ aiwf current <root_run_id> --json
 | check | 按 check_request.criteria 审查 check_request.output，返回 verdict 与 reason |
 | provide | 根据 input_request 向用户收集答案 |
 | review | 展示 review_request 的要求与产物，等待用户真实结论 |
-| resume | 动态清单等待或调度恢复；更新清单后执行 resume |
+| resume | 队列在等投喂 / 调度恢复；队列场景改用 `aiwf items add`（停在 awaiting_items 时它会自动推进） |
 
 执行 task 时，先读取材料中 `$file` 指向的文件。`previous_output` 非空表示该任务
 已有版本，可结合 `feedback` 修订。文件按 `node.output.file` 写入，完成后上报
@@ -94,8 +95,9 @@ aiwf resume <root_workflow_id> <root_run_id> --json
 清零或直接补报 PASS；需要明确修订时加载主入口“修订与重做”。
 定义错误不能靠反复 resume 修好：1.1 运行使用定义快照，修正源定义后新建运行。
 
-awaiting_items 表示动态清单等待追加或封口，不能忙循环 resume；
-先按业务更新队列再恢复。实际处理时加载主入口“动态清单”。
+awaiting_items 表示引擎队列在等投喂或封口，不能忙循环 resume；
+正等投喂时优先 `aiwf items add`——run 停在 awaiting_items 时 add 会自动推进；
+业务结束时 `aiwf items seal`。实际处理时加载主入口“运行时队列”。
 汇总 foreach 时读取结果清单并检查失败项，不数目录。
 
 ## 交接与交付

@@ -1,0 +1,16 @@
+{
+  "id": "std.review-loop",
+  "summary": "改代码 → Agent 自检 → 人工验收 → 独立复检 的开发类返工闭环",
+  "maturity": "experimental",
+  "scenarios": [
+    "开发类任务，改动质量需要多重把关",
+    "需要人工验收之后再补一道机器复检"
+  ],
+  "not_for": [
+    "非代码类改动（写作、素材生产等）",
+    "只需要一次生成、不需要验收的场景"
+  ],
+  "deps": [
+    "std.review-check"
+  ]
+}

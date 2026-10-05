@@ -20,8 +20,8 @@
       "description": "Hint for the executing agent about which model to use. The engine itself never calls a model."
     },
     "max_steps": {
-      "type": "integer", "minimum": 1, "default": 50,
-      "description": "Hard guard against infinite branch loops."
+      "type": "integer", "minimum": 1, "default": 200,
+      "description": "Hard guard against infinite loops, counted in node_runs entries (start/end, failed, rejected and revision-reused skipped rows all count). Absent = 200."
     },
     "input_schema": {
       "type": "object",
@@ -48,9 +48,60 @@
           "to": { "type": "string" }
         }
       }
+    },
+    "view": {
+      "$ref": "#/$defs/view",
+      "description": "Optional business-stage view. Purely presentational: it is derived from the run record on every read and never changes execution."
     }
   },
   "$defs": {
+    "view": {
+      "type": "object",
+      "description": "How this workflow's nodes map onto the stages a human cares about. Without it, `aiwf runs show` prints the raw node stream only.",
+      "additionalProperties": false,
+      "required": ["stages"],
+      "properties": {
+        "stages": {
+          "type": "array",
+          "minItems": 1,
+          "description": "Ordered business stages. Every stage is listed even before it runs, which is what answers 'what is still ahead'.",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["name", "nodes"],
+            "properties": {
+              "name": { "type": "string", "minLength": 1 },
+              "nodes": {
+                "type": "array",
+                "minItems": 1,
+                "items": { "type": "string" },
+                "description": "Top-level node ids this stage covers. Several stages may share a node: that is how one node carries both 'implement' and 'human acceptance'."
+              },
+              "detail": {
+                "type": "string",
+                "description": "Conclusion template. Closed placeholder set: ${node.<id>.<path>}, ${loop.<field>}, ${phase}, ${status}, ${run.<field>}. Absent = engine default (node summary, or the queue sentence for a foreach stage)."
+              },
+              "gate": {
+                "type": "boolean",
+                "default": false,
+                "description": "Marks a human decision point: the view offers the command that decides it."
+              }
+            }
+          }
+        },
+        "items": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "Labelling of foreach queue items, so a view shows task names instead of bare ids.",
+          "properties": {
+            "label": {
+              "type": "string",
+              "description": "Label template for one queue item, e.g. \"${item.name}\"."
+            }
+          }
+        }
+      }
+    },
     "data_ref": {
       "type": "object",
       "required": ["ref"],
@@ -132,7 +183,7 @@
       "additionalProperties": true
     },
     "items_source": {
-      "description": "foreach items: a literal array, {var} from parent context, or {$file}. An array means static mode; an object {\"done\":bool,\"items\":[...]} means dynamic mode.",
+      "description": "foreach items. A literal array, {ref}/{var} from parent context, or {$file} pointing at a JSON array -- the whole list is known up front (static mode). {\"queue\": true} instead makes the list engine-owned run state: items are validated against the fixed item schema {id, name, ...extensions} and amended only through `aiwf items add|update|remove|seal`, so no queue file is ever written.",
       "oneOf": [
         { "type": "array" },
         { "$ref": "#/$defs/data_ref" },
@@ -147,6 +198,12 @@
           "required": ["$file"],
           "additionalProperties": false,
           "properties": { "$file": { "type": "string", "minLength": 1 } }
+        },
+        {
+          "type": "object",
+          "required": ["queue"],
+          "additionalProperties": false,
+          "properties": { "queue": { "const": true } }
         }
       ]
     },

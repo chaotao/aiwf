@@ -686,6 +686,50 @@ class EngineTest(unittest.TestCase):
         self.assertIn("novel/chapter-1.md", md)
         self.assertIn("draft", md)
 
+    def test_artifact_index_renders_templated_items_source(self):
+        """A foreach items source declared as {"$file": "<template>"} is
+        rendered when the queue is resolved; the artifact index must render it
+        the same way. Otherwise the index shows a raw ${...} and the entry
+        misses dedup against the very same path reported by a node."""
+        import json as _json
+        wf = {
+            "schema_version": "1.1", "id": "itemsrc-wf", "name": "队列源模板",
+            "input_schema": {"type": "object", "properties": {"topic": {}}},
+            "nodes": [
+                {"id": "start", "type": "start"},
+                {"id": "batch", "type": "foreach",
+                 "items": {"$file": "${run.dir}/items.json"},
+                 "inputs": {"topic": "${item.outline}"},
+                 "nodes": [
+                     {"id": "write", "type": "task", "output_key": "summary",
+                      "prompt": "写：${topic}"}
+                 ],
+                 "exports": ["summary"],
+                 "outputs_key": "results"},
+                {"id": "end", "type": "end"},
+            ],
+            "edges": [
+                {"from": "start", "to": "batch"},
+                {"from": "batch", "to": "end"},
+            ],
+        }
+        record = self.engine.start(wf, {"topic": "T"})
+        source = os.path.join(
+            self.storage.run_dir_for_record(record), "items.json"
+        )
+        with open(source, "w", encoding="utf-8") as f:
+            _json.dump([{"outline": "甲"}, {"outline": "乙"}], f)
+        record = self.engine.complete(wf, record["run_id"])  # start -> batch
+
+        md_path = os.path.join(
+            self.storage.run_dir_for_record(record), "context.md"
+        )
+        with open(md_path, "r", encoding="utf-8") as f:
+            index = f.read().split("## 产物索引", 1)[1]
+        self.assertIn("items.json", index)
+        self.assertIn(source.replace(os.sep, "/"), index.replace(os.sep, "/"))
+        self.assertNotIn("${run.dir}", index)
+
     # ---- consumes explicit dependencies ------------------------------
     def test_consumes_string_adds_dependency_beyond_prompt(self):
         wf = {
@@ -938,46 +982,51 @@ class EngineTest(unittest.TestCase):
             [{"summary": "A"}, {"summary": "B"}],
         )
 
-    def test_foreach_dynamic_items_waits_appends_and_done(self):
-        import json as _json
+    def test_foreach_queue_is_engine_owned_and_sealed_explicitly(self):
+        """A queue node has no items file at all: `queue_add` seeds it (even
+        before the run reaches the node), `queue_seal` is what ends the wait,
+        and `id` -- not `id_field` -- keys the instances."""
         self._save_child()
-        source = os.path.join(self.tmp, "items.json")
-        with open(source, "w", encoding="utf-8") as f:
-            _json.dump({"done": False, "items": []}, f)
         parent = foreach_parent_workflow()
-        parent["nodes"][1]["items"] = {"$file": source}
+        parent["nodes"][1]["items"] = {"queue": True}
         e = self.engine
         self.storage.save_workflow(parent)
         record = e.start(parent)
+
+        # seeding a queue for a node the run has not reached yet
+        table = e.queue_add(
+            record["run_id"], "chapters",
+            [{"id": "A", "name": "第一章", "outline": "第一章"}],
+        )
+        self.assertEqual([row["id"] for row in table["items"]], ["A"])
+        self.assertFalse(table["done"])
+
         record = e.complete(parent, record["run_id"])
+        self.assertEqual(record["phase"], "executing")
+        self.assertEqual(record["subflow_state"]["items_mode"], "queue")
+        inst = record["subflow_state"]["instances"][0]
+        self.assertEqual(inst["key"], "A")
+        record = _run_child_success(
+            e, self.storage.find_run(inst["run_id"]), "D1"
+        )
+        # nothing pending and the queue is not sealed: a wait, not an end
         self.assertEqual(record["phase"], "awaiting_items")
 
-        with open(source, "w", encoding="utf-8") as f:
-            _json.dump({"done": False, "items": [{"outline": "一"}]}, f)
-        record = e.resume(parent, record["run_id"])
-        self.assertEqual(record["subflow_state"]["total_seen"], 1)
+        # appending is what moves it on again
+        e.queue_add(
+            record["run_id"], "chapters",
+            [{"id": "B", "name": "第二章", "outline": "第二章"}],
+        )
+        record = self.storage.find_run(record["run_id"])
+        inst = record["subflow_state"]["instances"][1]
+        self.assertEqual(inst["key"], "B")
         record = _run_child_success(
-            e, self.storage.find_run(
-                record["subflow_state"]["instances"][0]["run_id"]
-            ),
-            "D1",
+            e, self.storage.find_run(inst["run_id"]), "D2"
         )
         self.assertEqual(record["phase"], "awaiting_items")
 
-        with open(source, "w", encoding="utf-8") as f:
-            _json.dump(
-                {"done": True,
-                 "items": [{"outline": "一"}, {"outline": "二"}]},
-                f,
-            )
-        record = e.resume(parent, record["run_id"])
-        inst2 = next(
-            i for i in record["subflow_state"]["instances"]
-            if i["key"] == "1"
-        )
-        record = _run_child_success(
-            e, self.storage.find_run(inst2["run_id"]), "D2"
-        )
+        e.queue_seal(record["run_id"], "chapters")
+        record = self.storage.find_run(record["run_id"])
         manifest = self.storage.read_json_file(
             record["context"]["results"]["$file"]
         )
@@ -985,6 +1034,112 @@ class EngineTest(unittest.TestCase):
             [i["status"] for i in manifest["items"]],
             ["success", "success"],
         )
+        # sealed and drained: the node is done and the run has moved past it
+        self.assertEqual(record["subflow_state"]["status"], "completed")
+        self.assertEqual(record["next_node"], "end")
+
+    def test_queue_items_are_validated_and_mutable_only_before_they_start(self):
+        self._save_child()
+        parent = foreach_parent_workflow()
+        parent["nodes"][1]["items"] = {"queue": True}
+        e = self.engine
+        self.storage.save_workflow(parent)
+        record = e.start(parent)
+        rid = record["run_id"]
+
+        with self.assertRaisesRegex(ValueError, "needs non-empty string"):
+            e.queue_add(rid, "chapters", [{"name": "no id"}])
+        with self.assertRaisesRegex(ValueError, "must match"):
+            e.queue_add(rid, "chapters", [{"id": "a b", "name": "spaced"}])
+        e.queue_add(rid, "chapters", [
+            {"id": "A", "name": "一", "outline": "第一章"},
+            {"id": "B", "name": "二", "outline": "第二章"},
+        ])
+        with self.assertRaisesRegex(ValueError, "already in queue"):
+            e.queue_add(rid, "chapters", [{"id": "A", "name": "dup"}])
+
+        # a pending item is still editable, and its fields are extensible
+        e.queue_update(rid, "chapters", "B", {"name": "二改", "note": "extra"})
+        e.queue_remove(rid, "chapters", "B")
+        table = e.queue_table(rid, "chapters")
+        self.assertEqual([row["id"] for row in table["items"]], ["A"])
+
+        e.queue_remove(rid, "chapters", "A")
+        e.queue_seal(rid, "chapters")
+        record = e.complete(parent, rid)
+        # empty but sealed is an end, not a wait -- and the run moves on
+        self.assertEqual(record["next_node"], "end")
+        self.assertEqual(record["subflow_state"]["instances"], [])
+
+    def test_started_queue_items_are_immutable_and_a_seal_is_final(self):
+        self._save_child()
+        parent = foreach_parent_workflow()
+        parent["nodes"][1]["items"] = {"queue": True}
+        e = self.engine
+        self.storage.save_workflow(parent)
+        record = e.start(parent)
+        rid = record["run_id"]
+        e.queue_add(rid, "chapters", [{"id": "A", "name": "一", "outline": "第一章"}])
+        record = e.complete(parent, rid)
+        inst = record["subflow_state"]["instances"][0]
+        record = _run_child_success(
+            e, self.storage.find_run(inst["run_id"]), "D1"
+        )
+        rid = record["run_id"]
+
+        with self.assertRaisesRegex(RuntimeError, "already started"):
+            e.queue_update(rid, "chapters", "A", {"name": "改不动"})
+        with self.assertRaisesRegex(RuntimeError, "already started"):
+            e.queue_remove(rid, "chapters", "A")
+        with self.assertRaisesRegex(ValueError, "keys the instance"):
+            e.queue_update(rid, "chapters", "A", {"id": "Z"})
+
+        e.queue_seal(rid, "chapters")
+        with self.assertRaisesRegex(RuntimeError, "is sealed"):
+            e.queue_add(rid, "chapters", [{"id": "B", "name": "二"}])
+
+    def test_pending_queue_items_can_be_reordered_but_never_ahead_of_ran_ones(self):
+        """Reordering is the fourth mutation and stops exactly where the others
+        do: a pending item may move anywhere in the pending suffix -- including
+        into the next-to-run slot -- but never ahead of a started item, whose
+        audit identity is already lived."""
+        self._save_child()
+        parent = foreach_parent_workflow()
+        parent["nodes"][1]["items"] = {"queue": True}
+        e = self.engine
+        self.storage.save_workflow(parent)
+        record = e.start(parent)
+        rid = record["run_id"]
+
+        e.queue_add(rid, "chapters", [
+            {"id": "A", "name": "一", "outline": "第一章"},
+            {"id": "B", "name": "二", "outline": "第二章"},
+            {"id": "C", "name": "三", "outline": "第三章"},
+        ])
+        with self.assertRaisesRegex(ValueError, "no item"):
+            e.queue_move(rid, "chapters", "Z", 0)
+        # C to the head of the pending run: it becomes the next to start
+        table = e.queue_move(rid, "chapters", "C", 0)
+        self.assertEqual([r["id"] for r in table["items"]], ["C", "A", "B"])
+
+        record = e.complete(parent, rid)
+        inst = record["subflow_state"]["instances"][0]
+        self.assertEqual(inst["key"], "C")   # the move decided who runs first
+
+        # A and B are still pending while C runs, so they may still be reordered
+        table = e.queue_move(rid, "chapters", "A", 2)
+        self.assertEqual([r["id"] for r in table["items"]], ["C", "B", "A"])
+        # ... but nothing may jump ahead of the started C
+        with self.assertRaisesRegex(ValueError, "pending items live in"):
+            e.queue_move(rid, "chapters", "A", 0)
+        with self.assertRaisesRegex(RuntimeError, "already started"):
+            e.queue_move(rid, "chapters", "C", 0)
+
+        # the new order is what actually runs: B is next, not A
+        record = _run_child_success(
+            e, self.storage.find_run(inst["run_id"]), "D-C"
+        )
+        self.assertEqual(record["subflow_state"]["instances"][1]["key"], "B")
 
     def test_subflow_abort_fails_parent_and_resume_retries(self):
         self._save_child()
@@ -1185,6 +1340,57 @@ class EngineTest(unittest.TestCase):
             state["instances"][0]["run_id"], first_id
         )
 
+    # ---- record layout at rest ----------------------------------------
+    def test_journal_is_removed_not_truncated_once_subsumed(self):
+        """A resting run keeps only `record.json`: the snapshot deletes the
+        delta log it subsumes instead of truncating it to a zero-byte file.
+        Readers already treat a missing log as empty (`_iter_journal`)."""
+        wf = linear_workflow()
+        record = self.engine.start(wf, {"topic": "T"})
+        record = drive_to_completion(self.engine, wf, record)
+        self.assertEqual(record["status"], "completed")
+        run_dir = self.storage.run_dir_for_record(record)
+        self.assertTrue(os.path.isfile(os.path.join(run_dir, "record.json")))
+        self.assertFalse(
+            os.path.exists(os.path.join(run_dir, "record.log.jsonl"))
+        )
+
+    def test_inline_subflow_instance_has_no_duplicate_snapshot(self):
+        """An inline subflow's definition is the parent's
+        children/<node>/subflow.json -- itself synthesized from the parent's
+        snapshot. Instances must not each copy it; the resolver falls back to
+        that file through the parent link. Uses a 1.1 parent: only 1.1 runs
+        snapshot their definition at all."""
+        parent = batch_11_parent_workflow(inline=True)
+        self.storage.save_workflow(parent)
+        record = self.engine.start(parent)
+        record = self.engine.complete(parent, record["run_id"])
+        state = record["subflow_state"]
+        self.assertTrue(state["inline"])
+        child = self.storage.find_run(state["instances"][0]["run_id"])
+        child_dir = self.storage.run_dir_for_record(child)
+        self.assertFalse(
+            os.path.isfile(os.path.join(child_dir, "workflow.json"))
+        )
+        resolved = self.storage.load_workflow_for_record(child)
+        self.assertEqual(resolved["id"], "batch-11-wf.batch")
+
+    def test_external_subflow_instance_keeps_its_snapshot(self):
+        """An external subflow definition lives outside the run and may
+        change, so its instances still carry their own snapshot."""
+        self.storage.save_workflow(entry_11_child_workflow())
+        parent = batch_11_parent_workflow(inline=False)
+        self.storage.save_workflow(parent)
+        record = self.engine.start(parent)
+        record = self.engine.complete(parent, record["run_id"])
+        child = self.storage.find_run(
+            record["subflow_state"]["instances"][0]["run_id"]
+        )
+        child_dir = self.storage.run_dir_for_record(child)
+        self.assertTrue(
+            os.path.isfile(os.path.join(child_dir, "workflow.json"))
+        )
+
 
 # ---- subflow / foreach module-level fixtures ------------------------------
 def chapter_child_workflow():
@@ -1259,6 +1465,58 @@ def foreach_inline_parent_workflow():
              ],
              "exports": ["summary"],
              "outputs_key": "results"},
+            {"id": "end", "type": "end"},
+        ],
+        "edges": [
+            {"from": "start", "to": "batch"},
+            {"from": "batch", "to": "end"},
+        ],
+    }
+
+
+def entry_11_child_workflow():
+    """A 1.1 external subflow target. 1.1 is what makes a run snapshot its
+    definition at all, so this is the fixture that exercises the snapshot
+    rules."""
+    return {
+        "schema_version": "1.1",
+        "id": "entry-11",
+        "name": "1.1 子流程",
+        "input_schema": {"type": "object", "properties": {"topic": {}}},
+        "nodes": [
+            {"id": "start", "type": "start"},
+            {"id": "write", "type": "task", "output_key": "summary",
+             "prompt": "写：${topic}"},
+            {"id": "end", "type": "end"},
+        ],
+    }
+
+
+def batch_11_parent_workflow(inline: bool):
+    """A 1.1 foreach parent. `inline=True` synthesizes the child body into
+    children/batch/subflow.json; `False` points at entry_11_child_workflow()."""
+    node = {
+        "id": "batch", "type": "foreach",
+        "items": [{"topic": "甲"}, {"topic": "乙"}],
+        "inputs": {"topic": "${item.topic}"},
+        "outputs_key": "results",
+    }
+    if inline:
+        node["nodes"] = [
+            {"id": "write", "type": "task", "output_key": "summary",
+             "prompt": "写：${topic}"}
+        ]
+        node["exports"] = ["summary"]
+    else:
+        node["workflow"] = "entry-11"
+    return {
+        "schema_version": "1.1",
+        "id": "batch-11-wf",
+        "name": "1.1 循环",
+        "input_schema": {"type": "object", "properties": {}},
+        "nodes": [
+            {"id": "start", "type": "start"},
+            node,
             {"id": "end", "type": "end"},
         ],
         "edges": [

@@ -1,0 +1,95 @@
+{
+  "schema_version": "1.1",
+  "max_steps": 200,
+  "id": "plan-task.work",
+  "name": "inline:work",
+  "input_schema": {
+    "type": "object",
+    "properties": {
+      "plan": {},
+      "intake": {},
+      "previous": {},
+      "item": {},
+      "index": {}
+    },
+    "required": [
+      "plan",
+      "intake",
+      "previous"
+    ]
+  },
+  "exports": {
+    "execute": {}
+  },
+  "nodes": [
+    {
+      "id": "start",
+      "type": "start"
+    },
+    {
+      "id": "execute",
+      "type": "task",
+      "name": "执行与自检",
+      "inputs": {
+        "task": {
+          "ref": "item"
+        },
+        "plan": {
+          "ref": "plan"
+        },
+        "intake": {
+          "ref": "intake"
+        },
+        "previous": {
+          "ref": "previous"
+        }
+      },
+      "prompt": "按 task.goal 实施本任务改动；previous 非空时先读上一任务的交接文件，保持衔接。改动完成后自查 task.acceptance 的每条验收点。把「改动说明（做了什么 / 关键决定 / 遗留风险）+ 自检结论」写成一份文件，输出 {$file, summary}。",
+      "output": {
+        "file": "plan/${intake.plan_name}/tasks/${item.id}.md"
+      },
+      "output_schema": {
+        "type": "object",
+        "required": [
+          "$file",
+          "summary"
+        ],
+        "properties": {
+          "$file": {
+            "type": "string"
+          },
+          "summary": {
+            "type": "string"
+          }
+        }
+      },
+      "check": {
+        "criteria": [
+          "改动覆盖 task.acceptance 的验收点",
+          "自检结论逐条对应验收点，有据可查"
+        ],
+        "max_attempts": 3
+      },
+      "review": {
+        "requirements": [
+          "任务目标达成，产物可交付",
+          "与计划范围不冲突"
+        ]
+      }
+    },
+    {
+      "id": "end",
+      "type": "end"
+    }
+  ],
+  "edges": [
+    {
+      "from": "start",
+      "to": "execute"
+    },
+    {
+      "from": "execute",
+      "to": "end"
+    }
+  ]
+}

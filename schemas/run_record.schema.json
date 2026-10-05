@@ -39,6 +39,11 @@
       "description": "State of the active/completed subflow or foreach node; null otherwise.",
       "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/subflow_state" }]
     },
+    "queues": {
+      "type": "object",
+      "description": "Engine-owned foreach queues (nodes declaring items: {\"queue\": true}), keyed by node id. Recorded before the node starts, because `aiwf items add` may seed a queue that feeds a node reached later.",
+      "additionalProperties": { "$ref": "#/$defs/queue" }
+    },
     "status": {
       "type": "string",
       "enum": ["running", "completed", "failed"]
@@ -46,7 +51,7 @@
     "phase": {
       "type": "string",
       "enum": ["executing", "awaiting_input", "awaiting_review", "awaiting_items", "awaiting_check"],
-      "description": "Sub-state within status=running: executing normally, waiting for user input, waiting for human review, or (dynamic foreach) waiting for more items."
+      "description": "Sub-state within status=running: executing normally, waiting for user input, waiting for human review, or (engine-owned queue) waiting for more items."
     },
     "started_at": { "type": "string" },
     "ended_at": { "type": ["string", "null"] },
@@ -91,6 +96,22 @@
     }
   },
   "$defs": {
+    "queue": {
+      "type": "object",
+      "description": "One engine-owned queue. `items` is the callers' data, `done` is the seal; the per-item execution status is NOT stored here -- it is read from subflow_state.instances, so the two cannot drift.",
+      "required": ["items", "done"],
+      "additionalProperties": false,
+      "properties": {
+        "items": {
+          "type": "array",
+          "description": "Each item is {id, name, ...caller extensions}; id is unique in the queue and keys the instance."
+        },
+        "done": {
+          "type": "boolean",
+          "description": "Sealed by `aiwf items seal`: no more additions, and an empty queue finishes the node instead of waiting."
+        }
+      }
+    },
     "parent_link": {
       "type": "object",
       "required": ["workflow_id", "run_id", "node_id", "instance"],
@@ -136,7 +157,7 @@
         "subflow_id": { "type": "string", "description": "Resolved workflow id; synthetic id for inline foreach." },
         "inline": { "type": "boolean" },
         "items_mode": {
-          "oneOf": [{ "type": "null" }, { "type": "string", "enum": ["static", "dynamic"] }]
+          "oneOf": [{ "type": "null" }, { "type": "string", "enum": ["static", "queue"] }]
         },
         "items_source": { "description": "Original items spec; null for single calls." },
         "items_snapshot": { "type": "string", "description": "1.1 immutable/append-only item snapshot file." },
@@ -223,6 +244,8 @@
             "check_requested", "check_decided",
             "subflow_started", "instance_completed", "instance_failed",
             "instance_redone",
+            "queue_items_added", "queue_item_updated", "queue_item_removed",
+            "queue_item_moved", "queue_sealed",
             "run_resumed", "run_failed"
           ]
         },
@@ -231,6 +254,19 @@
         "node_id": { "type": "string" },
         "values": { "type": "object" },
         "fields": { "type": "array", "items": { "type": "string" } },
+        "items": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Queue item ids touched by this event."
+        },
+        "item": {
+          "type": "string",
+          "description": "Queue item id touched by this event."
+        },
+        "to": {
+          "type": "integer",
+          "description": "Destination index of a queue_item_moved event."
+        },
         "verdict": { "type": "string" },
         "feedback": { "type": "string" },
         "requirements": {

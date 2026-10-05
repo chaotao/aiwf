@@ -1,10 +1,22 @@
 """JSON-file storage layer. Layout (per project):
 
     <root>/
+      config.json                                   # optional project settings
       workflows/<workflow_id>.json                  # workflow definitions
       runs/<workflow_id>/<run_id>/record.json       # top-level run record
       runs/<workflow_id>/<run_id>/context.md        # auto-generated sharing hub
-      runs/<workflow_id>/<run_id>/record.log.jsonl  # append-only delta journal
+      runs/<workflow_id>/<run_id>/record.log.jsonl  # delta journal (absent at rest)
+      inbox/inbox.md                                # parked items (open only)
+      inbox/history.md                              # parked items, archived
+      inbox/notes/INB-NNN.md                         # optional item detail
+      plans/<plan_id>/index.md                      # long-running task list
+      plans/<plan_id>/context.md                    # optional stable context
+      plans/<plan_id>/tasks/TASK-NNN.md             # optional task contract
+
+The inbox is not part of run state - it is written and read by
+``aiwf inbox`` (see inbox.py) and never touched by the engine. Plans are the
+same for ``aiwf plan`` (see plan.py): a plan spans many runs, so it cannot be
+derived from any one of them.
 
 Subflow / foreach children are nested inside their parent run folder:
 
@@ -17,7 +29,8 @@ No database. Everything is plain JSON (plus the Markdown context view).
 
 Run records use a snapshot + append-only journal scheme: `save_run` writes one
 small delta line per call and only rewrites the full `record.json` snapshot
-every SNAPSHOT_EVERY saves (or as soon as the run reaches a resting status).
+every SNAPSHOT_EVERY saves (or as soon as the run reaches a resting status);
+the delta log is deleted once a snapshot subsumes it, so it is absent at rest.
 `record.json` therefore stays the complete state at rest; while a run is in
 flight it may trail the journal by up to SNAPSHOT_EVERY saves. Always read
 records through `load_record`/`load_run`/`find_run`, which replay the journal.
@@ -29,6 +42,7 @@ from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 MAX_CHAIN_DEPTH = 8
 
+CONFIG_NAME = "config.json"
 JOURNAL_NAME = "record.log.jsonl"
 # A snapshot is the one remaining O(record) write, so it is amortised over many
 # saves: total snapshot cost drops from O(N^2) to O(N^2 / SNAPSHOT_EVERY) while
@@ -238,6 +252,13 @@ class Storage:
         self.root = root or os.getenv("AIWF_HOME", ".aiwf")
         self.workflows_dir = os.path.join(self.root, "workflows")
         self.runs_dir = os.path.join(self.root, "runs")
+        # Parked thoughts/problems. Project-level on purpose: most items are
+        # noted with no run in flight, so they outlive every run (see inbox.py).
+        self.inbox_dir = os.path.join(self.root, "inbox")
+        # Long-running task lists. Also project-level: a plan spans many runs
+        # (one task may take several), so it cannot live inside any one of them
+        # (see plan.py).
+        self.plans_dir = os.path.join(self.root, "plans")
         # run_dir -> {"prev": last persisted state, "since"/"bytes": journal size
         # since the last snapshot}. Rebuilt from disk on the next load, so a
         # miss only costs one extra full snapshot.
@@ -248,6 +269,34 @@ class Storage:
         os.makedirs(self.workflows_dir, exist_ok=True)
         os.makedirs(self.runs_dir, exist_ok=True)
         return self
+
+    # ---- project settings ------------------------------------------------
+    @property
+    def config_path(self) -> str:
+        return os.path.join(self.root, CONFIG_NAME)
+
+    def load_config(self) -> Dict[str, Any]:
+        """Project settings from ``<root>/config.json``; ``{}`` when absent."""
+        text = self._read_text(self.config_path)
+        if not text:
+            return {}
+        try:
+            config = json.loads(text)
+        except ValueError as exc:
+            raise ValueError(f"invalid {CONFIG_NAME}: {exc}") from exc
+        if not isinstance(config, dict):
+            raise ValueError(f"{CONFIG_NAME} must contain a JSON object")
+        return config
+
+    def run_defaults(self) -> Dict[str, Any]:
+        """``run_defaults`` from the project config: per-project values for
+        workflow inputs, so values a template requires (project dir, knowledge
+        base path, test command) live with the project instead of being
+        retyped on every ``aiwf run -p``."""
+        defaults = self.load_config().get("run_defaults") or {}
+        if not isinstance(defaults, dict):
+            raise ValueError(f"{CONFIG_NAME} run_defaults must be a JSON object")
+        return defaults
 
     @staticmethod
     def _atomic_write_text(path: str, content: str) -> None:
@@ -368,12 +417,23 @@ class Storage:
     def _snapshot_run(self, run_dir: str, record: Dict[str, Any]) -> str:
         """Write the full record, then drop the log it subsumes. Order matters:
         a crash in between leaves log entries that replay to the same state,
-        whereas truncating first would lose them."""
+        whereas truncating first would lose them. The log is *removed* rather
+        than emptied, so a resting run leaves no zero-byte file behind."""
         path = os.path.join(run_dir, "record.json")
         self._atomic_write_text(path, _dump_json(record))
-        self._atomic_write_text(self.journal_path(run_dir), "")
+        self._discard_journal(run_dir)
         self._remember(run_dir, record)
         return path
+
+    @staticmethod
+    def _discard_journal(run_dir: str) -> None:
+        """Delete the delta log a snapshot subsumes. A missing log is already
+        treated as empty by ``_iter_journal`` and ``_repair_journal_tail``, so
+        a run that resumes simply appends a fresh one."""
+        try:
+            os.remove(os.path.join(run_dir, JOURNAL_NAME))
+        except OSError:
+            pass
 
     def _remember(self, run_dir: str, record: Dict[str, Any]) -> None:
         self._journal.pop(run_dir, None)

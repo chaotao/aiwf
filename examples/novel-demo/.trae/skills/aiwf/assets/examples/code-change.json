@@ -2,7 +2,7 @@
   "schema_version": "1.1",
   "id": "code-change",
   "name": "软件开发：修复、验证与验收",
-  "max_steps": 50,
+  "max_steps": 200,
   "input_schema": {
     "type": "object",
     "required": ["project_dir", "request"],

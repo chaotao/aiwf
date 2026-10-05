@@ -64,7 +64,8 @@ values 仍按该 task 的 user_input_schema 校验，成功后开启修订。
 aiwf redo <parent_run_id> --node chapters --instance 1 --reason "第一章需要重写" --json
 ```
 
-instance 是 id_field 产生的稳定 key，没有 id_field 时通常是从零开始的索引键。
+instance 是稳定实例 key：静态清单取 `id_field` 字段，队列模式 (`{"queue": true}`)
+取 item 的 `id`；两者都没有时是从零开始的索引键。
 单实例 redo 不自动重做后面的兄弟实例，也不自动重写所有下游成品。
 章节依赖 previous 时，改第一章通常影响后续章节；应明确扩大修订范围，
 或从上游任务发起能覆盖整个 foreach 的级联修订。

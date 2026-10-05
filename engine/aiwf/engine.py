@@ -53,6 +53,14 @@ SUMMARY_LIMIT = 160
 OUTPUT_LIMIT = 2000
 # Marker key of a file reference object: {"$file": "path/relative/to/project"}.
 FILE_REF_KEY = "$file"
+# Sentinel key of an engine-owned foreach queue: items: {"queue": true}. The
+# list is run state rather than a file -- nobody (agent included) writes a queue
+# file, and every item is validated against the fixed item schema further down.
+QUEUE_KEY = "queue"
+# Event types that only book a queue edit. They are excluded from action
+# digests for the same reason the queue payload is: they record data the
+# caller fed, not a move of the run.
+QUEUE_EVENT_PREFIX = "queue_"
 # Maximum nesting depth of subflow chains.
 MAX_SUBFLOW_DEPTH = 8
 DEFAULT_MAX_INSTANCES = 1000
@@ -68,6 +76,33 @@ def now_iso() -> str:
 
 def make_run_id() -> str:
     return datetime.now().strftime("%Y%m%d-%H%M%S-") + os.urandom(3).hex()
+
+
+def action_digest(record: Dict[str, Any], workflow: Dict[str, Any]) -> str:
+    """Fingerprint of one (leaf record, definition) pair.
+
+    Every action carries this digest so the engine can refuse an instruction
+    that describes a state it has already left ("missing or stale action"). It
+    lives at module level because a reader holding only the record -- the view
+    renderer -- must be able to print a command that still validates.
+
+    The engine-owned queues are deliberately **excluded**: they are data the
+    caller feeds, not part of "which action is pending". A node may push items
+    into a queue (its own, or one belonging to a node reached later) and still
+    hold a valid action for the node it is working on. Whatever a queue edit
+    does to the schedule shows up in ``subflow_state``/``phase``/``next_node``,
+    which stay in the digest -- so are the events recording the edit itself,
+    for the same reason.
+    """
+    slim = {k: v for k, v in record.items() if k != "queues"}
+    slim["events"] = [
+        event for event in record.get("events", [])
+        if not str(event.get("type", "")).startswith(QUEUE_EVENT_PREFIX)
+    ]
+    payload = json.dumps(
+        [slim, workflow], sort_keys=True, ensure_ascii=False
+    ).encode()
+    return hashlib.sha256(payload).hexdigest()[:24]
 
 
 def is_file_ref(value: Any) -> bool:
@@ -90,6 +125,17 @@ def file_ref_paths(value: Any) -> Set[str]:
         for child in value:
             paths.update(file_ref_paths(child))
     return paths
+
+
+def same_file_path(reported: str, declared: str) -> bool:
+    """Whether a reported path names the same file as the declared one.
+
+    Compared by absolute position rather than raw text so a Windows agent that
+    reports ``...\\dir\\file.md`` still matches a declared ``.../dir/file.md``.
+    """
+    return os.path.normcase(os.path.abspath(reported)) == os.path.normcase(
+        os.path.abspath(declared)
+    )
 
 
 def _stringify_context_value(value: Any) -> str:
@@ -289,6 +335,44 @@ def _elapsed_between(started_iso: Optional[str], ended: datetime) -> int:
         return int((ended - started).total_seconds() * 1000)
     except (TypeError, ValueError):
         return 0
+
+
+#: Fixed item fields. ``id`` keys the instance and ``name`` labels it; every
+#: other key is a caller extension and is carried through untouched.
+ITEM_REQUIRED = ("id", "name")
+_ITEM_ID_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+
+
+def validate_item(item: Any) -> Dict[str, Any]:
+    """Normalise one queue item: ``{id, name}`` plus caller extensions."""
+    if not isinstance(item, dict):
+        raise ValueError(f"queue item must be an object, got {type(item).__name__}")
+    blank = [
+        k for k in ITEM_REQUIRED
+        if not isinstance(item.get(k), str) or not item[k].strip()
+    ]
+    if blank:
+        raise ValueError(
+            f"queue item needs non-empty string {' and '.join(ITEM_REQUIRED)}; "
+            f"missing or not a string: {blank} (got {sorted(item)})"
+        )
+    if not _ITEM_ID_RE.match(item["id"]):
+        raise ValueError(
+            f"queue item id {item['id']!r} must match {_ITEM_ID_RE.pattern}"
+        )
+    return dict(item)
+
+
+def item_status(instance: Optional[Dict[str, Any]]) -> str:
+    """A queue item's status *is* its instance's status -- one vocabulary.
+
+    ``pending`` / ``running`` / ``success`` / ``failed`` are the engine's own
+    instance states, so the queue table, the view and the record spell the same
+    fact the same way, and no second copy of it exists to drift.
+    """
+    if instance is None:
+        return "pending"
+    return instance.get("status") or "pending"
 
 
 class WorkflowEngine:
@@ -586,10 +670,13 @@ class WorkflowEngine:
             "started_at": None, "ended_at": None, "error": None, "exports": {},
         }
 
-    def _instance_key(
-        self, node: Dict[str, Any], index: int, item: Any
-    ) -> str:
-        id_field = node.get("id_field")
+    @staticmethod
+    def _items_id_field(node: Dict[str, Any], items_mode: str) -> Optional[str]:
+        """The field keying instances. A queue always keys on ``id`` -- that is
+        what makes an item addressable by ``aiwf items --id`` later."""
+        return "id" if items_mode == "queue" else node.get("id_field")
+
+    def _instance_key(self, id_field: Optional[str], index: int, item: Any) -> str:
         if id_field and isinstance(item, dict) and id_field in item:
             key = str(item[id_field])
             if not re.fullmatch(r"[A-Za-z0-9_-]+", key):
@@ -615,8 +702,9 @@ class WorkflowEngine:
         self, node: Dict[str, Any], child_wf: Dict[str, Any],
         items_mode: str, items: list, done: bool
     ) -> Dict[str, Any]:
+        id_field = self._items_id_field(node, items_mode)
         instances = [
-            self._make_instance(self._instance_key(node, i, item), i)
+            self._make_instance(self._instance_key(id_field, i, item), i)
             for i, item in enumerate(items)
         ]
         if len({i["key"] for i in instances}) != len(instances):
@@ -627,19 +715,41 @@ class WorkflowEngine:
             "items_mode": items_mode, "items_source": node["items"],
             "as": node.get("as", "item"),
             "index_as": node.get("index_as", "index"),
-            "id_field": node.get("id_field"),
+            "id_field": id_field,
             "cursor": 0, "total_seen": len(items), "done": done,
             "returning": False, "on_fail": node.get("on_fail", "abort"),
             "output_key": node.get("outputs_key", node["id"]),
             "instances": instances,
         }
 
+    @staticmethod
+    def _queue_of(record: Dict[str, Any], node_id: str) -> Dict[str, Any]:
+        """The engine-owned queue of one foreach node, created on first touch."""
+        return record.setdefault("queues", {}).setdefault(
+            node_id, {"items": [], "done": False}
+        )
+
     def _resolve_items(
-        self, node: Dict[str, Any], ctx: Dict[str, Any]
+        self, node: Dict[str, Any], ctx: Dict[str, Any],
+        record: Optional[Dict[str, Any]] = None,
     ) -> Tuple[str, list, bool]:
-        """Return (mode, items, done). Array source = static; an object
-        {"done":bool,"items":[...]} = dynamic."""
+        """Return (mode, items, done).
+
+        ``static``: the source carries the whole list up front -- a literal
+        array, ``{ref}``/``{var}``, or ``{$file}`` of a JSON array.
+        ``queue``: ``{"queue": true}`` -- the list is run state, validated
+        against the item schema and amended only through ``aiwf items``.
+        """
         src = node["items"]
+        if isinstance(src, dict) and QUEUE_KEY in src:
+            if src != {QUEUE_KEY: True}:
+                raise ValueError(
+                    f'items takes exactly {{"{QUEUE_KEY}": true}}; got {src!r}'
+                )
+            if record is None:
+                raise ValueError("an engine-owned queue needs the run record")
+            queue = self._queue_of(record, node["id"])
+            return "queue", list(queue["items"]), bool(queue["done"])
         if isinstance(src, list):
             value: Any = src
         elif isinstance(src, dict) and "ref" in src:
@@ -650,43 +760,21 @@ class WorkflowEngine:
         elif isinstance(src, dict) and "$file" in src:
             value = render(src, ctx)
         else:
-            raise ValueError("unsupported items source; use an array, {ref} or {$file}")
+            raise ValueError(
+                "unsupported items source; use an array, {ref}, {$file} "
+                'or {"queue": true}'
+            )
         if is_file_ref(value):
             value = self.storage.read_json_file(value["$file"])
         if isinstance(value, list):
-            return "static", value, False
+            return "static", value, True
         if isinstance(value, dict) and isinstance(value.get("items"), list):
-            if not isinstance(value.get("done"), bool):
-                raise ValueError("dynamic items require an explicit boolean done")
-            return "dynamic", value["items"], value["done"]
-        raise ValueError("items source must be an array or {\"done\":...,\"items\":[...]}")
-
-    def _merge_items(
-        self, state: Dict[str, Any], items: list, done: bool,
-        node: Dict[str, Any]
-    ) -> None:
-        """Dynamic boundary: append pending instances for newly added items."""
-        cap = node.get("max_instances", DEFAULT_MAX_INSTANCES)
-        if len(items) > cap:
             raise ValueError(
-                f"items count {len(items)} exceeds max_instances {cap}"
+                'the dynamic {"done": ..., "items": [...]} source is gone: the '
+                'queue is engine-owned now -- declare items as {"queue": true} '
+                "and drive it with `aiwf items add|update|remove|seal`"
             )
-        existing = state["instances"]
-        if state.get("items_snapshot"):
-            previous = self.storage.read_json_file(state["items_snapshot"])
-            if items[:len(previous)] != previous:
-                raise ValueError("dynamic items are append-only; existing items changed or removed")
-            keys = [self._instance_key(node, i, item) for i, item in enumerate(items)]
-            if len(set(keys)) != len(keys):
-                raise ValueError("foreach instance keys must be unique")
-            self.storage.write_json_file(state["items_snapshot"], items)
-        if len(items) > len(existing):
-            for i in range(len(existing), len(items)):
-                existing.append(
-                    self._make_instance(self._instance_key(node, i, items[i]), i)
-                )
-        state["total_seen"] = len(items)
-        state["done"] = done
+        raise ValueError('items source must be an array or {"queue": true}')
 
     @staticmethod
     def _find_instance(
@@ -746,7 +834,7 @@ class WorkflowEngine:
         props[node.get("index_as", "index")] = {}
         wf = {
             "schema_version": parent_workflow["schema_version"],
-            "max_steps": parent_workflow.get("max_steps", 50),
+            "max_steps": parent_workflow.get("max_steps", 200),
             "id": f'{parent_workflow["id"]}.{node["id"]}',
             "name": f'inline:{node["id"]}',
             "input_schema": {
@@ -802,10 +890,276 @@ class WorkflowEngine:
         return child_wf
 
     def _item_at(
-        self, node: Dict[str, Any], ctx: Dict[str, Any], index: int
+        self, node: Dict[str, Any], record: Dict[str, Any], index: int
     ) -> Any:
-        _mode, items, _done = self._resolve_items(node, ctx)
+        _mode, items, _done = self._resolve_items(
+            node, record["context"], record
+        )
         return items[index]
+
+    # ---- engine-owned queue: the `aiwf items` surface ------------------
+    def _queue_record_for(
+        self, record: Dict[str, Any], node_id: str
+    ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+        """The record in the parent chain whose workflow declares ``node_id``.
+
+        A queue node may live in the root run or inside a subflow, so the
+        search walks up the chain rather than assuming the root owns it.
+        """
+        cur, seen = record, set()
+        while True:
+            workflow = self.storage.load_workflow_for_record(cur)
+            if any(n["id"] == node_id for n in workflow["nodes"]):
+                return cur, workflow
+            parent = cur.get("parent")
+            if not parent or parent["run_id"] in seen:
+                raise RuntimeError(
+                    f"no node {node_id!r} in the run chain of {record['run_id']}"
+                )
+            seen.add(parent["run_id"])
+            cur = self.storage.find_run(parent["run_id"])
+
+    @staticmethod
+    def _queue_node(workflow: Dict[str, Any], node_id: str) -> Dict[str, Any]:
+        node = next((n for n in workflow["nodes"] if n["id"] == node_id), None)
+        if node is None:
+            raise RuntimeError(f"unknown node {node_id!r}")
+        if node["type"] != "foreach" or not (
+            isinstance(node.get("items"), dict)
+            and node["items"].get(QUEUE_KEY) is True
+        ):
+            raise RuntimeError(
+                f'node {node_id!r} is not an engine-owned queue; declare '
+                f'items: {{"{QUEUE_KEY}": true}} on a foreach node'
+            )
+        return node
+
+    @staticmethod
+    def _queue_state(
+        record: Dict[str, Any], node_id: str
+    ) -> Optional[Dict[str, Any]]:
+        state = record.get("subflow_state")
+        if (state and state.get("node_id") == node_id
+                and state.get("kind") == "foreach"):
+            return state
+        return None
+
+    def _queue_open(self, run_id: str, node_id: str):
+        record, workflow = self._queue_record_for(
+            self.storage.find_run(run_id), node_id
+        )
+        return record, workflow, self._queue_node(workflow, node_id)
+
+    def _queue_table(self, record: Dict[str, Any], node_id: str) -> Dict[str, Any]:
+        """The queue as one table: item fields plus the engine's own status."""
+        queue = self._queue_of(record, node_id)
+        state = self._queue_state(record, node_id)
+        rows = []
+        for i, item in enumerate(queue["items"]):
+            inst = (
+                state["instances"][i]
+                if state and i < len(state["instances"]) else None
+            )
+            rows.append({
+                "index": i,
+                "id": item["id"],
+                "name": item["name"],
+                "status": item_status(inst),
+                "editable": inst is None or inst.get("run_id") is None,
+                "fields": dict(item),
+            })
+        return {
+            "run_id": record["run_id"], "node": node_id,
+            "done": bool(queue["done"]), "total": len(rows), "items": rows,
+        }
+
+    def _queue_editable(
+        self, record: Dict[str, Any], node_id: str, index: int, item_id: str
+    ) -> None:
+        """Only items that have not started may be changed or removed.
+
+        Audit identity is ``(key, run_id, started_at)``; an item with a run has
+        one, so editing it would make the record disagree with what ran.
+        """
+        state = self._queue_state(record, node_id)
+        inst = (
+            state["instances"][index]
+            if state and index < len(state["instances"]) else None
+        )
+        if inst is not None and inst.get("run_id"):
+            raise RuntimeError(
+                f"item {item_id!r} already started; started items are immutable "
+                f"(redo instance {inst['key']!r} instead)"
+            )
+
+    def _queue_commit(
+        self, workflow, record, node, queue, event, **fields
+    ) -> None:
+        """Persist a queue edit, then let the run move if it was waiting on it.
+
+        Instances are rebuilt from the queue *after* the last started one:
+        started instances keep their identity (they are a prefix, execution
+        being sequential), while everything still pending is re-derived, so a
+        pending item can be edited or dropped without renumbering anything that
+        actually ran.
+        """
+        state = self._queue_state(record, node["id"])
+        if state is not None:
+            started = sum(1 for i in state["instances"] if i.get("run_id"))
+            if len(queue["items"]) < started:
+                raise RuntimeError(
+                    f"queue {node['id']!r} would drop below its {started} "
+                    f"started items"
+                )
+            id_field = self._items_id_field(node, "queue")
+            state["instances"] = state["instances"][:started] + [
+                self._make_instance(
+                    self._instance_key(id_field, i, queue["items"][i]), i
+                )
+                for i in range(started, len(queue["items"]))
+            ]
+            keys = [inst["key"] for inst in state["instances"]]
+            if len(set(keys)) != len(keys):
+                raise ValueError("queue item ids must be unique")
+            state["done"] = bool(queue["done"])
+            state["total_seen"] = len(queue["items"])
+            if state.get("items_snapshot"):
+                self.storage.write_json_file(state["items_snapshot"], queue["items"])
+        self._append_event(record, event, node_id=node["id"], **fields)
+        record["error"] = None
+        self._save(workflow, record)
+        if state is None or record["phase"] != "awaiting_items":
+            return
+        if state["done"] or self._next_pending(state):
+            record["phase"] = "executing"
+            self._save(workflow, record)
+            self._advance_foreach(workflow, record, node, state)
+
+    def queue_table(self, run_id: str, node_id: str) -> Dict[str, Any]:
+        record, _workflow, _node = self._queue_open(run_id, node_id)
+        return self._queue_table(record, node_id)
+
+    def queue_add(
+        self, run_id: str, node_id: str, items: List[Any]
+    ) -> Dict[str, Any]:
+        record, workflow, node = self._queue_open(run_id, node_id)
+        queue = self._queue_of(record, node_id)
+        if queue["done"]:
+            raise RuntimeError(
+                f"queue {node_id!r} is sealed; nothing can be added any more"
+            )
+        known = {item["id"] for item in queue["items"]}
+        fresh: List[Dict[str, Any]] = []
+        for raw in items:
+            item = validate_item(raw)
+            if item["id"] in known:
+                raise ValueError(
+                    f"item id {item['id']!r} is already in queue {node_id!r}"
+                )
+            known.add(item["id"])
+            fresh.append(item)
+        if not fresh:
+            raise ValueError("queue_add needs at least one item")
+        cap = node.get("max_instances", DEFAULT_MAX_INSTANCES)
+        if len(queue["items"]) + len(fresh) > cap:
+            raise ValueError(
+                f"queue {node_id!r} would hold "
+                f"{len(queue['items']) + len(fresh)} items, over max_instances {cap}"
+            )
+        queue["items"].extend(fresh)
+        self._queue_commit(
+            workflow, record, node, queue, "queue_items_added",
+            items=[item["id"] for item in fresh],
+        )
+        return self._queue_table(record, node_id)
+
+    def queue_update(
+        self, run_id: str, node_id: str, item_id: str, patch: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        if not isinstance(patch, dict) or not patch:
+            raise ValueError("queue_update needs a non-empty patch object")
+        if "id" in patch:
+            raise ValueError("item id keys the instance and cannot be changed")
+        record, workflow, node = self._queue_open(run_id, node_id)
+        queue = self._queue_of(record, node_id)
+        index = next(
+            (i for i, it in enumerate(queue["items"]) if it["id"] == item_id), None
+        )
+        if index is None:
+            raise ValueError(f"no item {item_id!r} in queue {node_id!r}")
+        self._queue_editable(record, node_id, index, item_id)
+        queue["items"][index] = validate_item(
+            {**queue["items"][index], **patch}
+        )
+        self._queue_commit(
+            workflow, record, node, queue, "queue_item_updated",
+            item=item_id, fields=sorted(patch),
+        )
+        return self._queue_table(record, node_id)
+
+    def queue_remove(
+        self, run_id: str, node_id: str, item_id: str
+    ) -> Dict[str, Any]:
+        record, workflow, node = self._queue_open(run_id, node_id)
+        queue = self._queue_of(record, node_id)
+        index = next(
+            (i for i, it in enumerate(queue["items"]) if it["id"] == item_id), None
+        )
+        if index is None:
+            raise ValueError(f"no item {item_id!r} in queue {node_id!r}")
+        self._queue_editable(record, node_id, index, item_id)
+        queue["items"].pop(index)
+        self._queue_commit(
+            workflow, record, node, queue, "queue_item_removed", item=item_id,
+        )
+        return self._queue_table(record, node_id)
+
+    def queue_move(
+        self, run_id: str, node_id: str, item_id: str, to_index: int
+    ) -> Dict[str, Any]:
+        """Reorder one not-yet-started item.
+
+        Started items are always a prefix (execution is sequential), so a
+        pending item may move anywhere from the first pending slot to the end:
+        it can become the next to run, but never jump ahead of something that
+        already ran. Index is the **destination position**, so moving an item
+        forward counts against the list it is being removed from.
+        """
+        record, workflow, node = self._queue_open(run_id, node_id)
+        queue = self._queue_of(record, node_id)
+        index = next(
+            (i for i, it in enumerate(queue["items"]) if it["id"] == item_id), None
+        )
+        if index is None:
+            raise ValueError(f"no item {item_id!r} in queue {node_id!r}")
+        self._queue_editable(record, node_id, index, item_id)
+        state = self._queue_state(record, node_id)
+        started = (
+            sum(1 for i in state["instances"] if i.get("run_id")) if state else 0
+        )
+        if not started <= to_index < len(queue["items"]):
+            raise ValueError(
+                f"cannot move {item_id!r} to index {to_index}; pending items "
+                f"live in [{started}, {len(queue['items'])})"
+            )
+        if to_index == index:
+            return self._queue_table(record, node_id)
+        queue["items"].insert(to_index, queue["items"].pop(index))
+        self._queue_commit(
+            workflow, record, node, queue, "queue_item_moved",
+            item=item_id, to=to_index,
+        )
+        return self._queue_table(record, node_id)
+
+    def queue_seal(self, run_id: str, node_id: str) -> Dict[str, Any]:
+        """Close the queue: no more additions, and stop waiting for them."""
+        record, workflow, node = self._queue_open(run_id, node_id)
+        queue = self._queue_of(record, node_id)
+        if queue["done"]:
+            return self._queue_table(record, node_id)
+        queue["done"] = True
+        self._queue_commit(workflow, record, node, queue, "queue_sealed")
+        return self._queue_table(record, node_id)
 
     # ---- chain guards -------------------------------------------------
     def _assert_chain_ok(
@@ -848,7 +1202,7 @@ class WorkflowEngine:
             if state.get("items_snapshot"):
                 item_value = self.storage.read_json_file(state["items_snapshot"])[inst["index"]]
             else:
-                item_value = self._item_at(node, record["context"], inst["index"])
+                item_value = self._item_at(node, record, inst["index"])
             scope[state["as"]] = item_value
             scope[state["index_as"]] = inst["index"]
             scope["previous"] = (
@@ -1014,20 +1368,14 @@ class WorkflowEngine:
             return self._finish_foreach_node(
                 parent_wf, parent_record, node, state
             )
-        try:
-            if state["items_mode"] == "dynamic":
-                mode, items, done = self._resolve_items(node, parent_record["context"])
-                if mode != "dynamic":
-                    raise ValueError("dynamic items source changed mode")
-                self._merge_items(state, items, done, node)
-        except (ValueError, KeyError, OSError) as e:
-            return self._fail(parent_wf, parent_record, f"foreach items invalid: {e}")
         nxt = self._next_pending(state)
         if nxt is not None:
             self._save(parent_wf, parent_record)
             self._begin_instance(parent_wf, parent_record, node, state, nxt)
             return parent_record
-        if state["items_mode"] == "dynamic" and not state["done"]:
+        # An unsealed queue with nothing pending is a wait, not an end: the
+        # engine hands control back so `aiwf items add|seal` can decide.
+        if state["items_mode"] == "queue" and not state["done"]:
             parent_record["phase"] = "awaiting_items"
             self._save(parent_wf, parent_record)
             return parent_record
@@ -1113,7 +1461,7 @@ class WorkflowEngine:
             state = self._new_single_state(node, child_wf)
         else:
             items_mode, items, done = self._resolve_items(
-                node, record["context"]
+                node, record["context"], record
             )
             cap = node.get("max_instances", DEFAULT_MAX_INSTANCES)
             if len(items) > cap:
@@ -1131,14 +1479,13 @@ class WorkflowEngine:
                     self.storage.run_dir_for_record(record), f"foreach-{node['id']}-items.json"
                 )
                 self.storage.write_json_file(state["items_snapshot"], items)
-            if not items and (items_mode == "static" or done):
+            if not items:
                 record["subflow_state"] = state
+                if items_mode == "queue" and not done:
+                    record["phase"] = "awaiting_items"
+                    self._save(workflow, record)
+                    return
                 self._finish_foreach_node(workflow, record, node, state)
-                return
-            if not items:  # dynamic source, not done yet
-                record["subflow_state"] = state
-                record["phase"] = "awaiting_items"
-                self._save(workflow, record)
                 return
         record["subflow_state"] = state
         self._save(workflow, record)
@@ -1252,14 +1599,28 @@ class WorkflowEngine:
     def _initialize_protocol(self, workflow, record):
         record["workflow_version"] = workflow["schema_version"]
         if workflow["schema_version"] == "1.1":
+            run_dir = self.storage.run_dir_for_record(record)
             record["context"]["run"] = {
                 "id": record["run_id"],
-                "dir": self.storage.run_dir_for_record(record),
+                "dir": run_dir,
             }
-            self.storage.write_json_file(
-                os.path.join(self.storage.run_dir_for_record(record), "workflow.json"),
-                workflow,
-            )
+            if not self._has_inline_definition(run_dir):
+                self.storage.write_json_file(
+                    os.path.join(run_dir, "workflow.json"), workflow,
+                )
+
+    @staticmethod
+    def _has_inline_definition(run_dir):
+        """True when this run is an inline subflow instance. Its definition is
+        the parent's children/<node>/subflow.json, synthesized from the parent's
+        own snapshot, so it already *is* a snapshot -- copying it per instance
+        would only duplicate it. `load_workflow_for_record` falls back to that
+        file (via the parent link) when no per-run snapshot exists. External
+        subflow definitions do get their own snapshot: those live outside the
+        run and may change."""
+        return os.path.exists(
+            os.path.normpath(os.path.join(run_dir, "..", "subflow.json"))
+        )
 
     def root_record(self, record):
         while record.get("parent"):
@@ -1299,11 +1660,8 @@ class WorkflowEngine:
             if node["type"] in ("start", "end", "subflow", "foreach") or node.get("when"):
                 if leaf["phase"] == "executing":
                     kind = "resume"
-            digest = hashlib.sha256(json.dumps(
-                [leaf, workflow], sort_keys=True, ensure_ascii=False
-            ).encode()).hexdigest()[:24]
             spec["action"] = {
-                "id": digest, "run_id": leaf["run_id"],
+                "id": action_digest(leaf, workflow), "run_id": leaf["run_id"],
                 "node_id": leaf["next_node"], "kind": kind,
             }
         return spec
@@ -1488,7 +1846,7 @@ class WorkflowEngine:
                 spec["output_key"] = node.get("output_key", node["id"])
             else:
                 try:
-                    f_mode, f_items, _f_done = self._resolve_items(node, ctx)
+                    f_mode, f_items, _f_done = self._resolve_items(node, ctx, record)
                 except Exception:
                     f_mode, f_items = "unresolved", []
                 spec.update(
@@ -1526,8 +1884,10 @@ class WorkflowEngine:
                     }
             if record["phase"] == "awaiting_items":
                 spec["message"] = (
-                    "dynamic items source has no pending items; append items "
-                    "(or set done=true), then `aiwf resume`"
+                    f"queue {node['id']!r} has no pending items and is not "
+                    f"sealed; add with `aiwf items add <run> --node "
+                    f"{node['id']} --item '<json>'`, or finish with "
+                    f"`aiwf items seal <run> --node {node['id']}`"
                 )
         # start / end: id/type/name only
         return spec
@@ -1648,7 +2008,7 @@ class WorkflowEngine:
             raise RuntimeError(
                 f"run is in phase {record['phase']!r}, not accepting task output"
             )
-        if workflow["schema_version"] == "1.1" and len(record["node_runs"]) >= workflow.get("max_steps", 50):
+        if workflow["schema_version"] == "1.1" and len(record["node_runs"]) >= workflow.get("max_steps", 200):
             return self._fail(workflow, record, "max_steps exceeded before accepting output")
         validate_output_size(output)
         current = record["next_node"]  # type: ignore[assignment]
@@ -1699,7 +2059,11 @@ class WorkflowEngine:
         if node["type"] == "task" and node.get("output"):
             expected = resolve_data(node["output"], record["context"])["file"]
             path = file_ref_path(output)
-            if path != expected or not isinstance(path, str) or not os.path.isfile(path):
+            if (
+                not isinstance(path, str)
+                or not same_file_path(path, expected)
+                or not os.path.isfile(path)
+            ):
                 return self._reject_output(
                     workflow, record, node, ended, output,
                     f"expected existing file {expected!r}, got {path!r}",
@@ -1755,10 +2119,10 @@ class WorkflowEngine:
                 )
             return self._complete(workflow, record)
 
-        if workflow["schema_version"] == "1.0" and len(record["node_runs"]) >= workflow.get("max_steps", 50):
+        if workflow["schema_version"] == "1.0" and len(record["node_runs"]) >= workflow.get("max_steps", 200):
             return self._fail(
                 workflow, record,
-                f"max_steps ({workflow.get('max_steps', 50)}) exceeded; "
+                f"max_steps ({workflow.get('max_steps', 200)}) exceeded; "
                 f"possible infinite loop",
             )
 
@@ -2131,8 +2495,8 @@ class WorkflowEngine:
         record["node_started_at"] = now_iso()
         if workflow["schema_version"] == "1.1":
             record["activation_id"] = make_run_id()
-        if workflow["schema_version"] == "1.1" and len(record["node_runs"]) >= workflow.get("max_steps", 50):
-            self._fail(workflow, record, f"max_steps ({workflow.get('max_steps', 50)}) exceeded")
+        if workflow["schema_version"] == "1.1" and len(record["node_runs"]) >= workflow.get("max_steps", 200):
+            self._fail(workflow, record, f"max_steps ({workflow.get('max_steps', 200)}) exceeded")
             return
         if (workflow["schema_version"] == "1.1"
                 and node["type"] in ("task", "branch", "review")
@@ -2223,7 +2587,7 @@ class WorkflowEngine:
                 break
             prior = self._last_success_node_run(record, nxt)
             if prior is not None:
-                if len(record["node_runs"]) >= workflow.get("max_steps", 50):
+                if len(record["node_runs"]) >= workflow.get("max_steps", 200):
                     self._fail(workflow, record, "max_steps exceeded during reuse")
                     return
                 record["node_runs"].append(self._skipped_run(record, prior))
@@ -2497,7 +2861,14 @@ class WorkflowEngine:
             if isinstance(src, dict):
                 origin = f"{state['node_id']} items 源"
                 if "$file" in src:
-                    scan({FILE_REF_KEY: src["$file"]}, origin)
+                    # the path is a template (${run.dir}/... , ${node.x.y}/...):
+                    # render it the same way _resolve_items does, otherwise the
+                    # index would show an unresolved ${...} and miss dedup
+                    try:
+                        path = render(src["$file"], record["context"])
+                    except KeyError:
+                        path = src["$file"]
+                    scan({FILE_REF_KEY: path}, origin)
                 elif "var" in src or "ref" in src:
                     try:
                         scan(resolve_dotted(record["context"], src.get("ref", src.get("var"))), origin)

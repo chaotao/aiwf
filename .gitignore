@@ -8,3 +8,6 @@ venv/
 
 # OS / editor
 .DS_Store
+
+# Local AI-assistant state (session memory lives on this machine)
+.workbuddy/

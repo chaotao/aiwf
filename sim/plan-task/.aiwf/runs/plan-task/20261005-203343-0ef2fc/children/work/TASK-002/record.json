@@ -1,0 +1,92 @@
+{
+  "schema_version": "1.0",
+  "run_id": "20261005-203345-d1e6d8",
+  "workflow_id": "plan-task.work",
+  "status": "running",
+  "phase": "executing",
+  "started_at": "2026-10-05T20:33:45",
+  "ended_at": null,
+  "duration_ms": null,
+  "inputs": {
+    "plan": {
+      "$file": "plan/wu-gang-ch1/plan.md",
+      "summary": "计划已制定：2 个任务，队列已封口",
+      "task_count": 2
+    },
+    "intake": {
+      "goal": "做出《雾港》第一章可玩的垂直切片",
+      "scope": "码头探索 + 潮汐谜题 + 道具合成 + 关门通关，一条单章节闭环",
+      "constraints": "两周内完成；只用现有美术素材；不引入新的第三方库",
+      "acceptance": "玩家能从码头走到通关且全程无阻断；谜题 / 合成 / 关门三条链路可独立复现；手感与氛围达到可展示标准",
+      "plan_name": "wu-gang-ch1"
+    },
+    "previous": {
+      "execute": {
+        "$file": "plan/wu-gang-ch1/tasks/TASK-001.md",
+        "summary": "核心循环 spec 完成并自检达标"
+      }
+    },
+    "item": {
+      "id": "TASK-002",
+      "name": "潮汐谜题与关卡原型",
+      "goal": "搭建潮汐水位机制与首个谜题关卡原型",
+      "deps": "TASK-001",
+      "acceptance": "水位随机关状态变化；谜题有唯一解且可通过"
+    },
+    "index": 1
+  },
+  "context": {
+    "plan": {
+      "$file": "plan/wu-gang-ch1/plan.md",
+      "summary": "计划已制定：2 个任务，队列已封口",
+      "task_count": 2
+    },
+    "intake": {
+      "goal": "做出《雾港》第一章可玩的垂直切片",
+      "scope": "码头探索 + 潮汐谜题 + 道具合成 + 关门通关，一条单章节闭环",
+      "constraints": "两周内完成；只用现有美术素材；不引入新的第三方库",
+      "acceptance": "玩家能从码头走到通关且全程无阻断；谜题 / 合成 / 关门三条链路可独立复现；手感与氛围达到可展示标准",
+      "plan_name": "wu-gang-ch1"
+    },
+    "previous": {
+      "execute": {
+        "$file": "plan/wu-gang-ch1/tasks/TASK-001.md",
+        "summary": "核心循环 spec 完成并自检达标"
+      }
+    },
+    "item": {
+      "id": "TASK-002",
+      "name": "潮汐谜题与关卡原型",
+      "goal": "搭建潮汐水位机制与首个谜题关卡原型",
+      "deps": "TASK-001",
+      "acceptance": "水位随机关状态变化；谜题有唯一解且可通过"
+    },
+    "index": 1,
+    "run": {
+      "id": "20261005-203345-d1e6d8",
+      "dir": ".aiwf\\runs\\plan-task\\20261005-203343-0ef2fc\\children\\work\\TASK-002"
+    }
+  },
+  "next_node": "start",
+  "node_started_at": "2026-10-05T20:33:45",
+  "error": null,
+  "last_feedback": null,
+  "pending_review": null,
+  "revision": null,
+  "node_runs": [],
+  "events": [
+    {
+      "type": "run_started",
+      "at": "2026-10-05T20:33:45"
+    }
+  ],
+  "parent": {
+    "workflow_id": "plan-task",
+    "run_id": "20261005-203343-0ef2fc",
+    "node_id": "work",
+    "instance": "TASK-002"
+  },
+  "subflow_state": null,
+  "workflow_version": "1.1",
+  "activation_id": "20261005-203345-249315"
+}

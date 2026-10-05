@@ -1,0 +1,14 @@
+{
+  "id": "std.review-check",
+  "summary": "按给定标准对一个对象做评审，输出 PASS/REVISE 与问题清单",
+  "maturity": "experimental",
+  "scenarios": [
+    "需要一个不参与改动的独立复检环节",
+    "同一套评审标准要在多处复用，不想重复写提示词"
+  ],
+  "not_for": [
+    "本模板是 agent 评审，不含人工验收节点；要人拍板需在流程里另加 task 的 review 节点",
+    "一次性短任务"
+  ],
+  "deps": []
+}

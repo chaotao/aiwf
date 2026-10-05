@@ -1,0 +1,96 @@
+{
+  "schema_version": "1.1",
+  "id": "std.review-loop",
+  "name": "改-检-审-复检环",
+  "description": "按需求实施改动，经 Agent 自检与人工验收后，再交给通用评审子流程独立复检一次。开发类任务的返工闭环。",
+  "input_schema": {
+    "type": "object",
+    "required": ["project_dir", "request", "conventions_file", "test_cmd"],
+    "properties": {
+      "project_dir": {
+        "type": "string",
+        "description": "目标项目目录（绝对路径）"
+      },
+      "request": {
+        "type": "string",
+        "description": "本次改动需求"
+      },
+      "conventions_file": {
+        "type": "string",
+        "description": "项目约定文件的相对路径（如 CLAUDE.md / CONTRIBUTING.md）；没有就填 \"none\""
+      },
+      "test_cmd": {
+        "type": "string",
+        "description": "本项目的验证命令（如 python -m pytest -q）；没有自动化测试就填 \"none\""
+      }
+    }
+  },
+  "nodes": [
+    {
+      "id": "start",
+      "type": "start",
+      "name": "开始"
+    },
+    {
+      "id": "fix",
+      "type": "task",
+      "name": "实施修改",
+      "prompt": "在项目 ${project_dir} 中完成以下需求：\n${request}\n\n按以下步骤执行，每步都要落到实际动作：\n1. 读约定：约定文件为 ${conventions_file}——不是 none 就先读它，按其约定行事；是 none 就先看项目根的 README / CONTRIBUTING / docs。\n2. 定位：找出与需求直接相关的文件，说明定位依据；不要靠猜大范围翻找。\n3. 改动：只改必要文件，保持项目现有风格，不顺手重构无关代码。\n4. 验证：执行 ${test_cmd}——是 none 就自选与改动相称的最小验证，并说明为什么选它；无论哪种都要真跑一遍。\n5. 报告：输出 JSON {\"summary\": \"...\", \"changed_files\": [\"相对路径\", ...]}，summary 里要写明跑了什么验证、结果如何。",
+      "output_key": "fix",
+      "output_schema": {
+        "type": "object",
+        "required": ["summary", "changed_files"],
+        "properties": {
+          "summary": {
+            "type": "string"
+          },
+          "changed_files": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      "check": {
+        "criteria": [
+          "需求已完整实现",
+          "改动范围最小，未动无关文件",
+          "按 test_cmd 实际执行了验证（或说明了为何不适用），并如实报告结果",
+          "未破坏既有行为"
+        ],
+        "max_attempts": 2
+      },
+      "review": {
+        "requirements": [
+          "改动是否符合预期，可以进入独立复检"
+        ]
+      }
+    },
+    {
+      "id": "audit",
+      "type": "subflow",
+      "name": "独立复检",
+      "workflow": "std.review-check",
+      "inputs": {
+        "subject": {
+          "ref": "fix.summary"
+        },
+        "criteria": "1. 改动可回滚；2. 未引入与需求无关的修改；3. 每条需求都有对应改动。"
+      },
+      "output_key": "audit"
+    },
+    {
+      "id": "report",
+      "type": "task",
+      "name": "出结论",
+      "prompt": "本次改动：${fix.summary}\n涉及文件：${fix.changed_files}\n\n复检结论：${audit.review.verdict}\n复检问题：${audit.review.issues}\n\n汇总以上信息，给出是否可交付的结论；复检为 REVISE 时明确列出待修项。",
+      "output_key": "report"
+    },
+    {
+      "id": "end",
+      "type": "end",
+      "name": "结束"
+    }
+  ]
+}
