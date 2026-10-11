@@ -25,8 +25,6 @@ description: 创建、运行与审计 aiwf 工作流。用户要求创建或修�
 | 启动、执行、接管、临时失败续跑 | [执行指南](references/run-workflow.md) |
 | 查看进度、记录、产物、耗时、失败原因 | [审计与检索](references/inspect-runs.md) |
 | 想知道「做到哪一步、还剩什么」而不是「哪些节点跑完了」 | [业务进展视图](references/view.md) — 定义里声明 `view` 段，`runs show` 按业务阶段渲染并给出下一步命令 |
-| 临时冒出、不挡这一轮的想法或问题 | [收件箱](references/inbox.md) — 先记下，不打断当前流程 |
-| 长期项目：有哪些计划、当前焦点、还剩哪些任务；建计划 / 加任务 / 把 run 事实折回文档 | [计划](references/plan.md) — 先 `aiwf plan list` 看全局 |
 
 ### 常用专题
 
@@ -54,7 +52,7 @@ description: 创建、运行与审计 aiwf 工作流。用户要求创建或修�
 - 单节点输出 ≤2000 字符；优先把运行产物放 `${run.dir}`，代码修改仍落实际项目文件。
 - 使用根 run_id 和最新 `action.id` 驱动；依据 `action.kind` 选择命令，不把 phase 当命令。
 - `check` 由 Agent 实际检查；`review` 的结论来自用户，不能自行代批。
-- 当前节点的缺陷走 `check` / `fail` / `revise`，不许用 `inbox` 记下来绕过质检。
+- 当前节点的缺陷走 `check` / `fail` / `revise`，不许绕过质检。
 - `.aiwf/runs/` 保留并纳入版本管理；交接先看 `context.md`，再 `current --json`。
 
 命令优先用本仓库启动入口：POSIX 用 `engine/bin/aiwf`，Windows 用

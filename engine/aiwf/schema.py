@@ -118,6 +118,10 @@ def _validate_view(workflow: Dict[str, Any], spec: Dict[str, Any]) -> None:
             where=f"view stage {stage.get('name')!r} detail", allow_item=False,
         )
     _check_view_template(
+        spec.get("title"), known, view_mod,
+        where="view.title", allow_item=False,
+    )
+    _check_view_template(
         (spec.get("items") or {}).get("label"), known, view_mod,
         where="view.items.label", allow_item=True,
     )

@@ -23,14 +23,6 @@ The CLI is the boundary between an AI agent / human and the engine state machine
                                          that was waiting for items
     aiwf skills list|install ...         package agent skills
     aiwf wf list|show|install|diff|...   bundled workflow template library
-    aiwf inbox add|list|show|resolve|... park a thought/problem without
-                                         blocking the current work; project
-                                         level, never part of a run
-    aiwf plan list|show|check|status     long-running task list: goals, scope,
-                                         tasks, dependencies; project level,
-                                         spans many runs
-    aiwf plan new|task add|focus|sync    create, extend and reconcile a plan;
-                                         sync is a dry run until --write
 
 `aiwf runs show` renders a workflow's declared `view` -- the business stages a
 human cares about -- above the raw node stream; `--view` prints only that.
@@ -45,9 +37,7 @@ import shutil
 import sys
 from typing import Any, Dict, List, Optional
 
-from . import inbox as inbox_store
 from . import library as template_library
-from . import plan as plan_store
 from . import view as view_mod
 from .engine import WorkflowEngine
 from .schema import validate_workflow
@@ -438,6 +428,13 @@ def cmd_validate(args, storage: Storage) -> int:
 
 def cmd_workflows(args, storage: Storage) -> int:
     ids = storage.list_workflows()
+    if getattr(args, "json", False):
+        print(json.dumps(
+            [{"id": wid, "name": storage.load_workflow(wid).get("name", "")}
+             for wid in ids],
+            ensure_ascii=False, indent=2,
+        ))
+        return 0
     if not ids:
         print("(no workflows; create one with the aiwf skill)")
         return 0
@@ -667,6 +664,16 @@ def cmd_runs_list(args, storage: Storage) -> int:
             continue
         rows.append((r["started_at"], rid, wf, r["status"], r.get("duration_ms"),
                      len(r["node_runs"]), parent_run))
+    if getattr(args, "json", False):
+        print(json.dumps(
+            [{"started_at": started, "run_id": rid, "workflow_id": wf,
+              "status": status, "duration_ms": dur, "node_count": node_count,
+              "parent_run": parent_run}
+             for started, rid, wf, status, dur, node_count, parent_run
+             in sorted(rows, reverse=True)],
+            ensure_ascii=False, indent=2,
+        ))
+        return 0
     if not rows:
         print("(no runs)")
         return 0
@@ -898,405 +905,6 @@ def cmd_wf_index(args, storage: Storage) -> int:
     return 0
 
 
-# ---- inbox ---------------------------------------------------------------
-def _inbox_source(args) -> Optional[str]:
-    """前两项是 run 记录标识，第三项才是工作流名；自由文本，不校验存在性。"""
-    parts = [p for p in (getattr(args, "run", None), getattr(args, "node", None),
-                         getattr(args, "source", None)) if p]
-    return " / ".join(parts) if parts else None
-
-
-def _inbox_dump(args, payload: Dict[str, Any]) -> None:
-    print(json.dumps(payload, ensure_ascii=False, indent=2))
-
-
-def cmd_inbox_add(args, storage: Storage) -> int:
-    note = None
-    if args.note_file:
-        with open(args.note_file, "r", encoding="utf-8") as handle:
-            note = handle.read()
-    elif args.note:
-        note = args.note
-    entry = inbox_store.add(
-        storage.inbox_dir,
-        " ".join(args.text).strip(),
-        reason=args.why,
-        type_=args.type,
-        source=_inbox_source(args),
-        merge_into=args.merge_into,
-        split_from=args.split_from,
-        related=args.related,
-        note=note,
-    )
-    if getattr(args, "json", False):
-        _inbox_dump(args, entry)
-        return 0
-    if args.merge_into:
-        print(f"merged into {entry['id']} (吸收)：{entry.get('summary', '').splitlines()[0][:60]}")
-    else:
-        print(f"recorded {entry['id']}：{entry.get('summary', '').splitlines()[0][:60]}")
-    print(f"type     : {entry.get('type', '')}")
-    print(f"parked   : {entry.get('reason', '')}")
-    print(f"source   : {entry.get('source') or '(none)'}")
-    print("current run/work is unaffected - keep going.")
-    print(f"ledger   : {inbox_store.ledger_path(storage.inbox_dir)}")
-    return 0
-
-
-def _inbox_rows(entry: Dict[str, Any]) -> str:
-    lines = (entry.get("summary") or "").splitlines()
-    first = lines[0] if lines else ""
-    parked = entry.get("reason") or entry.get("target") or ""
-    return (f"{inbox_store.pad_display(entry['id'], 9)}"
-            f"{inbox_store.pad_display(entry.get('status', ''), 7)}"
-            f"{inbox_store.pad_display(entry.get('type', ''), 5)}"
-            f"{inbox_store.pad_display(entry.get('date', ''), 11)}"
-            f"{inbox_store.pad_display(parked, 15)} {first}")
-
-
-def cmd_inbox_list(args, storage: Storage) -> int:
-    data = inbox_store.load(storage.inbox_dir)
-    rows = list(data["open"])
-    if args.type:
-        rows = [r for r in rows if r.get("type") == args.type]
-    if args.run:
-        rows = [r for r in rows if args.run in (r.get("source") or "")]
-    archived = list(data["archived"])
-    if args.run:
-        archived = [r for r in archived if args.run in (r.get("source") or "")]
-
-    if getattr(args, "json", False):
-        _inbox_dump(args, {"open": rows, "archived": archived if args.all else []})
-        return 0
-
-    if not rows:
-        print(f"(no open items in {storage.inbox_dir})")
-    else:
-        print(f"{inbox_store.pad_display('ID', 9)}{inbox_store.pad_display('STATUS', 7)}"
-              f"{inbox_store.pad_display('TYPE', 5)}{inbox_store.pad_display('DATE', 11)}"
-              f"{inbox_store.pad_display('PARKED', 15)} SUMMARY")
-        for entry in rows:
-            print(_inbox_rows(entry))
-    if args.all and archived:
-        print("\narchived:")
-        for entry in archived:
-            print(_inbox_rows(entry))
-    return 0
-
-
-def cmd_inbox_show(args, storage: Storage) -> int:
-    entry = inbox_store.find(storage.inbox_dir, args.entry_id)
-    if entry is None:
-        raise ValueError(
-            f"no item {args.entry_id} in {storage.inbox_dir}; see `aiwf inbox list`"
-        )
-    if getattr(args, "json", False):
-        _inbox_dump(args, entry)
-        return 0
-    print(f"### {entry['id']}")
-    for key, label in (("status", "状态"), ("type", "类型"), ("date", "日期"),
-                       ("source", "来源"), ("summary", "摘要"), ("reason", "为何停放"),
-                       ("split_from", "拆自"), ("absorbed", "吸收"),
-                       ("related", "相关"), ("note", "备注"), ("target", "去向")):
-        value = str(entry.get(key) or "").strip()
-        if value:
-            print(f"- {label}：{value}")
-    return 0
-
-
-def cmd_inbox_resolve(args, storage: Storage) -> int:
-    entry = inbox_store.resolve(
-        storage.inbox_dir,
-        args.entry_id,
-        status=args.status,
-        target=args.to,
-        split_into=args.split_into,
-    )
-    if getattr(args, "json", False):
-        _inbox_dump(args, entry)
-        return 0
-    print(f"archived {entry['id']} as {entry['status']}")
-    print(f"went to  : {entry['target']}")
-    print(f"history  : {inbox_store.history_path(storage.inbox_dir)}")
-    return 0
-
-
-def cmd_inbox_check(args, storage: Storage) -> int:
-    problems = inbox_store.check(storage.inbox_dir)
-    if getattr(args, "json", False):
-        _inbox_dump(args, {"ok": not problems, "problems": problems})
-        return 0
-    if problems:
-        print(f"inbox check failed ({len(problems)} problem(s)):")
-        for problem in problems:
-            print(f"  - {problem}")
-        return 2
-    data = inbox_store.load(storage.inbox_dir)
-    print(f"inbox ok: {len(data['open'])} open, {len(data['archived'])} archived")
-    return 0
-
-
-def cmd_inbox_path(args, storage: Storage) -> int:
-    if getattr(args, "json", False):
-        _inbox_dump(args, {"dir": storage.inbox_dir,
-                           "ledger": inbox_store.ledger_path(storage.inbox_dir),
-                           "history": inbox_store.history_path(storage.inbox_dir)})
-        return 0
-    print(storage.inbox_dir)
-    return 0
-
-
-# ---- plan ----------------------------------------------------------------
-# A plan is a long-running task list at <root>/plans/<id>/index.md. Like the
-# inbox it is project level and never part of a run; unlike the inbox it does
-# read runs -- to derive execution status, which prose cannot keep honest.
-def _plans_dir(args, storage: Storage) -> str:
-    return getattr(args, "dir", None) or storage.plans_dir
-
-
-def _plan_dump(args, payload: Any) -> None:
-    print(json.dumps(payload, ensure_ascii=False, indent=2))
-
-
-def _plan_row(plan: Dict[str, Any]) -> str:
-    tally = plan_store.counts(plan)
-    status = (plan["info"].get("状态") or "?").strip()
-    focus = plan_store.focus_task_id(plan) or "—"
-    done = "%d/%d" % (tally.get("已完成", 0), tally["total"])
-    return (f"{inbox_store.pad_display(str(plan['id']), 22)}"
-            f"{inbox_store.pad_display(status, 10)}"
-            f"{inbox_store.pad_display(done, 8)}"
-            f"{inbox_store.pad_display(focus, 10)} {plan['name']}")
-
-
-def _plan_json(plan: Dict[str, Any], derived: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    payload = {
-        "id": plan["id"],
-        "name": plan["name"],
-        "path": plan.get("path"),
-        "status": plan["info"].get("状态"),
-        "goal": plan["info"].get("目标"),
-        "scope": plan["info"].get("范围"),
-        "focus": plan_store.focus_task_id(plan),
-        "counts": plan_store.counts(plan),
-        "tasks": [
-            {"id": t["id"], "name": t["name"], "status": t["status"], "deps": t["deps"]}
-            for t in plan["tasks"]
-        ],
-        "outstanding": [t["id"] for t in plan_store.outstanding(plan)],
-    }
-    if derived is not None:
-        payload["derived"] = derived
-    return payload
-
-
-def cmd_plan_list(args, storage: Storage) -> int:
-    root = _plans_dir(args, storage)
-    plans = plan_store.load_all(root)
-    if getattr(args, "json", False):
-        _plan_dump(args, {"dir": root, "plans": [_plan_json(p) for p in plans]})
-        return 0
-    if not plans:
-        print(f"(no plans in {root})")
-        return 0
-    print(f"{inbox_store.pad_display('PLAN', 22)}{inbox_store.pad_display('STATUS', 10)}"
-          f"{inbox_store.pad_display('DONE', 8)}{inbox_store.pad_display('FOCUS', 10)} NAME")
-    for plan in plans:
-        print(_plan_row(plan))
-    return 0
-
-
-def cmd_plan_show(args, storage: Storage) -> int:
-    root = _plans_dir(args, storage)
-    plan = plan_store.load(root, args.plan_id)
-    derived: Dict[str, Any] = {}
-    if not getattr(args, "no_runs", False):
-        derived = plan_store.derive_from_runs(storage, plan["id"])
-    if getattr(args, "json", False):
-        _plan_dump(args, _plan_json(plan, derived))
-        return 0
-
-    info = plan["info"]
-    print(f"# {plan['name']}  ({plan['id']})")
-    for key in ("游戏", "状态", "目标", "范围", "创建日期", "最近更新"):
-        if info.get(key):
-            print(f"{inbox_store.pad_display(key, 10)}: {info[key]}")
-
-    focus = plan.get("focus") or {}
-    if focus:
-        print("\n当前焦点")
-        for key, value in focus.items():
-            head, _, rest = str(value).partition("\n")
-            print(f"  {inbox_store.pad_display(key, 8)}: {head}")
-            for line in rest.splitlines():
-                print(f"    {line}")
-
-    print("\n任务")
-    for task in plan["tasks"]:
-        line = f"  {task['id']}  {inbox_store.pad_display(task['status'], 6)}  {task['name']}"
-        run = derived.get(task["id"])
-        if run and run["status"] != task["status"]:
-            line += f"   [run {run['run_id']} → {run['status']}]"
-        print(line)
-
-    tally = plan_store.counts(plan)
-    pending = plan_store.outstanding(plan)
-    print(f"\n进度  {tally.get('已完成', 0)}/{tally['total']} 已完成")
-    print(f"待办  {', '.join(t['id'] for t in pending) if pending else '无'}")
-    return 0
-
-
-def cmd_plan_check(args, storage: Storage) -> int:
-    root = _plans_dir(args, storage)
-    problems = plan_store.check(root, getattr(args, "plan_id", None))
-    if getattr(args, "json", False):
-        _plan_dump(args, {"ok": not problems, "dir": root, "problems": problems})
-        return 0
-    if problems:
-        print(f"plan check failed ({len(problems)} problem(s)):")
-        for problem in problems:
-            print(f"  - {problem}")
-        return 2
-    plans = plan_store.load_all(root)
-    total = sum(len(p["tasks"]) for p in plans)
-    print(f"plan ok: {len(plans)} plan(s), {total} task(s) in {root}")
-    return 0
-
-
-def cmd_plan_status(args, storage: Storage) -> int:
-    """Execution status derived from runs, next to what the document says."""
-    root = _plans_dir(args, storage)
-    want = getattr(args, "plan_id", None)
-    rows = []
-    for plan in plan_store.load_all(root):
-        if want and plan["id"] != want:
-            continue
-        derived = plan_store.derive_from_runs(storage, plan["id"])
-        for task in plan["tasks"]:
-            run = derived.get(task["id"])
-            if run:
-                rows.append((plan["id"], task["id"], task["status"],
-                             run["status"], run["run_id"]))
-    if getattr(args, "json", False):
-        _plan_dump(args, {"dir": root, "rows": [
-            {"plan": p, "task": t, "document": doc, "derived": der, "run_id": rid}
-            for p, t, doc, der, rid in rows]})
-        return 0
-    if not rows:
-        print("(no runs linked to a task; a run links via inputs.plan / inputs.task)")
-        return 0
-    print(f"{inbox_store.pad_display('PLAN', 22)}{inbox_store.pad_display('TASK', 10)}"
-          f"{inbox_store.pad_display('DOC', 10)}{inbox_store.pad_display('RUN STATUS', 12)} RUN_ID")
-    for p, t, doc, der, rid in rows:
-        mark = "" if doc == der else "  <- drift"
-        print(f"{inbox_store.pad_display(p, 22)}{inbox_store.pad_display(t, 10)}"
-              f"{inbox_store.pad_display(doc, 10)}{inbox_store.pad_display(der, 12)}{rid}{mark}")
-    return 0
-
-
-def cmd_plan_path(args, storage: Storage) -> int:
-    root = _plans_dir(args, storage)
-    ids = plan_store.iter_plan_ids(root)
-    if getattr(args, "json", False):
-        _plan_dump(args, {"dir": root, "plans": [
-            {"id": i, "index": plan_store.index_path(root, i)} for i in ids]})
-        return 0
-    print(root)
-    for i in ids:
-        print(f"  {i}: {plan_store.index_path(root, i)}")
-    return 0
-
-
-def cmd_plan_new(args, storage: Storage) -> int:
-    root = _plans_dir(args, storage)
-    path = plan_store.new_plan(
-        root, args.plan_id, goal=args.goal, scope=args.scope,
-        name=getattr(args, "name", None), status=args.status,
-        game=getattr(args, "game", None),
-    )
-    if getattr(args, "json", False):
-        _plan_dump(args, {"created": path, "id": args.plan_id})
-        return 0
-    print(f"created plan {args.plan_id}: {path}")
-    print(f"next: aiwf plan task add {args.plan_id} TASK-001 --name \"...\"")
-    return 0
-
-
-def cmd_plan_task_add(args, storage: Storage) -> int:
-    root = _plans_dir(args, storage)
-    result = plan_store.add_task(
-        root, args.plan_id, args.task_id, name=args.name, status=args.status,
-        deps=plan_store.parse_deps(args.deps or ""),
-        link=not getattr(args, "no_link", False),
-        note=getattr(args, "note", None),
-    )
-    if getattr(args, "json", False):
-        _plan_dump(args, result)
-        return 0
-    print(f"added {result['task']} to {result['plan']}:")
-    print(f"  {result['line']}")
-    return 0
-
-
-def cmd_plan_focus(args, storage: Storage) -> int:
-    root = _plans_dir(args, storage)
-    result = plan_store.set_focus(
-        root, args.plan_id, args.task_id, status=getattr(args, "status", None)
-    )
-    if getattr(args, "json", False):
-        _plan_dump(args, result)
-        return 0
-    if not result["changes"]:
-        print(f"{result['plan']}: 当前焦点 already {result['focus'] or '无'}")
-        return 0
-    for change in result["changes"]:
-        print(f"{result['plan']}: {change['field']}  {change['old']} -> {change['new']}")
-    return 0
-
-
-def cmd_plan_sync(args, storage: Storage) -> int:
-    """Fold run facts back into the index. Dry by default: rewriting a file the
-    human wrote is the one thing here not undone by typing a command, so it
-    takes an explicit --write."""
-    root = _plans_dir(args, storage)
-    want = getattr(args, "plan_id", None)
-    write = getattr(args, "write", False)
-    renumber = getattr(args, "renumber", False)
-
-    reports = []
-    for plan in plan_store.load_all(root):
-        if want and plan["id"] != want:
-            continue
-        derived = plan_store.derive_from_runs(storage, plan["id"])
-        text, changes = plan_store.sync(plan, derived, renumber=renumber)
-        if changes and write:
-            plan_store.save(root, plan["id"], text)
-        reports.append({"plan": plan["id"], "changes": changes,
-                        "written": bool(changes) and write})
-
-    if want and not reports:
-        print(f"no plan {want!r} in {root}", file=sys.stderr)
-        return 2
-    if getattr(args, "json", False):
-        _plan_dump(args, {"dir": root, "write": write, "plans": reports})
-        return 0
-
-    if not any(r["changes"] for r in reports):
-        print(f"plan sync: nothing to do ({len(reports)} plan(s) checked)")
-        return 0
-    for report in reports:
-        if not report["changes"]:
-            continue
-        verb = "wrote" if report["written"] else "would write"
-        print(f"{report['plan']} ({verb} {len(report['changes'])} change(s)):")
-        for change in report["changes"]:
-            run = f"   [run {change['run_id']}]" if change.get("run_id") else ""
-            print(f"  - {change['field']}: {change['old']} -> {change['new']}{run}")
-    if not write:
-        print("(dry run - add --write to apply)")
-    return 0
-
-
 # ---- argparse wiring -----------------------------------------------------
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="aiwf", description="Schema-driven AI workflow engine")
@@ -1310,7 +918,9 @@ def build_parser() -> argparse.ArgumentParser:
                     help="validate all definitions and the subflow call graph")
     pv.set_defaults(func=cmd_validate)
 
-    sub.add_parser("workflows", help="list saved workflows").set_defaults(func=cmd_workflows)
+    pw = sub.add_parser("workflows", help="list saved workflows")
+    pw.add_argument("--json", action="store_true")
+    pw.set_defaults(func=cmd_workflows)
 
     pr = sub.add_parser("run", help="start a workflow run; prints first spec")
     pr.add_argument("workflow_id")
@@ -1439,6 +1049,7 @@ def build_parser() -> argparse.ArgumentParser:
     rl.add_argument("workflow_id", nargs="?")
     rl.add_argument("--status", choices=["running", "completed", "failed"])
     rl.add_argument("--all", action="store_true", help="include nested child runs")
+    rl.add_argument("--json", action="store_true")
     rl.set_defaults(func=cmd_runs_list)
 
     rs = rsub.add_parser(
@@ -1508,146 +1119,6 @@ def build_parser() -> argparse.ArgumentParser:
     wx = wsub.add_parser("index", parents=[wf_parent],
                          help="regenerate library/INDEX.md from metadata")
     wx.set_defaults(func=cmd_wf_index)
-
-    # ---- inbox: project-level parking, deliberately unrelated to runs ----
-    inbox_parent = argparse.ArgumentParser(add_help=False)
-    inbox_parent.add_argument("--json", action="store_true",
-                              help="machine-readable output")
-
-    pin = sub.add_parser("inbox", help="park thoughts/problems without blocking current work")
-    isub = pin.add_subparsers(dest="inbox_command", required=True)
-
-    ia = isub.add_parser("add", parents=[inbox_parent],
-                         help="park one item (refuses an item with no 为何停放)")
-    ia.add_argument("text", nargs="+", help="what to park; keep it under 500 chars")
-    ia.add_argument("--why", required=True,
-                    help="为何停放: " + " / ".join(inbox_store.PARK_REASONS))
-    ia.add_argument("--type", default="想法", choices=inbox_store.TYPES)
-    ia.add_argument("--source", help="where it came from, free text (default: 对话)")
-    ia.add_argument("--run", help="source run id (recorded only; not validated)")
-    ia.add_argument("--node", help="source node id (recorded only)")
-    ia.add_argument("--merge-into", metavar="INB-NNN",
-                    help="fold into an existing open item instead of a new id")
-    ia.add_argument("--split-from", metavar="INB-NNN",
-                    help="this item was split out of that one")
-    ia.add_argument("--related", metavar="INB-NNN")
-    ia.add_argument("--note", help="one extra line of context")
-    ia.add_argument("--note-file", help="read the extra context from a file (utf-8)")
-    ia.set_defaults(func=cmd_inbox_add)
-
-    il = isub.add_parser("list", parents=[inbox_parent],
-                         help="open items (never reads history unless --all)")
-    il.add_argument("--all", action="store_true", help="also show archived items")
-    il.add_argument("--type", choices=inbox_store.TYPES)
-    il.add_argument("--run", help="only items whose 来源 mentions this run id")
-    il.set_defaults(func=cmd_inbox_list)
-
-    ish = isub.add_parser("show", parents=[inbox_parent], help="print one item")
-    ish.add_argument("entry_id", metavar="INB-NNN")
-    ish.set_defaults(func=cmd_inbox_show)
-
-    ir = isub.add_parser("resolve", parents=[inbox_parent],
-                         help="archive one item: status + history + ledger, one step")
-    ir.add_argument("entry_id", metavar="INB-NNN")
-    ir.add_argument("--status", default="已交接", choices=inbox_store.ARCHIVED)
-    ir.add_argument("--to", help="去向: where it went (handoff, not completion)")
-    ir.add_argument("--split-into", metavar="INB-NNN,INB-NNN",
-                    type=lambda s: [p.strip() for p in s.split(",") if p.strip()],
-                    help="record that the parts went to these ids (does not create them)")
-    ir.set_defaults(func=cmd_inbox_resolve)
-
-    ic = isub.add_parser("check", parents=[inbox_parent],
-                         help="verify the inbox format (read-only)")
-    ic.set_defaults(func=cmd_inbox_check)
-
-    ip = isub.add_parser("path", parents=[inbox_parent],
-                         help="print the inbox directory")
-    ip.set_defaults(func=cmd_inbox_path)
-
-    # ---- plan: project-level long-running task list ----------------------
-    plan_parent = argparse.ArgumentParser(add_help=False)
-    plan_parent.add_argument("--json", action="store_true",
-                             help="machine-readable output")
-    plan_parent.add_argument("--dir", metavar="PATH",
-                             help="plans directory (default: <AIWF_HOME>/plans, "
-                                  "i.e. .aiwf/plans)")
-
-    pp = sub.add_parser("plan", help="long-running task lists (goals, tasks, deps)")
-    psub = pp.add_subparsers(dest="plan_command", required=True)
-
-    ppl = psub.add_parser("list", parents=[plan_parent],
-                          help="every plan with status, progress and focus")
-    ppl.set_defaults(func=cmd_plan_list)
-
-    pps = psub.add_parser("show", parents=[plan_parent],
-                          help="one plan: goal, scope, focus, tasks, backlog")
-    pps.add_argument("plan_id")
-    pps.add_argument("--no-runs", action="store_true",
-                     help="skip deriving status from run records")
-    pps.set_defaults(func=cmd_plan_show)
-
-    ppc = psub.add_parser("check", parents=[plan_parent],
-                          help="verify status vocabulary and dependency graph")
-    ppc.add_argument("plan_id", nargs="?")
-    ppc.set_defaults(func=cmd_plan_check)
-
-    ppt = psub.add_parser("status", parents=[plan_parent],
-                          help="status derived from runs vs the document")
-    ppt.add_argument("plan_id", nargs="?")
-    ppt.set_defaults(func=cmd_plan_status)
-
-    ppp = psub.add_parser("path", parents=[plan_parent],
-                          help="print the plans directory")
-    ppp.set_defaults(func=cmd_plan_path)
-
-    ppn = psub.add_parser("new", parents=[plan_parent],
-                          help="create an empty plan (goal + scope)")
-    ppn.add_argument("plan_id")
-    ppn.add_argument("--goal", required=True, metavar="TEXT",
-                     help="what the plan is for (the required 目标 field)")
-    ppn.add_argument("--scope", required=True, metavar="TEXT",
-                     help="what is in and out of scope (the required 范围 field)")
-    ppn.add_argument("--name", metavar="TEXT", help="title (default: the plan id)")
-    ppn.add_argument("--status", default="规划中",
-                     choices=list(plan_store.PLAN_STATUSES))
-    ppn.add_argument("--game", metavar="NAME", help="value for the 游戏 field")
-    ppn.set_defaults(func=cmd_plan_new)
-
-    pptask = psub.add_parser("task", help="edit the task list")
-    ptask_sub = pptask.add_subparsers(dest="task_command", required=True)
-
-    pta = ptask_sub.add_parser("add", parents=[plan_parent],
-                               help="append one task row")
-    pta.add_argument("plan_id")
-    pta.add_argument("task_id", help="TASK-NNN")
-    pta.add_argument("--name", required=True, metavar="TEXT",
-                     help="the ｜名称｜ column")
-    pta.add_argument("--status", default="待开始",
-                     choices=list(plan_store.TASK_STATUSES))
-    pta.add_argument("--deps", metavar="IDS",
-                     help="dependencies, e.g. TASK-001,TASK-002 or TASK-003～005")
-    pta.add_argument("--note", metavar="TEXT",
-                     help="extra ｜…｜ segment after the dependencies")
-    pta.add_argument("--no-link", action="store_true",
-                     help="write a bare id, not [TASK-NNN](tasks/TASK-NNN.md)")
-    pta.set_defaults(func=cmd_plan_task_add)
-
-    ppf = psub.add_parser("focus", parents=[plan_parent],
-                          help="point the plan at a task, or at none")
-    ppf.add_argument("plan_id")
-    ppf.add_argument("task_id", help="TASK-NNN, or 'none'")
-    ppf.add_argument("--status", metavar="STATUS",
-                     help="override 当前状态 (default: the task's own status)")
-    ppf.set_defaults(func=cmd_plan_focus)
-
-    ppsync = psub.add_parser("sync", parents=[plan_parent],
-                             help="write run facts back into the index (dry run)")
-    ppsync.add_argument("plan_id", nargs="?")
-    ppsync.add_argument("--write", action="store_true",
-                        help="apply the changes; without it nothing is written")
-    ppsync.add_argument("--renumber", action="store_true",
-                        help="also reset the 已验收 denominator to the task count")
-    ppsync.set_defaults(func=cmd_plan_sync)
 
     return p
 

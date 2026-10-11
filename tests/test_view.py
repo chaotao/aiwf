@@ -518,5 +518,46 @@ class ViewCliTest(unittest.TestCase):
         self.assertEqual(self.storage.find_run(run_id)["status"], "completed")
 
 
+class TitleTest(unittest.TestCase):
+    """``view.title`` names *this* run, not just its workflow."""
+
+    def derive(self, title=None, inputs=None, detail=None):
+        stage = {"name": "S", "nodes": ["a"]}
+        if detail is not None:
+            stage["detail"] = detail
+        spec = {"stages": [stage]}
+        if title is not None:
+            spec["title"] = title
+        rec = record(inputs=inputs or {})
+        return view_mod.derive(workflow([task("a")], view=spec), rec)
+
+    def test_title_interpolates_inputs(self):
+        derived = self.derive("${input.project_name} · 第${input.episode}集",
+                              {"project_name": "D01", "episode": 1})
+        self.assertEqual(derived["title"], "D01 · 第1集")
+
+    def test_absent_title_is_none(self):
+        self.assertIsNone(self.derive()["title"])
+
+    def test_input_placeholder_in_a_stage_detail(self):
+        derived = self.derive(inputs={"genre": "悬疑推理"},
+                              detail="题材 ${input.genre}")
+        self.assertEqual(derived["stages"][0]["detail"], "题材 悬疑推理")
+
+    def test_unknown_input_key_renders_as_a_dash(self):
+        self.assertEqual(self.derive("x=${input.nope}", {})["title"], "x=—")
+
+    def test_title_template_is_validated(self):
+        wf = workflow([task("a")], view={"title": "${bogus.field}",
+                                         "stages": [{"name": "S", "nodes": ["a"]}]})
+        with self.assertRaises(ValueError):
+            validate_workflow(wf)
+
+    def test_a_declared_title_passes_validation(self):
+        wf = workflow([task("a")], view={"title": "${input.project_name}",
+                                         "stages": [{"name": "S", "nodes": ["a"]}]})
+        validate_workflow(wf)  # must not raise
+
+
 if __name__ == "__main__":
     unittest.main()

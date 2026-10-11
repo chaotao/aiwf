@@ -1,0 +1,379 @@
+{
+  "schema_version": "1.1",
+  "id": "std.novel-writing",
+  "name": "AI 长篇小说创作",
+  "description": "以 AI 创作为主、人工在关键节点做验收与方案选择的标准长篇小说创作流程。覆盖立项构思→世界观构建→角色设计→故事大纲→章节细纲→逐章写作→修订润色→终审定稿八个阶段，每阶段含 AI 自检与人工验收。",
+  "max_steps": 500,
+  "input_schema": {
+    "type": "object",
+    "required": ["project_dir", "genre", "theme", "target_words", "inspiration"],
+    "properties": {
+      "project_dir": {
+        "type": "string",
+        "description": "小说项目目录（绝对路径），所有创作文件存放于此"
+      },
+      "genre": {
+        "type": "string",
+        "description": "类型偏好，如科幻/奇幻/悬疑/言情/现实主义/不限"
+      },
+      "theme": {
+        "type": "string",
+        "description": "核心主题或想要探讨的命题，如'人在绝境中的道德选择'"
+      },
+      "target_words": {
+        "type": "string",
+        "description": "目标总字数，如20万；不确定可填'不限'"
+      },
+      "inspiration": {
+        "type": "string",
+        "description": "用户的初始灵感、故事种子、参考作品等；没有可填'无'"
+      }
+    }
+  },
+  "exports": {
+    "final_check": {
+      "type": "object",
+      "required": ["$file"]
+    }
+  },
+  "nodes": [
+    {
+      "id": "start",
+      "type": "start",
+      "name": "开始"
+    },
+    {
+      "id": "concept",
+      "type": "task",
+      "name": "立项构思",
+      "prompt": "你是一位资深小说策划。根据以下创作方向，构思 3 个差异化的长篇小说方案。\n\n【创作方向】\n- 类型偏好：${genre}\n- 核心主题：${theme}\n- 目标字数：${target_words}\n- 用户灵感与参考：${inspiration}\n\n【任务】\n产出 3 个在类型、基调或叙事策略上有实质差异的方案（不是同一思路的微调）。每个方案包含：\n\n1. **标题** — 暂定名，有记忆点\n2. **一句话梗概** — 谁＋在什么处境下＋要做什么＋什么阻碍＋什么代价\n3. **故事前提** — 这个故事本质上在讲什么（2—3 句）\n4. **核心冲突** — 主角的内在冲突与外在冲突分别是什么\n5. **主题陈述** — 这个故事想传达什么关于人性或世界的观察（不是说教）\n6. **基调与风格** — 整体氛围，参照 2—3 部已有作品帮助定位\n7. **预估字数** — 按故事体量估算\n8. **目标读者** — 这部小说写给谁看\n9. **独特卖点** — 同类型中这部小说凭什么吸引读者\n\n【质量要求】\n- 三个方案的 logline 都要让人想读下去\n- 每个方案的核心冲突要具体、有画面感，不能是抽象概念\n- 主题陈述要有洞察力，不是'爱能战胜一切'这类套话\n\n如收到上一轮反馈，请优先据此调整方案。\n\n将完整内容写入文件：${project_dir}/novel/concept.md\n完成后报告 JSON：{\"$file\": \"${project_dir}/novel/concept.md\"}",
+      "output": {
+        "file": "${project_dir}/novel/concept.md"
+      },
+      "output_key": "concept",
+      "check": {
+        "criteria": [
+          "三个方案在类型、基调或叙事策略上有实质差异，不是同一思路的微调",
+          "每个方案的一句话梗概包含 谁＋处境＋目标＋阻碍＋代价 五要素",
+          "每个方案的核心冲突具体、有画面感",
+          "三个 logline 都有吸引力，让人想读下去",
+          "主题陈述有洞察力，非套话"
+        ],
+        "max_attempts": 2
+      },
+      "review": {
+        "requirements": [
+          "请审阅 3 个方案；选出 1 个进入下一步（在通过理由中写明编号），或驳回提出修改方向",
+          "确认故事类型与整体基调"
+        ]
+      }
+    },
+    {
+      "id": "worldbuild",
+      "type": "task",
+      "name": "世界观构建",
+      "prompt": "你是一位世界观架构师。基于已确定的故事构思，构建完整的世界观设定。\n\n【故事构思】\n请阅读文件：${concept}\n\n【任务】\n构建以下维度的世界观，每个维度都要落到具体细节而非概念罗列：\n\n1. **地理与环境** — 主要地区、地形、气候、关键地点及其特色\n2. **历史脉络** — 影响当前故事的关键历史事件、时间线（至少 5 个里程碑）\n3. **政治与权力** — 权力结构、主要势力/阵营、它们之间的矛盾\n4. **社会与文化** — 阶层、习俗、信仰、禁忌、日常生活面貌\n5. **经济与资源** — 经济模式、关键资源、贫富分化\n6. **技术/魔法体系** — 核心规则、能力上限、使用代价、对社会的影响\n7. **关键组织** — 与故事直接相关的组织、机构、团体\n8. **矛盾与张力** — 这个世界中已存在的结构性矛盾（故事冲突的土壤）\n\n【质量要求】\n- 世界观为故事服务，不堆砌无关设定\n- 技术/魔法体系有明确规则与代价，不能万能\n- 各维度之间有因果关联，不是孤立的词条\n- 矛盾与张力直接为故事的核心冲突提供土壤\n\n如收到上一轮反馈，请优先据此调整。\n\n将完整内容写入文件：${project_dir}/novel/worldbuilding.md\n完成后报告 JSON：{\"$file\": \"${project_dir}/novel/worldbuilding.md\"}",
+      "output": {
+        "file": "${project_dir}/novel/worldbuilding.md"
+      },
+      "output_key": "worldbuild",
+      "consumes": ["concept"],
+      "check": {
+        "criteria": [
+          "地理、历史、政治、社会、经济、技术/魔法六大维度齐备",
+          "技术/魔法体系有明确规则与代价，不是万能",
+          "各维度之间有因果关联，不是孤立词条",
+          "世界观中的结构性矛盾直接为故事核心冲突服务",
+          "历史脉络有至少 5 个里程碑事件",
+          "世界观为故事提供足够的舞台，不堆砌无关设定"
+        ],
+        "max_attempts": 2
+      },
+      "review": {
+        "requirements": [
+          "世界观是否为故事提供了足够的舞台",
+          "有无内在矛盾或遗漏",
+          "技术/魔法体系的规则与代价是否清晰"
+        ]
+      }
+    },
+    {
+      "id": "characters",
+      "type": "task",
+      "name": "角色设计",
+      "prompt": "你是一位角色设计专家。基于已确定的故事构思和世界观，设计完整的角色体系。\n\n【故事构思】\n请阅读文件：${concept}\n\n【世界观设定】\n请阅读文件：${worldbuild}\n\n【任务】\n设计以下角色，每个角色都要有血有肉，不是标签堆砌：\n\n**主角**\n- 姓名、年龄、外貌（要有辨识度，不是泛泛描述）\n- 性格：3—5 个核心特质，附带行为表现而非形容词罗列\n- 背景：出身、成长经历、影响其性格的关键事件\n- 动机：想要什么（外在目标）vs 需要什么（内在需求）\n- 冲突：内在冲突（如责任 vs 自由）与外在冲突\n- 成长弧线：开头是什么人 → 经历什么转变 → 结尾成为什么人\n- 声音：说话方式、口头禅、语言风格\n- 秘密：至少一个不为人知的秘密，与情节相关\n\n**对手**\n- 与主角的对抗关系是什么\n- 对手的动机要合理，不能是为反派而反派\n- 对手在某些方面镜像或互补主角\n\n**关键配角**（3—5 个）\n- 每个配角有明确的叙事功能（导师/盟友/变数/镜像等）\n- 各有独特性格与声音，不千人一面\n- 与主角的关系有张力或层次变化\n\n**关系网**\n- 角色之间的关系图谱：谁对谁有什么态度/利益/秘密\n- 至少 3 组关系会在故事中发生转变\n\n如收到上一轮反馈，请优先据此调整。\n\n将完整内容写入文件：${project_dir}/novel/characters.md\n完成后报告 JSON：{\"$file\": \"${project_dir}/novel/characters.md\"}",
+      "output": {
+        "file": "${project_dir}/novel/characters.md"
+      },
+      "output_key": "characters",
+      "consumes": ["concept", "worldbuild"],
+      "check": {
+        "criteria": [
+          "主角有清晰的内在冲突与成长弧线",
+          "对手的动机合理，与主角形成有力对抗，不是为反派而反派",
+          "每个配角有明确的叙事功能，不冗余",
+          "角色声音各异，对话能区分说话人",
+          "关系网中有至少 3 组关系会在故事中发生转变",
+          "主角的动机（想要）与需求（需要）有明确区分"
+        ],
+        "max_attempts": 2
+      },
+      "review": {
+        "requirements": [
+          "角色是否有说服力和深度",
+          "关系网是否有戏剧张力",
+          "主角的成长弧线是否清晰且吸引人"
+        ]
+      }
+    },
+    {
+      "id": "outline",
+      "type": "task",
+      "name": "故事大纲",
+      "prompt": "你是一位故事结构专家。基于已确定的构思、世界观和角色，设计故事大纲。\n\n【故事构思】\n请阅读文件：${concept}\n\n【世界观设定】\n请阅读文件：${worldbuild}\n\n【角色设定】\n请阅读文件：${characters}\n\n【任务】\n产出 2 种不同结构方案供选择，每种包含完整的结构设计：\n\n**方案内容**\n1. **结构类型** — 三幕式 / 英雄之旅 / 多线交织 / 非线性等，说明选择理由\n2. **幕的划分** — 每幕的功能、起止点、篇幅占比\n3. **关键结构点**：\n   - 开场（日常世界）\n   - 触发事件\n   - 第一幕转折（进入新世界）\n   - 前半段上升动作（至少 3 个关键事件）\n   - 中点反转\n   - 后半段上升动作（至少 3 个关键事件）\n   - 至暗时刻\n   - 高潮\n   - 结局\n4. **因果链** — 每个事件由前一个事件导致，不是随机堆砌\n5. **风险升级** — 赌注如何逐步升高\n6. **主题回响** — 主题在哪些节点被呼应或深化\n7. **总章数** — 按故事体量估算总章数\n8. **节奏策略** — 快慢交替的大致安排\n\n两个方案要在结构类型或叙事策略上有实质差异。\n\n如收到上一轮反馈，请优先据此调整。\n\n将完整内容写入文件：${project_dir}/novel/outline.md\n完成后报告 JSON：{\"$file\": \"${project_dir}/novel/outline.md\"}",
+      "output": {
+        "file": "${project_dir}/novel/outline.md"
+      },
+      "output_key": "outline",
+      "consumes": ["concept", "worldbuild", "characters"],
+      "check": {
+        "criteria": [
+          "两个方案在结构类型或叙事策略上有实质差异",
+          "三幕划分清晰，每幕功能明确",
+          "关键结构点齐备：开场、触发事件、一幕转折、中点反转、至暗时刻、高潮、结局",
+          "因果链清晰，每个事件由前一个导致，不是随机堆砌",
+          "风险逐步升级",
+          "主题在故事节点中被呼应或深化",
+          "总章数与节奏策略合理"
+        ],
+        "max_attempts": 2
+      },
+      "review": {
+        "requirements": [
+          "审阅 2 种结构方案；选择 1 种进入章节细纲（在通过理由中写明方案编号）",
+          "确认总章数和整体节奏安排",
+          "核心结构点是否齐全且因果链自洽"
+        ]
+      }
+    },
+    {
+      "id": "chapter_plan",
+      "type": "task",
+      "name": "章节细纲",
+      "prompt": "你是一位小说结构师。基于已确定的大纲，逐章拆分场景与节拍。\n\n【故事大纲】\n请阅读文件：${outline}\n\n【角色设定】\n请阅读文件：${characters}\n\n【世界观设定】\n请阅读文件：${worldbuild}\n\n【任务】\n将大纲拆分为逐章计划，输出一个 JSON 数组写入文件。每个章节对象包含以下字段：\n\n```json\n[\n  {\n    \"number\": 1,\n    \"title\": \"章节标题\",\n    \"pov\": \"视点人物姓名\",\n    \"scenes\": [\n      {\"location\": \"地点\", \"characters\": [\"在场角色\"], \"action\": \"这一场景发生了什么\"}\n    ],\n    \"key_events\": [\"本章关键事件1\", \"关键事件2\"],\n    \"emotional_beat\": \"本章的情感基调与变化\",\n    \"opening_hook\": \"开篇钩子——用什么抓住读者\",\n    \"ending_hook\": \"章末钩子——用什么让读者翻到下一章\",\n    \"target_words\": 5000,\n    \"foreshadowing\": [\"本章埋下的伏笔\"],\n    \"payoff\": [\"本章回收的伏笔（来自前面哪章）\"],\n    \"notes\": \"写作注意事项\"\n  }\n]\n```\n\n【质量要求】\n- 每章有明确的叙事目的（推进情节/深化角色/揭示世界/制造转折），不水章\n- 节奏张弛有度：不是每章都高潮也不是都平淡\n- 章末钩子多样化（悬念/转折/情感/信息揭露），不全是同一种\n- POV 分配有意识：谁的视点最能传达这一章的戏剧性\n- 伏笔与回收有标注，不遗忘\n- 全书章数与大纲的总章数一致\n\n如收到上一轮反馈，请优先据此调整。\n\n将 JSON 数组写入文件：${project_dir}/novel/chapter-plan.json\n完成后报告 JSON：{\"$file\": \"${project_dir}/novel/chapter-plan.json\"}",
+      "output": {
+        "file": "${project_dir}/novel/chapter-plan.json"
+      },
+      "output_key": "chapter_plan",
+      "consumes": ["outline", "characters", "worldbuild"],
+      "check": {
+        "criteria": [
+          "每章有明确叙事目的，不水章",
+          "全书章数与大纲总章数一致",
+          "节奏张弛有度，不全是高潮也不全平淡",
+          "章末钩子多样化",
+          "POV 分配有戏剧性考量",
+          "伏笔与回收有标注"
+        ],
+        "max_attempts": 2
+      },
+      "review": {
+        "requirements": [
+          "章节安排是否合理",
+          "有无遗漏的情节线",
+          "节奏是否得当",
+          "伏笔与回收是否闭环"
+        ]
+      }
+    },
+    {
+      "id": "draft_chapters",
+      "type": "foreach",
+      "name": "逐章写作",
+      "items": {
+        "ref": "chapter_plan"
+      },
+      "as": "chapter",
+      "index_as": "chapter_index",
+      "outputs_key": "chapters_manifest",
+      "on_fail": "continue",
+      "inputs": {
+        "project_dir": {
+          "ref": "project_dir"
+        },
+        "concept": {
+          "ref": "concept"
+        },
+        "worldbuild": {
+          "ref": "worldbuild"
+        },
+        "characters": {
+          "ref": "characters"
+        },
+        "outline": {
+          "ref": "outline"
+        }
+      },
+      "exports": ["chapter_draft"],
+      "nodes": [
+        {
+          "id": "write_chapter",
+          "type": "task",
+          "name": "写作章节",
+          "prompt": "你是一位小说家。请根据章节计划写正文。\n\n【本章计划】\n- 第 ${chapter.number} 章：${chapter.title}\n- 视点：${chapter.pov}\n- 场景：${chapter.scenes}\n- 关键事件：${chapter.key_events}\n- 情感节拍：${chapter.emotional_beat}\n- 开篇钩子：${chapter.opening_hook}\n- 章末钩子：${chapter.ending_hook}\n- 目标字数：${chapter.target_words}\n- 伏笔：${chapter.foreshadowing}\n- 回收：${chapter.payoff}\n- 注意事项：${chapter.notes}\n\n【参考文档】\n- 世界观：请阅读文件 ${worldbuild}\n- 角色设定：请阅读文件 ${characters}\n- 故事大纲：请阅读文件 ${outline}\n\n【前文衔接】\n如需了解前文，请阅读 ${project_dir}/novel/chapters/ 目录下已有的章节文件，确保人物、情节、时间线一致。\n\n【写作要求】\n1. 严格按场景计划推进，但用细节和情感让计划活起来\n2. 场景写作：交代时空、动用五感、用行为和对话而非叙述展示角色内心\n3. 对话要有角色个性，不同人说话方式不同\n4. Show don't tell：用具体行为和细节传达情绪，不要直接写'他很伤心'\n5. 章末钩子要有力，让读者想翻下一章\n6. 字数接近目标，不水不赶\n7. 与前文保持一致：人物称呼、关系进展、已知信息、时间线\n\n如收到上一轮反馈，请优先据此调整。\n\n将正文写入文件：${project_dir}/novel/chapters/chapter-${chapter.number}.md\n完成后报告 JSON：{\"$file\": \"${project_dir}/novel/chapters/chapter-${chapter.number}.md\"}",
+          "output": {
+            "file": "${project_dir}/novel/chapters/chapter-${chapter.number}.md"
+          },
+          "output_key": "chapter_draft",
+          "check": {
+            "criteria": [
+              "本章覆盖了计划中的所有关键事件",
+              "场景有五感细节，不是纯叙述",
+              "对话体现角色个性，不同角色说话方式有区分",
+              "情绪用行为和细节传达，不直接贴标签",
+              "章末钩子有力",
+              "字数接近目标 ±20%",
+              "与前文一致：人物、情节、时间线无明显矛盾"
+            ],
+            "max_attempts": 2
+          },
+          "review": {
+            "requirements": [
+              "本章是否符合章节计划",
+              "文笔质量与人物对话是否有说服力",
+              "与前文是否一致"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "id": "revise",
+      "type": "task",
+      "name": "修订润色",
+      "prompt": "你是一位资深小说编辑。请通读全书初稿，进行结构性修订与行文润色。\n\n【参考文档】\n- 故事构思：请阅读文件 ${concept}\n- 世界观设定：请阅读文件 ${worldbuild}\n- 角色设定：请阅读文件 ${characters}\n- 故事大纲：请阅读文件 ${outline}\n- 章节清单（含各章文件路径）：请阅读文件 ${chapters_manifest}\n\n【任务】\n逐章修订，关注以下层面：\n\n1. **情节一致性** — 前后有无矛盾：时间线、角色已知信息、物件去向、因果链\n2. **人物一致性** — 角色性格、说话方式、关系进展是否连贯\n3. **节奏** — 有无过长的无事件段落、有无需要扩写的薄弱章节\n4. **主题深化** — 主题在关键节点是否被有效呼应\n5. **伏笔回收** — 所有伏笔是否已回收，有无遗忘\n6. **行文质量** — 消除冗余、精确用词、加强五感、消除 telling\n7. **对话打磨** — 去除说明性对话，让对话承载冲突或信息\n\n【修订方式】\n- 逐章修订，将修订后的章节写回原文件：${project_dir}/novel/chapters/chapter-NN.md\n- 不要整章重写，只改需要改的地方\n- 保持原章节的情节走向，不做破坏大纲的结构性改动\n\n【输出】\n将修订报告（逐章列出改了什么、为什么改）写入文件：${project_dir}/novel/revision-report.md\n完成后报告 JSON：{\"$file\": \"${project_dir}/novel/revision-report.md\"}",
+      "output": {
+        "file": "${project_dir}/novel/revision-report.md"
+      },
+      "output_key": "revise",
+      "consumes": [
+        "chapters_manifest",
+        "concept",
+        "worldbuild",
+        "characters",
+        "outline"
+      ],
+      "check": {
+        "criteria": [
+          "逐章修订报告完整，列出了每章的改动和理由",
+          "修订解决了情节前后矛盾",
+          "角色性格与说话方式全书连贯",
+          "所有伏笔已回收",
+          "修订后的章节文件已更新"
+        ],
+        "max_attempts": 2
+      },
+      "review": {
+        "requirements": [
+          "修订是否解决了初稿的主要问题",
+          "行文质量是否提升",
+          "有无遗漏的情节漏洞"
+        ]
+      }
+    },
+    {
+      "id": "final_check",
+      "type": "task",
+      "name": "终审校验",
+      "prompt": "你是一位终审编辑。请对全书做最终一致性校验，产出终审报告。\n\n【参考文档】\n- 故事构思：请阅读文件 ${concept}\n- 世界观设定：请阅读文件 ${worldbuild}\n- 角色设定：请阅读文件 ${characters}\n- 故事大纲：请阅读文件 ${outline}\n- 修订报告：请阅读文件 ${revise}\n- 章节清单（含各章文件路径）：请阅读文件 ${chapters_manifest}\n\n【任务】\n通读全书，逐项检查以下清单，每项给出 PASS 或 FAIL 并附具体位置：\n\n1. **时间线** — 全书事件的时间顺序是否自洽\n2. **角色细节** — 姓名、年龄、外貌、关系前后是否一致\n3. **世界观规则** — 有无违反已建立的规则\n4. **伏笔/回收** — 每条伏笔是否都有对应回收\n5. **人物弧线** — 主角的成长弧线是否完成\n6. **核心冲突** — 高潮是否解决了核心冲突\n7. **主题呼应** — 主题在结尾是否得到回应\n8. **章末钩子** — 每章末是否有有效钩子\n9. **遗留线索** — 有无提起但未解决的线索\n\n【输出】\n将终审报告写入文件：${project_dir}/novel/final-report.md\n报告末尾给出全书结论：PASS（可定稿）或 REVISE（需返工）并列出待修项。\n完成后报告 JSON：{\"$file\": \"${project_dir}/novel/final-report.md\"}",
+      "output": {
+        "file": "${project_dir}/novel/final-report.md"
+      },
+      "output_key": "final_check",
+      "consumes": [
+        "revise",
+        "chapters_manifest",
+        "concept",
+        "worldbuild",
+        "characters",
+        "outline"
+      ],
+      "check": {
+        "criteria": [
+          "9 项检查清单逐项给出 PASS/FAIL 并附具体位置",
+          "时间线全过自洽",
+          "角色细节全书一致",
+          "所有伏笔回收",
+          "主角弧线完成，核心冲突在高潮解决",
+          "终审结论明确：PASS 或 REVISE"
+        ],
+        "max_attempts": 2
+      },
+      "review": {
+        "requirements": [
+          "终审报告是否覆盖全部检查项",
+          "如有 FAIL 项，待修项是否清晰可操作",
+          "全书是否达到定稿标准"
+        ]
+      }
+    },
+    {
+      "id": "end",
+      "type": "end",
+      "name": "结束"
+    }
+  ],
+  "view": {
+    "title": "${input.genre} · ${input.inspiration}",
+    "stages": [
+      {
+        "name": "立项构思",
+        "nodes": ["concept"],
+        "gate": true,
+        "detail": "AI 生成 3 个故事方案，人工选择 1 个进入下一步"
+      },
+      {
+        "name": "世界观构建",
+        "nodes": ["worldbuild"],
+        "gate": true,
+        "detail": "基于确定的构思构建世界观，人工验收"
+      },
+      {
+        "name": "角色设计",
+        "nodes": ["characters"],
+        "gate": true,
+        "detail": "设计主要角色与关系网，人工验收"
+      },
+      {
+        "name": "故事大纲",
+        "nodes": ["outline"],
+        "gate": true,
+        "detail": "设计 2 种结构方案，人工选择 1 种"
+      },
+      {
+        "name": "章节细纲",
+        "nodes": ["chapter_plan"],
+        "gate": true,
+        "detail": "逐章拆分场景与节拍，人工验收"
+      },
+      {
+        "name": "逐章写作",
+        "nodes": ["draft_chapters"],
+        "gate": true,
+        "detail": "逐章写正文，每章 AI 自检 + 人工验收"
+      },
+      {
+        "name": "修订润色",
+        "nodes": ["revise"],
+        "gate": true,
+        "detail": "全文修订：一致性、节奏、文笔，人工验收"
+      },
+      {
+        "name": "终审定稿",
+        "nodes": ["final_check"],
+        "gate": true,
+        "detail": "9 项终审清单，人工终审定稿"
+      }
+    ]
+  }
+}

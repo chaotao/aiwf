@@ -39,7 +39,9 @@ STAGE_STATUSES = ("done", "active", "waiting", "failed", "pending")
 
 #: Placeholder roots a definition may use. ``item`` is only legal inside
 #: ``view.items.label`` -- a stage detail has no single item to point at.
-NOTE_ROOTS = ("node", "loop", "item", "phase", "status", "run")
+#: ``input`` exposes the run's ``inputs`` mapping, so a view can name *this*
+#: run (``${input.project_name}``) rather than only its workflow.
+NOTE_ROOTS = ("node", "loop", "item", "phase", "status", "run", "input")
 
 #: Fields the engine precomputes for a foreach stage. Deliberately scalars:
 #: the template concatenates them, it does not do arithmetic on them.
@@ -91,6 +93,10 @@ def _resolve(key: str, ctx: Dict[str, Any]):
         if not rest:
             return ctx.get(root)
         return _dotted(ctx.get(root), rest)
+    if root == "input":
+        if not rest:
+            return ctx.get("input")
+        return _dotted(ctx.get("input"), rest)
     return ctx.get(root)
 
 
@@ -400,6 +406,7 @@ def derive(
 
     order = {n["id"]: i for i, n in enumerate(workflow.get("nodes") or [])}
     nodes_ctx = _node_context(record)
+    inputs = record.get("inputs") or {}
     state = record.get("subflow_state") or {}
     loop = _loop_context(state, record, spec, storage)
 
@@ -412,6 +419,7 @@ def derive(
             "phase": record.get("phase"),
             "status": record.get("status"),
             "run": record,
+            "input": inputs,
         }
         status = stage_status(stage, record, order)
         action = None
@@ -440,9 +448,19 @@ def derive(
             )
         stages.append(entry)
 
+    title = None
+    if spec.get("title"):
+        title = interpolate(spec["title"], {
+            "input": inputs,
+            "phase": record.get("phase"),
+            "status": record.get("status"),
+            "run": record,
+        })
+
     return {
         "run_id": record.get("run_id"),
         "workflow_id": record.get("workflow_id"),
+        "title": title,
         "status": record.get("status"),
         "phase": record.get("phase"),
         "stages": stages,

@@ -6,17 +6,6 @@
       runs/<workflow_id>/<run_id>/record.json       # top-level run record
       runs/<workflow_id>/<run_id>/context.md        # auto-generated sharing hub
       runs/<workflow_id>/<run_id>/record.log.jsonl  # delta journal (absent at rest)
-      inbox/inbox.md                                # parked items (open only)
-      inbox/history.md                              # parked items, archived
-      inbox/notes/INB-NNN.md                         # optional item detail
-      plans/<plan_id>/index.md                      # long-running task list
-      plans/<plan_id>/context.md                    # optional stable context
-      plans/<plan_id>/tasks/TASK-NNN.md             # optional task contract
-
-The inbox is not part of run state - it is written and read by
-``aiwf inbox`` (see inbox.py) and never touched by the engine. Plans are the
-same for ``aiwf plan`` (see plan.py): a plan spans many runs, so it cannot be
-derived from any one of them.
 
 Subflow / foreach children are nested inside their parent run folder:
 
@@ -252,13 +241,6 @@ class Storage:
         self.root = root or os.getenv("AIWF_HOME", ".aiwf")
         self.workflows_dir = os.path.join(self.root, "workflows")
         self.runs_dir = os.path.join(self.root, "runs")
-        # Parked thoughts/problems. Project-level on purpose: most items are
-        # noted with no run in flight, so they outlive every run (see inbox.py).
-        self.inbox_dir = os.path.join(self.root, "inbox")
-        # Long-running task lists. Also project-level: a plan spans many runs
-        # (one task may take several), so it cannot live inside any one of them
-        # (see plan.py).
-        self.plans_dir = os.path.join(self.root, "plans")
         # run_dir -> {"prev": last persisted state, "since"/"bytes": journal size
         # since the last snapshot}. Rebuilt from disk on the next load, so a
         # miss only costs one extra full snapshot.
