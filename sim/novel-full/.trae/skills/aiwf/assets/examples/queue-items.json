@@ -1,0 +1,53 @@
+{
+  "schema_version": "1.1",
+  "id": "queue-items",
+  "name": "高阶：引擎维护的章节队列",
+  "description": "队列不是文件，而是 run 状态：`items: {\"queue\": true}` 声明；plan 节点逐条 `aiwf items add <run_id> --node chapters` 投喂、`aiwf items seal` 封口。item 的固定字段是 {id, name}，其余键随调用方拓展。",
+  "max_steps": 200,
+  "nodes": [
+    {
+      "id": "plan",
+      "type": "task",
+      "name": "排章节",
+      "prompt": "把要写的章节排成有序清单，逐条投给引擎队列，不要写清单文件：`aiwf items add <run_id> --node chapters --item '{\"id\": \"CH-001\", \"name\": \"醒来\"}'`（`--item` 可重复），全部投完后 `aiwf items seal <run_id> --node chapters` 封口。`add` 在 run 停在 awaiting_items 时会自动推进，不必额外 resume。最后把同一份清单写成给人看的大纲，输出 {$file, summary}。",
+      "output": {"file": "${run.dir}/outline.md"},
+      "output_schema": {
+        "type": "object",
+        "required": ["$file", "summary"],
+        "properties": {"$file": {"type": "string"}, "summary": {"type": "string"}}
+      },
+      "check": {
+        "criteria": ["队列条目与大纲逐项一致、无凭空增删，且队列已 seal"],
+        "max_attempts": 3
+      }
+    },
+    {
+      "id": "chapters",
+      "type": "foreach",
+      "items": {"queue": true},
+      "max_instances": 100,
+      "inputs": {"previous": {"ref": "previous"}},
+      "nodes": [
+        {
+          "id": "draft",
+          "type": "task",
+          "inputs": {"chapter": {"ref": "item"}, "previous": {"ref": "previous"}},
+          "prompt": "按 chapter 创作一章；previous 非空时先读 previous.draft 保持连续性。",
+          "output": {"file": "${run.dir}/chapter-${item.id}.md"},
+          "check": {
+            "criteria": ["本章与 chapter 标题一致", "与前章连续且冲突推进", "章尾留下钩子"],
+            "max_attempts": 3
+          }
+        }
+      ],
+      "exports": ["draft"]
+    },
+    {
+      "id": "assemble",
+      "type": "task",
+      "inputs": {"manifest": {"ref": "chapters"}},
+      "prompt": "读取 manifest 及成功项 exports.draft，按清单顺序汇总，明确任何失败项。",
+      "output": {"file": "${run.dir}/novel.md"}
+    }
+  ]
+}

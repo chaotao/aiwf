@@ -454,7 +454,7 @@ class UsabilityTest(unittest.TestCase):
 
     def test_general_novel_fixture_preserves_all_reviews(self):
         repo = Path(__file__).resolve().parents[1]
-        wf = json.loads((repo / "examples/novel-demo/.aiwf/workflows/novel-writing.json").read_text())
+        wf = json.loads((repo / "sim/novel-full/.aiwf/workflows/novel-writing.json").read_text(encoding="utf-8"))
         spec = self.start(wf, {"idea": "测试灵感"})
         reviews = []
         while spec["status"] == "running":
@@ -491,16 +491,19 @@ class UsabilityTest(unittest.TestCase):
     def test_cli_three_chapter_fixture(self):
         """Protocol fixture only: prose/checks/reviews here are simulated."""
         repo = REPO
-        wf = json.loads((repo / "sim/novel-3ch/.aiwf/workflows/novel-3ch.json").read_text())
+        wf = json.loads((repo / "sim/novel-3ch/.aiwf/workflows/novel-3ch.json").read_text(encoding="utf-8"))
         self.storage.save_workflow(wf)
         env = dict(os.environ, AIWF_HOME=self.storage.root, **CLI_ENV)
         calls = []
-        def call(command, *args):
+        def call(command, *args, expect=0):
             proc = subprocess.run([*CLI, command, *args, "--json"], env=env,
-                                  text=True, capture_output=True, check=True)
+                                  text=True, encoding="utf-8",
+                                  capture_output=True, check=False)
+            self.assertEqual(proc.returncode, expect, proc.stdout + proc.stderr)
             calls.append(command)
             return json.loads(proc.stdout)
-        spec = call("run", wf["id"], "-p", "theme=末世重生")
+        spec = call("run", wf["id"], "--title", "三章试跑",
+                    "-p", "theme=末世重生")
         root_id = spec["run_id"]
         first_revision = False
         first_path = None
@@ -534,7 +537,8 @@ class UsabilityTest(unittest.TestCase):
                     ]}
                     invalid = copy.deepcopy(output)
                     invalid["chapters"].pop()
-                    rejected = call("complete", *args, "--output", json.dumps(invalid))
+                    rejected = call("complete", *args, "--output", json.dumps(invalid),
+                                    expect=3)
                     self.assertEqual(rejected["action"]["node_id"], "plan")
                     args = (root_id, "--action", rejected["action"]["id"])
                 elif node["id"] == "draft":
@@ -557,7 +561,10 @@ class UsabilityTest(unittest.TestCase):
                     self.assertEqual(node["id"], "assemble")
                     manifest = self.storage.read_json_file(node["inputs"]["results"]["$file"])
                     self.assertEqual([i["status"] for i in manifest["items"]], ["success"] * 3)
-                    path.write_text("\n".join(Path(p).read_text() for p in chapter_paths))
+                    path.write_text(
+                        "\n".join(Path(p).read_text(encoding="utf-8") for p in chapter_paths),
+                        encoding="utf-8",
+                    )
                     output = {"$file": str(path), "total_word_count": 3240}
                 spec = call("complete", *args, "--output", json.dumps(output))
         self.assertEqual(spec["status"], "completed")
@@ -567,7 +574,7 @@ class UsabilityTest(unittest.TestCase):
         self.assertNotIn("current", calls)
         root = self.storage.find_run(root_id)
         for _, _, record_path, _ in self.storage.iter_run_files():
-            record = json.loads(Path(record_path).read_text())
+            record = json.loads(Path(record_path).read_text(encoding="utf-8"))
             for nr in record["node_runs"]:
                 self.assertLessEqual(len(json.dumps(nr["output"], ensure_ascii=False)), 2000)
         self.assertTrue((Path(self.storage.run_dir_for_record(root)) / "novel.md").is_file())
@@ -577,15 +584,18 @@ class UsabilityTest(unittest.TestCase):
         env = dict(os.environ, AIWF_HOME=self.storage.root, **CLI_ENV)
         def call(*args):
             proc = subprocess.run([*CLI, *args, "--json"], env=env,
-                                  text=True, capture_output=True, check=True)
+                                  text=True, encoding="utf-8",
+                                  capture_output=True, check=True)
             return json.loads(proc.stdout)
-        spec = call("run", "usability")
+        spec = call("run", "usability", "--title", "round trip")
         missing_action = subprocess.run(
             [*CLI, "complete", spec["run_id"], "--output", "late", "--json"],
-            env=env, text=True, capture_output=True,
+            env=env, text=True, encoding="utf-8", capture_output=True,
         )
         self.assertEqual(missing_action.returncode, 2)
-        self.assertIn("stale action", json.loads(missing_action.stdout)["error"])
+        error = json.loads(missing_action.stdout)
+        self.assertEqual(error["code"], "E_USAGE")
+        self.assertIn("missing --action", error["error"])
         self.assertEqual(missing_action.stderr, "")
         finished = call("complete", spec["run_id"], "--action", spec["action"]["id"],
                         "--output", '{"ok":true}')

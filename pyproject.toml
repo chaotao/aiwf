@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "aiwf"
 version = "0.1.0"
 description = "AI workflow engine: schema-driven JSON workflows, audited runs, CLI + agent skills"
-readme = { "type" = "text/plain", "content" = "Run engine/bin/aiwf, or see skills/ for agent usage." }
+readme = { text = "Run engine/bin/aiwf, or see skills/ for agent usage.", content-type = "text/plain" }
 requires-python = ">=3.9"
 license = { "text" = "MIT" }
 dependencies = [
@@ -21,3 +21,15 @@ package-dir = { "" = "engine" }
 
 [tool.setuptools.packages.find]
 where = ["engine"]
+
+# Runtime data the CLI resolves from the installation prefix. The source
+# checkout keeps the canonical copies; the loaders check it first, then these
+# installed locations.
+[tool.setuptools.data-files]
+"share/aiwf/schemas" = ["schemas/*.json"]
+"share/aiwf/library" = ["library/INDEX.md"]
+"share/aiwf/library/workflows" = ["library/workflows/*.json"]
+"share/aiwf/library/meta" = ["library/meta/*.json"]
+"share/aiwf/skills/aiwf" = ["skills/aiwf/SKILL.md"]
+"share/aiwf/skills/aiwf/references" = ["skills/aiwf/references/*.md"]
+"share/aiwf/skills/aiwf/assets/examples" = ["skills/aiwf/assets/examples/*.json"]

@@ -36,6 +36,7 @@ import re
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Set, Tuple
 
+from .errors import SchemaError, StaleActionError, UsageError
 from .schema import (
     _jsonschema_validate,
     node_user_input_schema,
@@ -378,6 +379,9 @@ def item_status(instance: Optional[Dict[str, Any]]) -> str:
 class WorkflowEngine:
     def __init__(self, storage: Optional[Storage] = None):
         self.storage = storage or Storage()
+        # Set by _reject_output; the CLI turns it into exit code 3. Not part of
+        # the run record: a rejection is a transient answer to one call.
+        self.last_rejection: Optional[Dict[str, Any]] = None
 
     # ---- graph helpers -----------------------------------------------
     @staticmethod
@@ -1560,7 +1564,16 @@ class WorkflowEngine:
         self,
         workflow: Dict[str, Any],
         inputs: Optional[Dict[str, Any]] = None,
+        title: Optional[str] = None,
     ) -> Dict[str, Any]:
+        """Start a top-level run.
+
+        ``title`` is the human-facing identity of *this* run -- what
+        ``aiwf runs list`` shows, and the fallback when the definition's
+        ``view.dynamic_title`` cannot be resolved yet. The CLI requires it.
+        Child records are built by :meth:`_new_child_record` instead and carry
+        none, so they fall back to their run id.
+        """
         validate_workflow(workflow)
         inputs = inputs or {}
         validate_inputs(workflow, inputs)
@@ -1573,6 +1586,7 @@ class WorkflowEngine:
             "schema_version": SCHEMA_VERSION,
             "run_id": make_run_id(),
             "workflow_id": workflow["id"],
+            **({"title": title} if title else {}),
             "status": "running",
             "phase": "executing",
             "started_at": now_iso(),
@@ -1704,13 +1718,43 @@ class WorkflowEngine:
 
     def act(self, run_id, action_id, command, **kwargs):
         """Guard an agent/human response against the current leaf identity."""
+        self.last_rejection = None
         spec = self.action_spec(run_id)
         action = spec["action"]
-        if not action or not action_id or action_id != action["id"]:
-            raise RuntimeError("missing or stale action; fetch `current --json` again")
+        root = spec["run_id"]
+        if not action:
+            raise UsageError(
+                f"run {root} is {spec.get('status')}; there is no action to report",
+                at=f"run {root}",
+                hint="read the final state with `aiwf runs show <run>`",
+                next_command=f"aiwf runs show {root}",
+            )
+        if not action_id:
+            raise UsageError(
+                f"missing --action for run {root} (current node "
+                f"{action['node_id']})",
+                at=f"run {root}, node {action['node_id']}",
+                hint=f"pass the action id from the task packet: --action {action['id']}",
+                next_command=f"aiwf current {root} --json",
+            )
+        if action_id != action["id"]:
+            raise StaleActionError(
+                f"stale action: the run moved to node {action['node_id']} "
+                f"({action['kind']})",
+                at=f"run {root}, node {action['node_id']}",
+                hint="re-read the task packet, confirm the work still matches, "
+                     "then report again",
+                next_command=f"aiwf current {root} --json",
+            )
         expected = "complete" if action["kind"] == "check" else action["kind"]
         if command not in (expected, "fail"):
-            raise RuntimeError(f"current action requires {expected}, not {command}")
+            raise UsageError(
+                f"current action requires {expected}, not {command} "
+                f"(node {action['node_id']})",
+                at=f"run {root}, node {action['node_id']}",
+                hint=f"use `{expected}` for this action",
+                next_command=f"aiwf current {root} --json",
+            )
         record = self.storage.find_run(action["run_id"])
         workflow = self.storage.load_workflow_for_record(record)
         getattr(self, command)(workflow, record["run_id"], **kwargs)
@@ -1952,7 +1996,11 @@ class WorkflowEngine:
             node = self._node(workflow, target_id)
             merged = dict(record["context"])
             merged.update(values)
-            _jsonschema_validate(merged, node_user_input_schema(node))
+            _jsonschema_validate(
+                merged, node_user_input_schema(node),
+                hint="回答不符合 user_input_schema；字段名、类型与枚举见 "
+                     "input_request，用 -p key=value 提交",
+            )
             record["context"].update(values)
             missing = self._missing_node_inputs(node, record["context"])
             self._append_event(
@@ -1980,7 +2028,8 @@ class WorkflowEngine:
         user_schema = node_user_input_schema(node)
         if user_schema:
             _jsonschema_validate(
-                {**record["context"], **values}, user_schema
+                {**record["context"], **values}, user_schema,
+                hint="回答不符合 user_input_schema；用 -p key=value 提交",
             )
         self._begin_revision(
             workflow, record,
@@ -2001,6 +2050,7 @@ class WorkflowEngine:
         model: Optional[str] = None,
         tokens: Optional[Dict[str, int]] = None,
     ) -> Dict[str, Any]:
+        self.last_rejection = None
         record = self._load_running(workflow, run_id)
         if record["phase"] == "awaiting_check":
             return self._check_result(workflow, record, output)
@@ -2052,6 +2102,10 @@ class WorkflowEngine:
         if node["type"] == "task" and node.get("output_schema"):
             try:
                 _jsonschema_validate(output, node["output_schema"])
+            except SchemaError as e:
+                return self._reject_output(
+                    workflow, record, node, ended, output, e.message
+                )
             except Exception as e:
                 return self._reject_output(
                     workflow, record, node, ended, output, str(e)
@@ -2064,9 +2118,16 @@ class WorkflowEngine:
                 or not same_file_path(path, expected)
                 or not os.path.isfile(path)
             ):
+                got = (
+                    "no $file reported" if not isinstance(path, str)
+                    else f"reported {str(path).replace(chr(92), '/')}"
+                    + ("" if os.path.isfile(path) else " (file does not exist)")
+                )
                 return self._reject_output(
                     workflow, record, node, ended, output,
-                    f"expected existing file {expected!r}, got {path!r}",
+                    f"expected existing file {str(expected).replace(chr(92), '/')}; "
+                    f"{got}",
+                    label="产物未通过文件契约",
                 )
 
         decision: Optional[Dict[str, str]] = None
@@ -2182,7 +2243,8 @@ class WorkflowEngine:
                 "verdict": {"enum": ["PASS", "REVISE"]},
                 "reason": {"type": "string", "minLength": 1},
             },
-        })
+        }, hint='check 结果必须是 {"verdict":"PASS|REVISE","reason":"非空依据"}；'
+                 "用 --verdict PASS --reason \"...\" 提交")
         if not output["reason"].strip():
             raise ValueError("check reason must not be blank")
         pending = record["pending_check"]
@@ -2218,14 +2280,27 @@ class WorkflowEngine:
         ended: datetime,
         output: Any,
         message: str,
+        label: str = "output_schema 校验未通过",
     ) -> Dict[str, Any]:
         """Audit an output that failed output_schema, feed the reason back,
         and re-enter the same node in executing phase (run stays running)."""
+        expected = None
+        if node.get("output"):
+            try:
+                expected = resolve_data(node["output"], record["context"]).get("file")
+            except Exception:
+                expected = None
+        self.last_rejection = {
+            "node_id": node["id"],
+            "expected": expected,
+            "got": file_ref_path(output),
+            "reason": message,
+        }
         record["node_runs"].append(
             self._node_run(node, record, "rejected", ended, output,
                            None, None, None)
         )
-        feedback = f"output_schema 校验未通过：{message}"
+        feedback = f"{label}：{message}"
         feedback = re.sub(r"\s+", " ", feedback).strip()[:300]
         record["last_feedback"] = feedback
         record["node_started_at"] = now_iso()

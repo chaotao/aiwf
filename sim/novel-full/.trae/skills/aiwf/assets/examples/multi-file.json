@@ -1,0 +1,40 @@
+{
+  "schema_version": "1.1",
+  "id": "multi-file",
+  "name": "短剧：剧本与分镜多文件交付",
+  "max_steps": 50,
+  "input_schema": {
+    "type": "object",
+    "required": ["idea"],
+    "properties": {"idea": {"type": "string"}}
+  },
+  "nodes": [
+    {
+      "id": "write",
+      "type": "task",
+      "inputs": {"idea": {"ref": "idea"}, "artifact_dir": "${run.dir}"},
+      "prompt": "根据 idea 写短剧剧本和对应分镜，分别保存为 artifact_dir 下 script.md 与 shots.json；核对两个文件存在并可读取，返回 script 与 shots 文件引用，并带上 title（本剧剧名）——runs list 靠它认出这次运行。",
+      "output_schema": {
+        "type": "object",
+        "required": ["script", "shots"],
+        "additionalProperties": false,
+        "properties": {
+          "script": {"type": "object", "required": ["$file"], "properties": {"$file": {"type": "string"}}},
+          "shots": {"type": "object", "required": ["$file"], "properties": {"$file": {"type": "string"}}},
+          "title": {"type": "string"}
+        }
+      }
+    },
+    {
+      "id": "accept",
+      "type": "task",
+      "inputs": {"script": {"ref": "write.script"}, "shots": {"ref": "write.shots"}},
+      "prompt": "读取剧本与分镜，核对场次和角色对应，将交付摘要写到声明文件。",
+      "output": {"file": "${run.dir}/delivery.md"},
+      "review": {"requirements": ["剧本与分镜可用于下一步制作"]}
+    }
+  ],
+  "view": {
+    "dynamic_title": "${node.write.title}"
+  }
+}

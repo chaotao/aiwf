@@ -6,11 +6,15 @@
 ## 开始与接管
 
 ```bash
-aiwf run <workflow_id> --input-file inputs.json --json
+aiwf run <workflow_id> --title "这次要做什么" --input-file inputs.json --json
 aiwf current <root_run_id> --json
 ```
 
-任务包的 `run_id` 是根运行；`action` 指向当前真实目标：
+`--title` **必填**：它认领这次运行，`aiwf runs list` 靠它辨认是哪个实例。定不出正式名字
+就给个能认出来的（「末世/重生」即可）；定义里若声明了 `view.dynamic_title`，等它引用的
+变量有值时会自动换成正式名。
+
+任务包的 `run_id` 是根运行；`action` 指向当前真实目标，`next` 直接给出下一行命令：
 
 ```json
 {
@@ -22,6 +26,10 @@ aiwf current <root_run_id> --json
     "run_id": "child-or-root-id",
     "node_id": "write",
     "kind": "complete"
+  },
+  "next": {
+    "kind": "complete",
+    "text": "aiwf complete root-id --action opaque-action-id --file \"…/chapter.md\""
   },
   "node": {
     "id": "write",
@@ -35,6 +43,7 @@ aiwf current <root_run_id> --json
 }
 ```
 
+**看到 `next.text` 就照抄执行**，不要自己从 `kind` 推命令。文本模式同样在最后打印一行 `next     : …`。
 无需查子 run 或维护调用栈；子 run_id 供审计定位。`workflow_id` 对应叶子定义，
 `root_workflow_id` 用于根运行 resume。`current` 只读；若 action.kind 为 resume，
 先分辨是不是队列在等投喂（`awaiting_items`）——是则用 `aiwf items add`，它会自动推进；
@@ -55,23 +64,28 @@ aiwf current <root_run_id> --json
 相同路径的 `$file`；引擎不会替你创建正文。别把正文粘贴进 complete。
 
 ```bash
-aiwf complete <root_run_id> --action <最新action.id> --output-file result.json --json
-aiwf complete <root_run_id> --action <最新action.id> --output '{"$file":"实际路径"}' --json
+# 单个产物文件：最常用，不需要手写 JSON
+aiwf complete <root_run_id> --action <最新action.id> --file "实际路径" --json
+# 结构化结果：写一个 JSON 文件再交（数组/对象一律走这个）
+aiwf complete <root_run_id> --action <最新action.id> --json-file result.json --json
+# 少量标量字段（值是 JSON）
+aiwf complete <root_run_id> --action <最新action.id> --set goal=短规划 --set count=3 --json
 ```
 
 有 `check` 的任务，上报作品后不会直接过关。先实际检查，再上报：
 
 ```bash
 aiwf complete <root_run_id> --action <最新action.id> \
-  --output '{"verdict":"REVISE","reason":"缺少本章要求的转折，需要补充主角选择及其代价"}' --json
+  --verdict REVISE --reason "缺少本章要求的转折，需要补充主角选择及其代价" --json
 aiwf complete <root_run_id> --action <最新action.id> \
-  --output '{"verdict":"PASS","reason":"关键事件完整，冲突推进且章尾钩子明确"}' --json
+  --verdict PASS --reason "关键事件完整，冲突推进且章尾钩子明确" --json
 ```
 
 REVISE 保持同一任务与实例，反馈自动进入下一任务包；达到 max_attempts 则失败。
 PASS 后若有 review，仍须用户批准。人工验收的拒绝开启新一轮创作与质检；
 max_steps 对整个运行继续生效。结构错误和文件不存在会留下 rejected 记录；
-按反馈修正后用新 action.id 重报。
+按反馈修正后用新 action.id 重报。**驳回时命令退出码是 3**（状态没有前进），
+不要把它当成功继续下一步。
 
 ```bash
 aiwf provide <root_run_id> --action <最新action.id> --data-file answers.json --json
@@ -81,8 +95,11 @@ aiwf review <root_run_id> --action <最新action.id> --verdict REJECT --feedback
 
 质检结论是 Agent 判断，人工 review 必须来自用户；测试夹具中的模拟审批不可用于
 真实运行。`status=completed` 才交付最终成果；failed 时查看 error 并处理原因。
-收到 stale action 不要重试旧结果，应重新 current，确认现在的任务与产物是否匹配。
+收到 stale action（退出码 4）不要重试旧结果，应重新 current，确认现在的任务与产物是否匹配。
 动作编号防顺序误报，不提供多进程并发写保护；同一根运行由一个执行者驱动。
+
+**Windows / PowerShell**：不要用 `--output '{"k":...}'`，shell 会剥掉双引号；
+统一用 `--file` / `--json-file` / `--verdict` / `--set`。`--output-file` 能读带 BOM 的 JSON。
 
 ## 临时失败与等待
 
@@ -113,14 +130,14 @@ awaiting_items 表示引擎队列在等投喂或封口，不能忙循环 resume�
 
 | 现象 | 处理 |
 |---|---|
-| complete 要求 action | 使用本次 current 返回的 action.id |
-| action stale | 重读 current，确认任务和结果匹配后再上报 |
+| complete 要求 action | 使用本次 current 返回的 action.id（`next.text` 已带） |
+| action stale（退出码 4） | 重读 current，确认任务和结果匹配后再上报 |
 | ref missing | 查实际 context；确认父子 inputs 和前置节点是否执行 |
-| 文件输出被驳回 | 检查顶层 $file、声明路径和文件存在性 |
-| 把正文传 --output-file 后解析失败 | 该参数要求结果 JSON；正文应通过 $file 引用 |
+| 文件输出被驳回（退出码 3） | 按 `rejected.expected/got` 修文件，用新 action.id 重报 |
+| 把正文传 --output-file 后解析失败 | 该参数要求结果 JSON；正文改用 `--file` |
 | PASS 后还在 awaiting_review | 等待用户结论，再用 review，不重复提交 PASS |
 | 不知道子 run 怎么切换 | 1.1 使用根 run_id，任务包直接给叶子动作 |
 | 旧 run 没有 action | 加载主入口“集成与兼容”的 1.0 协议 |
 
-状态变更和 current 使用 --json；runs show 支持 --json，
-runs list/events/search 输出文本。不要给所有子命令机械追加 --json。
+状态变更和 current 使用 `--json`；`runs show/list/events/search` 都支持 `--json`
+（文本输出仍适合人读）。`--json` 放在子命令前后都行。

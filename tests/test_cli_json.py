@@ -13,6 +13,7 @@ import tempfile
 import unittest
 
 from aiwf import Storage, WorkflowEngine
+from aiwf.cli import _cell, _clip, _display_width
 
 
 REPO = Path(__file__).resolve().parents[1]
@@ -22,7 +23,7 @@ CLI = [sys.executable, "-m", "aiwf"]
 CLI_ENV = {"PYTHONPATH": str(REPO / "engine")}
 
 RUN_COLUMNS = [
-    "started_at", "run_id", "workflow_id", "status",
+    "started_at", "run_id", "workflow_id", "title", "status",
     "duration_ms", "node_count", "parent_run",
 ]
 
@@ -51,10 +52,10 @@ class CliJsonTest(unittest.TestCase):
             capture_output=True, text=True, encoding="utf-8",
         )
 
-    def start(self):
+    def start(self, title="上线前的最后一遍检查"):
         wf = workflow()
         self.storage.save_workflow(wf)
-        return self.engine.start(wf, {})
+        return self.engine.start(wf, {}, title=title)
 
     # ---- workflows -------------------------------------------------------
     def test_workflows_json_empty_is_empty_array(self):
@@ -95,6 +96,7 @@ class CliJsonTest(unittest.TestCase):
         self.assertEqual(row["started_at"], record["started_at"])
         self.assertEqual(row["run_id"], record["run_id"])
         self.assertEqual(row["workflow_id"], record["workflow_id"])
+        self.assertEqual(row["title"], record["title"])
         self.assertEqual(row["status"], record["status"])
         self.assertEqual(row["duration_ms"], record["duration_ms"])
         self.assertEqual(row["node_count"], len(record["node_runs"]))
@@ -114,6 +116,51 @@ class CliJsonTest(unittest.TestCase):
         proc = self.cli("runs", "list")
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("jsoncheck", proc.stdout)
+
+    # ---- the title column ------------------------------------------------
+    def test_runs_list_leads_with_the_title(self):
+        """The title is what makes a listing readable at a glance, so it comes
+        first -- before the id nobody can decode."""
+        self.start("第十章 重写")
+        proc = self.cli("runs", "list")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        line = proc.stdout.strip().splitlines()[0]
+        self.assertTrue(line.startswith("第十章 重写"), line)
+        self.assertIn("jsoncheck", line)
+
+    def test_a_run_without_a_title_falls_back_to_its_run_id(self):
+        record = self.engine.start(workflow(), {})
+        proc = self.cli("runs", "list")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertTrue(
+            proc.stdout.strip().splitlines()[0].startswith(record["run_id"])
+        )
+
+    def test_a_long_title_is_clipped_without_pushing_the_columns_apart(self):
+        self.start("一个非常非常长的标题" * 4)
+        proc = self.cli("runs", "list")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        line = proc.stdout.strip().splitlines()[0]
+        self.assertIn("…", line)
+        self.assertIn("jsoncheck", line)
+
+
+class ColumnWidthTest(unittest.TestCase):
+    """Titles are routinely written in Chinese, where one glyph occupies two
+    columns: padding by ``len()`` would ragged-align every listing."""
+
+    def test_a_wide_glyph_counts_as_two_columns(self):
+        self.assertEqual(_display_width("末世"), 4)
+        self.assertEqual(_display_width("ab"), 2)
+
+    def test_a_cell_is_exactly_as_wide_as_asked_for(self):
+        for text in ("末世", "mixed 混排", "a very long latin title indeed"):
+            self.assertEqual(_display_width(_cell(text, 12)), 12)
+
+    def test_clipping_marks_what_was_lost(self):
+        self.assertEqual(_clip("abcdef", 4), "abc…")
+        self.assertEqual(_clip("abc", 4), "abc")
+        self.assertEqual(_display_width(_cell("末世重生攻略大纲", 6)), 6)
 
 
 if __name__ == "__main__":

@@ -2,6 +2,7 @@
   "schema_version": "1.1",
   "id": "subflow-parent",
   "name": "单次子工作流调用",
+  "max_steps": 50,
   "input_schema": {
     "type": "object",
     "required": ["text"],

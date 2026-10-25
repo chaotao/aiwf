@@ -1,0 +1,51 @@
+{
+  "schema_version": "1.1",
+  "id": "code-change",
+  "name": "软件开发：修复、验证与验收",
+  "max_steps": 200,
+  "input_schema": {
+    "type": "object",
+    "required": ["project_dir", "request", "conventions_file", "test_cmd"],
+    "properties": {
+      "project_dir": {"type": "string", "description": "目标项目目录（绝对路径）"},
+      "request": {"type": "string", "description": "本次改动需求"},
+      "conventions_file": {"type": "string", "description": "项目约定文件的相对路径（如 CLAUDE.md / CONTRIBUTING.md）；没有就填 \"none\""},
+      "test_cmd": {"type": "string", "description": "本项目的验证命令（如 python -m pytest -q）；没有自动化测试就填 \"none\""}
+    }
+  },
+  "nodes": [
+    {
+      "id": "fix",
+      "type": "task",
+      "inputs": {
+        "project_dir": {"ref": "project_dir"},
+        "request": {"ref": "request"},
+        "conventions_file": {"ref": "conventions_file"},
+        "test_cmd": {"ref": "test_cmd"},
+        "artifact_dir": "${run.dir}"
+      },
+      "prompt": "在 ${project_dir} 中修复下面的问题：\n${request}\n\n按以下步骤执行，每步都要落到实际动作：\n1. 读约定：约定文件为 ${conventions_file}——不是 none 就先读它，按其约定行事；是 none 就先看项目根的 README / CONTRIBUTING / docs。\n2. 定位：找出与需求直接相关的源文件，说明定位依据；不要靠猜大范围翻找。\n3. 改动：只改必要文件，保持项目现有风格，不顺手重构无关代码。\n4. 验证：执行 ${test_cmd}——是 none 就自选与改动相称的最小验证，并说明为什么选它；把真实命令与完整输出写入 artifact_dir 下的 validation.txt。\n5. 报告：返回简短 summary、相对项目路径 changed_files、validation 的真实 exit_code 与 report 文件引用；不要虚构未执行的验证。",
+      "output_schema": {
+        "type": "object",
+        "required": ["summary", "changed_files", "validation"],
+        "properties": {
+          "summary": {"type": "string", "maxLength": 160},
+          "changed_files": {"type": "array", "items": {"type": "string"}},
+          "validation": {
+            "type": "object",
+            "required": ["exit_code", "report"],
+            "properties": {
+              "exit_code": {"type": "integer"},
+              "report": {"type": "object", "required": ["$file"], "properties": {"$file": {"type": "string"}}}
+            }
+          }
+        }
+      },
+      "check": {
+        "criteria": ["修改解决了原始问题且没有无关变更", "按 test_cmd 实际执行了验证（或说明了为何不适用），验证报告文件存在且记录真实命令与结果", "validation.exit_code 为 0 且验证覆盖关键边界"],
+        "max_attempts": 3
+      },
+      "review": {"requirements": ["变更范围与验证证据满足需求"]}
+    }
+  ]
+}

@@ -15,6 +15,11 @@
     "schema_version": { "type": "string", "const": "1.0" },
     "run_id": { "type": "string" },
     "workflow_id": { "type": "string" },
+    "title": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Human-facing identity of *this* run, supplied at start (the CLI requires it). Absent on child records and on runs started before titles existed; a reader then falls back to the workflow's `view.dynamic_title`, and finally to the run id."
+    },
     "workflow_version": { "enum": ["1.0", "1.1"] },
     "activation_id": { "type": "string" },
     "pending_check": {

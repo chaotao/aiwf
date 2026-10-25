@@ -74,7 +74,7 @@ class RunDefaultsTest(unittest.TestCase):
     def cli(self, *args):
         return subprocess.run(
             [*CLI, *args], cwd=self.project, env=BASE_ENV,
-            text=True, capture_output=True,
+            text=True, encoding="utf-8", capture_output=True,
         )
 
     def context_of(self, stdout):
@@ -89,13 +89,13 @@ class RunDefaultsTest(unittest.TestCase):
 
     # ---- the problem this solves -----------------------------------------
     def test_required_inputs_still_fail_without_a_config(self):
-        result = self.cli("run", "needs-input")
+        result = self.cli("run", "needs-input", "--title", "t")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("'subject' is a required property", result.stderr)
 
     def test_config_defaults_fill_required_inputs(self):
         self.config({"run_defaults": {"subject": "from-config"}})
-        result = self.cli("run", "needs-input")
+        result = self.cli("run", "needs-input", "--title", "t")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.context_of(result.stdout)["subject"], "from-config")
 
@@ -104,7 +104,7 @@ class RunDefaultsTest(unittest.TestCase):
         self.config({"run_defaults": {
             "subject": "from-config", "criteria": "from-config",
         }})
-        result = self.cli("run", "needs-input", "-p", "subject=from-param")
+        result = self.cli("run", "needs-input", "--title", "t", "-p", "subject=from-param")
         self.assertEqual(result.returncode, 0, result.stderr)
         context = self.context_of(result.stdout)
         self.assertEqual(context["subject"], "from-param")
@@ -118,14 +118,14 @@ class RunDefaultsTest(unittest.TestCase):
         inputs = self.project / "inputs.json"
         self.write_json(inputs, {"subject": "from-file", "criteria": "from-file"})
 
-        from_file = self.cli("run", "needs-input", "--input-file", str(inputs))
+        from_file = self.cli("run", "needs-input", "--title", "t", "--input-file", str(inputs))
         self.assertEqual(from_file.returncode, 0, from_file.stderr)
         context = self.context_of(from_file.stdout)
         self.assertEqual(context["subject"], "from-file")
         self.assertEqual(context["criteria"], "from-file")
 
         param_wins = self.cli(
-            "run", "needs-input", "--input-file", str(inputs),
+            "run", "needs-input", "--title", "t", "--input-file", str(inputs),
             "-p", "subject=from-param",
         )
         self.assertEqual(param_wins.returncode, 0, param_wins.stderr)
@@ -138,7 +138,7 @@ class RunDefaultsTest(unittest.TestCase):
         self.config({"run_defaults": {
             "subject": "ok", "project_dir": "D:/somewhere", "typo_key": 1,
         }})
-        result = self.cli("run", "needs-input")
+        result = self.cli("run", "needs-input", "--title", "t")
         self.assertEqual(result.returncode, 0, result.stderr)
         context = self.context_of(result.stdout)
         self.assertEqual(context["subject"], "ok")
@@ -166,18 +166,18 @@ class RunDefaultsTest(unittest.TestCase):
         (self.project / HOME / "config.json").write_text(
             "{ not json", encoding="utf-8"
         )
-        broken = self.cli("run", "needs-input")
+        broken = self.cli("run", "needs-input", "--title", "t")
         self.assertEqual(broken.returncode, 2)
         self.assertIn("config.json", broken.stderr)
 
         self.write_json(self.project / HOME / "config.json", [1, 2])
-        wrong_shape = self.cli("run", "needs-input")
+        wrong_shape = self.cli("run", "needs-input", "--title", "t")
         self.assertEqual(wrong_shape.returncode, 2)
         self.assertIn("must contain a JSON object", wrong_shape.stderr)
 
     def test_run_defaults_must_be_an_object(self):
         self.config({"run_defaults": ["not", "a", "mapping"]})
-        result = self.cli("run", "needs-input")
+        result = self.cli("run", "needs-input", "--title", "t")
         self.assertEqual(result.returncode, 2)
         self.assertIn("run_defaults", result.stderr)
 

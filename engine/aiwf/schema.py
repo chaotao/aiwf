@@ -4,31 +4,83 @@ lightweight usage needs no heavy deps.
 import json
 import os
 import re
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
-def _default_schema_dir() -> str:
-    # engine/aiwf/schema.py -> <repo>/schemas
-    repo_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-    return os.path.join(repo_root, "schemas")
+from .errors import InstallError, SchemaError
+from .paths import data_candidates
 
 
-SCHEMA_DIR = os.getenv("AIWF_SCHEMAS_DIR", _default_schema_dir())
+def _candidate_schema_dirs():
+    """Where bundled schemas may live, best first.
+
+    A source checkout keeps them at ``<repo>/schemas``; an installed wheel
+    puts them under ``<prefix>/share/aiwf/schemas`` (see pyproject
+    data-files); a vendored layout may keep them inside the package.
+    """
+    env_dir = os.getenv("AIWF_SCHEMAS_DIR")
+    if env_dir:
+        yield env_dir
+    here = os.path.dirname(os.path.abspath(__file__))
+    yield os.path.join(here, "schemas")
+    repo_root = os.path.dirname(os.path.dirname(here))
+    yield os.path.join(repo_root, "schemas")
+    yield from data_candidates("schemas")
+
+
+def _resolve_schema_dir() -> str:
+    for candidate in _candidate_schema_dirs():
+        if os.path.isfile(os.path.join(candidate, "workflow.schema.json")):
+            return candidate
+    # Keep the checkout path so a missing installation names a useful location.
+    return os.path.join(
+        os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+        "schemas",
+    )
+
+
+SCHEMA_DIR = _resolve_schema_dir()
 
 
 def load_schema(name: str) -> Dict[str, Any]:
     path = os.path.join(SCHEMA_DIR, f"{name}.schema.json")
-    with open(path, "r", encoding="utf-8") as f:
+    if not os.path.isfile(path):
+        raise InstallError(
+            f"schema file not found: {path}",
+            hint="set AIWF_SCHEMAS_DIR to the directory holding workflow.schema.json, "
+                 "or reinstall aiwf with its bundled data",
+        )
+    with open(path, "r", encoding="utf-8-sig") as f:
         return json.load(f)
 
 
-def _jsonschema_validate(instance: Any, schema: Dict[str, Any]):
+def _jsonschema_validate(
+    instance: Any,
+    schema: Dict[str, Any],
+    *,
+    hint: Optional[str] = None,
+    where: Optional[str] = None,
+):
     try:
         import jsonschema
     except ImportError as e:  # pragma: no cover
         raise RuntimeError(
             "jsonschema is required for validation; install with `pip install jsonschema`"
         ) from e
-    jsonschema.validate(instance=instance, schema=schema)
+    try:
+        jsonschema.validate(instance=instance, schema=schema)
+    except jsonschema.ValidationError as e:
+        path = "/".join(str(part) for part in e.absolute_path)
+        if e.validator == "required":
+            # absolute_path points at the object; the useful location is the
+            # missing key itself, which jsonschema only names in the message.
+            match = re.search(r"'([^']+)' is a required property", e.message)
+            if match:
+                path = "/".join(part for part in (path, match.group(1)) if part)
+        path = path or "(root)"
+        message = f"{where}: {e.message}" if where else e.message
+        raise SchemaError(message, at=path, hint=hint) from None
+    except jsonschema.SchemaError as e:  # a broken bundled schema, not user input
+        raise RuntimeError(f"invalid bundled schema: {e.message}") from e
 
 
 def node_user_input_schema(node: Dict[str, Any]) -> Dict[str, Any]:
@@ -88,6 +140,9 @@ def _validate_view(workflow: Dict[str, Any], spec: Dict[str, Any]) -> None:
     Two invariants: every stage points at real nodes, and every node that does
     work is covered by some stage. An uncovered node would make the view lie by
     omission, which is worse than having no view at all.
+
+    Coverage is a promise only declared stages make. A view that carries just a
+    ``dynamic_title`` is naming runs, not describing the flow, so it is exempt.
     """
     from . import view as view_mod
 
@@ -102,15 +157,16 @@ def _validate_view(workflow: Dict[str, Any], spec: Dict[str, Any]) -> None:
             )
         covered.update(stage["nodes"])
 
-    required = {
-        n["id"] for n in workflow["nodes"]
-        if n["type"] in ("task", "review", "subflow", "foreach")
-    }
-    missing = sorted(required - covered)
-    if missing:
-        raise ValueError(
-            f"view must cover every task/review/subflow node; missing: {missing}"
-        )
+    if spec.get("stages"):
+        required = {
+            n["id"] for n in workflow["nodes"]
+            if n["type"] in ("task", "review", "subflow", "foreach")
+        }
+        missing = sorted(required - covered)
+        if missing:
+            raise ValueError(
+                f"view must cover every task/review/subflow node; missing: {missing}"
+            )
 
     for stage in spec.get("stages", []):
         _check_view_template(
@@ -118,8 +174,8 @@ def _validate_view(workflow: Dict[str, Any], spec: Dict[str, Any]) -> None:
             where=f"view stage {stage.get('name')!r} detail", allow_item=False,
         )
     _check_view_template(
-        spec.get("title"), known, view_mod,
-        where="view.title", allow_item=False,
+        spec.get("dynamic_title"), known, view_mod,
+        where="view.dynamic_title", allow_item=False,
     )
     _check_view_template(
         (spec.get("items") or {}).get("label"), known, view_mod,
@@ -129,7 +185,11 @@ def _validate_view(workflow: Dict[str, Any], spec: Dict[str, Any]) -> None:
 
 def validate_workflow(workflow: Dict[str, Any]) -> None:
     """Structural validation against workflow.schema.json + semantic checks."""
-    _jsonschema_validate(workflow, load_schema("workflow"))
+    _jsonschema_validate(
+        workflow, load_schema("workflow"),
+        hint="按 at 定位定义字段（如 nodes/0/output）；字段名与类型见 "
+             "skills/aiwf/references/data-reference.md",
+    )
     if (workflow["schema_version"] == "1.1"
             and "run" in (workflow.get("input_schema") or {}).get("properties", {})):
         raise ValueError("'run' is reserved for runtime metadata")
@@ -295,7 +355,10 @@ def validate_inputs(workflow: Dict[str, Any], inputs: Dict[str, Any]) -> None:
     """Validate run inputs against the workflow's input_schema (draft-07)."""
     schema = workflow.get("input_schema")
     if schema:
-        _jsonschema_validate(inputs, schema)
+        _jsonschema_validate(
+            inputs, schema,
+            hint="启动入参不符合 input_schema；用 -p key=value 或 --input-file 补齐",
+        )
 
 
 def validate_run_record(record: Dict[str, Any]) -> None:

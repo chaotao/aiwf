@@ -223,7 +223,8 @@ def main():
         spec = cli("current", root, "--json")
         approved_tasks = done_count(root)
     else:
-        spec = cli("run", "plan-task", "--input-file", "inputs.json", "--json")
+        spec = cli("run", "plan-task", "--title", "plan-task 驱动演练",
+                   "--input-file", "inputs.json", "--json")
         root = spec["run_id"]
     print(f"run {root}")
 

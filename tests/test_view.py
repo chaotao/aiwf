@@ -442,7 +442,7 @@ class ViewCliTest(unittest.TestCase):
     def cli(self, *args):
         env = dict(os.environ, AIWF_HOME=str(self.base / ".aiwf"), **CLI_ENV)
         return subprocess.run([*CLI, *args], env=env, cwd=str(self.base),
-                              text=True, capture_output=True)
+                              text=True, encoding="utf-8", capture_output=True)
 
     def start(self, wf, complete=False):
         """A fresh run has no node_runs yet, so complete one when a test needs
@@ -489,6 +489,25 @@ class ViewCliTest(unittest.TestCase):
         self.assertEqual(proc.returncode, 1)
         self.assertIn("declares no view", proc.stderr)
 
+    def test_a_title_only_view_prints_no_empty_stage_block(self):
+        """With no stages there is nothing to render but the name -- and the
+        name already has its own line in the record table."""
+        run_id = self.start(workflow([task("a")],
+                                     view={"dynamic_title": "${run.run_id}"}))
+        proc = self.cli("runs", "show", run_id)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn(f"title      : {run_id}", proc.stdout)
+        self.assertNotIn("view       :", proc.stdout)
+
+    def test_asking_for_a_title_only_view_yields_the_title(self):
+        run_id = self.start(workflow([task("a")],
+                                     view={"dynamic_title": "${run.run_id}"}))
+        proc = self.cli("runs", "show", run_id, "--view", "--json")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        derived = json.loads(proc.stdout)
+        self.assertEqual(derived["title"], run_id)
+        self.assertEqual(derived["stages"], [])
+
     def test_the_gate_command_the_view_prints_actually_runs(self):
         """A command that looks runnable but comes back "stale action" is worse
         than printing none -- so the printed command is executed here verbatim."""
@@ -519,44 +538,122 @@ class ViewCliTest(unittest.TestCase):
 
 
 class TitleTest(unittest.TestCase):
-    """``view.title`` names *this* run, not just its workflow."""
+    """How a run is named, in priority order: ``view.dynamic_title`` once every
+    placeholder it references has a value, else the title the run was started
+    with, else the run id. A name is what every listing needs, so it never
+    comes back empty -- and never half-filled."""
 
-    def derive(self, title=None, inputs=None, detail=None):
+    def derive(self, dynamic_title=None, inputs=None, node_runs=(), detail=None,
+               **extra):
         stage = {"name": "S", "nodes": ["a"]}
         if detail is not None:
             stage["detail"] = detail
         spec = {"stages": [stage]}
-        if title is not None:
-            spec["title"] = title
-        rec = record(inputs=inputs or {})
+        if dynamic_title is not None:
+            spec["dynamic_title"] = dynamic_title
+        rec = record(node_runs=node_runs, inputs=inputs or {}, **extra)
         return view_mod.derive(workflow([task("a")], view=spec), rec)
 
-    def test_title_interpolates_inputs(self):
-        derived = self.derive("${input.project_name} · 第${input.episode}集",
-                              {"project_name": "D01", "episode": 1})
-        self.assertEqual(derived["title"], "D01 · 第1集")
+    # ---- the fall-back chain ---------------------------------------------
+    def test_the_started_title_holds_until_the_template_resolves(self):
+        derived = self.derive("${node.a.title}", title="还没定名")
+        self.assertEqual(derived["title"], "还没定名")
 
-    def test_absent_title_is_none(self):
-        self.assertIsNone(self.derive()["title"])
+    def test_a_node_output_names_the_run_once_it_exists(self):
+        derived = self.derive(
+            "${node.a.title}", title="还没定名",
+            node_runs=[node_run("a", output={"title": "第七日重生"})],
+        )
+        self.assertEqual(derived["title"], "第七日重生")
+
+    def test_a_blank_value_does_not_count_as_a_name(self):
+        derived = self.derive(
+            "${node.a.title}", title="还没定名",
+            node_runs=[node_run("a", output={"title": "   "})],
+        )
+        self.assertEqual(derived["title"], "还没定名")
+
+    def test_inputs_resolve_right_away(self):
+        derived = self.derive("${input.genre} · ${input.inspiration}",
+                              title="x",
+                              inputs={"genre": "末世", "inspiration": "重生"})
+        self.assertEqual(derived["title"], "末世 · 重生")
+
+    def test_run_fields_resolve_to_the_field_not_the_whole_record(self):
+        """``${run.<field>}`` is a documented closed set; a field reference used
+        to render the entire record as a JSON blob."""
+        self.assertEqual(self.derive("${run.workflow_id}")["title"], "w")
+        derived = self.derive(detail="run=${run.run_id}")
+        self.assertEqual(derived["stages"][0]["detail"], "run=R1")
+
+    def test_a_partly_resolved_template_is_not_used_at_all(self):
+        """Half a name is worse than the working one: one unresolvable
+        placeholder sends the whole template back to the fall-back chain."""
+        derived = self.derive("${input.genre}/x=${input.nope}", title="先这样",
+                              inputs={"genre": "末世"})
+        self.assertEqual(derived["title"], "先这样")
+
+    def test_a_run_with_no_title_at_all_falls_back_to_its_run_id(self):
+        self.assertEqual(self.derive()["title"], "R1")
+
+    def test_a_definition_need_not_declare_a_template(self):
+        self.assertEqual(self.derive(title="起个名")["title"], "起个名")
 
     def test_input_placeholder_in_a_stage_detail(self):
         derived = self.derive(inputs={"genre": "悬疑推理"},
                               detail="题材 ${input.genre}")
         self.assertEqual(derived["stages"][0]["detail"], "题材 悬疑推理")
 
-    def test_unknown_input_key_renders_as_a_dash(self):
-        self.assertEqual(self.derive("x=${input.nope}", {})["title"], "x=—")
-
-    def test_title_template_is_validated(self):
-        wf = workflow([task("a")], view={"title": "${bogus.field}",
+    # ---- validation -------------------------------------------------------
+    def test_a_dynamic_title_naming_an_unknown_node_is_rejected(self):
+        wf = workflow([task("a")], view={"dynamic_title": "${node.nope.x}",
                                          "stages": [{"name": "S", "nodes": ["a"]}]})
         with self.assertRaises(ValueError):
             validate_workflow(wf)
 
-    def test_a_declared_title_passes_validation(self):
-        wf = workflow([task("a")], view={"title": "${input.project_name}",
+    def test_a_dynamic_title_may_not_reference_queue_items(self):
+        wf = workflow([task("a")], view={"dynamic_title": "${item.name}",
                                          "stages": [{"name": "S", "nodes": ["a"]}]})
+        with self.assertRaises(ValueError):
+            validate_workflow(wf)
+
+    def test_the_retired_title_key_is_rejected(self):
+        """``title`` was retired in favour of ``dynamic_title``; a definition
+        still using it must fail loudly rather than silently lose its name."""
+        wf = workflow([task("a")], view={"title": "${input.x}",
+                                         "stages": [{"name": "S", "nodes": ["a"]}]})
+        with self.assertRaises(Exception) as caught:
+            validate_workflow(wf)
+        self.assertIn("Additional properties are not allowed", str(caught.exception))
+
+    def test_a_declared_dynamic_title_passes_validation(self):
+        wf = workflow([task("a")],
+                      view={"dynamic_title": "${input.project_name}",
+                            "stages": [{"name": "S", "nodes": ["a"]}]})
         validate_workflow(wf)  # must not raise
+
+    # ---- a title without a stage view -------------------------------------
+    def test_a_view_may_carry_only_a_title(self):
+        """A short flow has no stage vocabulary to declare, but its runs are
+        still worth naming -- so `stages` is optional while something is said.
+        Coverage is a promise only declared stages make, so it is not enforced
+        here: node ``b`` is deliberately uncovered."""
+        wf = workflow([task("a"), task("b")],
+                      view={"dynamic_title": "${node.a.title}"})
+        validate_workflow(wf)  # must not raise
+        derived = view_mod.derive(
+            wf, record(node_runs=[node_run("a", output={"title": "第七日重生"})]))
+        self.assertEqual(derived["title"], "第七日重生")
+        self.assertEqual(derived["stages"], [])
+
+    def test_a_title_only_view_still_checks_the_template(self):
+        with self.assertRaises(ValueError):
+            validate_workflow(workflow(
+                [task("a")], view={"dynamic_title": "${node.nope.x}"}))
+
+    def test_a_view_that_says_neither_stages_nor_a_title_is_rejected(self):
+        with self.assertRaises(Exception):
+            validate_workflow(workflow([task("a")], view={}))
 
 
 if __name__ == "__main__":

@@ -49,7 +49,10 @@ aiwf runs list --all                # 含子工作流实例（标注 "(of <父ru
 
 `runs list` 默认只列顶层运行；子级用 `--all` 显示。
 
-每行显示：开始时间、run_id、workflow、状态、总耗时、节点数。
+每行显示：**标题**、开始时间、run_id、workflow、状态、总耗时、节点数。标题在最前，
+它就是「这次是哪个实例」的答案（来自 `run --title`，或被定义的 `view.dynamic_title`
+取代）；标题过长的会截断并带 `…`，`--json` 里对应 `title` 字段，取的是完整值。
+仍在运行的运行耗时列显示 `-`（`--json` 里 `duration_ms` 为 null）。
 
 ## 2. 查看单次运行
 
@@ -59,7 +62,7 @@ aiwf runs show <run_id> --view                # 只看业务阶段视图（定�
 aiwf runs show <run_id> --view --json         # 同上，机器可读
 aiwf runs show <run_id> --node <node_id>      # 某节点的完整记录
 aiwf runs show <run_id> --json                # 整条记录原始 JSON
-aiwf runs events <run_id>                     # 只看事件流时间线（纯文本，不支持 --json）
+aiwf runs events <run_id> [--json]            # 事件流时间线
 ```
 
 定义声明了 `view` 时，概览**最前面**先渲染业务阶段（按节点顺序排列；阶段名、状态、
@@ -132,7 +135,7 @@ context 始终只存最新值；输入与决策的演变历史只在 events 中�
 
 ```bash
 aiwf runs search "赛博"
-aiwf runs search "revision"
+aiwf runs search "revision" --json
 ```
 
 检索范围含 workflow、状态、error、inputs、events、各节点 id/名称/摘要。

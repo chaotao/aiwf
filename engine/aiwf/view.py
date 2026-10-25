@@ -83,6 +83,21 @@ def interpolate(template: str, ctx: Dict[str, Any]) -> str:
     return PLACEHOLDER_RE.sub(lambda m: _fmt(_resolve(m.group(1), ctx)), template)
 
 
+def resolve_template(template: str, ctx: Dict[str, Any]) -> Optional[str]:
+    """The rendered template, or ``None`` when it cannot *fully* resolve.
+
+    Unlike :func:`interpolate`, which degrades one placeholder at a time, this
+    answers "is it there yet?" -- the question a title asks. A run should be
+    named after what it produced once that is knowable, and keep its working
+    identity until then, never show a half-filled ``—``.
+    """
+    for key in placeholders(template):
+        value = _resolve(key, ctx)
+        if value is None or (isinstance(value, str) and not value.strip()):
+            return None
+    return interpolate(template, ctx)
+
+
 def _resolve(key: str, ctx: Dict[str, Any]):
     root, _, rest = key.partition(".")
     if root == "node":
@@ -97,6 +112,11 @@ def _resolve(key: str, ctx: Dict[str, Any]):
         if not rest:
             return ctx.get("input")
         return _dotted(ctx.get("input"), rest)
+    # phase/status take no field, and anything else with one -- ``run.run_id``
+    # say -- is a plain lookup on that root, never the root itself: returning
+    # the whole record for a field reference used to render a JSON dump.
+    if rest:
+        return _dotted(ctx.get(root), rest)
     return ctx.get(root)
 
 
@@ -145,7 +165,7 @@ def _item_at(state: Dict[str, Any], inst: Dict[str, Any]) -> Any:
     if not path or not os.path.isfile(path):
         return None
     try:
-        with open(path, "r", encoding="utf-8") as f:
+        with open(path, "r", encoding="utf-8-sig") as f:
             items = json.load(f)
     except (OSError, ValueError):
         return None
@@ -394,14 +414,50 @@ def loop_line(loop: Dict[str, Any]) -> str:
     return line + f" · 还剩 {loop['left']}"
 
 
+# ---- run title -----------------------------------------------------------
+def run_title(
+    workflow: Optional[Dict[str, Any]], record: Dict[str, Any]
+) -> str:
+    """How *this* run is named, in priority order:
+
+    1. ``view.dynamic_title`` once every placeholder it references has a value
+       -- that is the moment a run stops being "the one I started with X" and
+       becomes named after what it actually produced (a novel's real title, an
+       accepted plan's name);
+    2. the title the run was started with, kept until then;
+    3. the run id -- for runs started before titles existed, and for child
+       records, which never carry one.
+
+    Never returns an empty string: a name is what every listing needs.
+    """
+    spec = ((workflow or {}).get("view") or {})
+    template = spec.get("dynamic_title")
+    if template:
+        rendered = resolve_template(template, {
+            "node": _node_context(record),
+            "input": record.get("inputs") or {},
+            "phase": record.get("phase"),
+            "status": record.get("status"),
+            "run": record,
+        })
+        if rendered is not None:
+            return rendered
+    return record.get("title") or record.get("run_id") or ""
+
+
 def derive(
     workflow: Optional[Dict[str, Any]], record: Dict[str, Any],
     storage: Any = None,
 ) -> Optional[Dict[str, Any]]:
-    """The whole view, or None when the definition declares none."""
+    """The whole view, or None when the definition declares none.
+
+    A definition may declare stages, a title template, or both. A title-only
+    view still derives -- with an empty stage list -- so that callers render
+    the name without having to special-case it.
+    """
     spec = ((workflow or {}).get("view") or {})
     stages_spec = spec.get("stages") or []
-    if not stages_spec:
+    if not stages_spec and not spec.get("dynamic_title"):
         return None
 
     order = {n["id"]: i for i, n in enumerate(workflow.get("nodes") or [])}
@@ -448,19 +504,10 @@ def derive(
             )
         stages.append(entry)
 
-    title = None
-    if spec.get("title"):
-        title = interpolate(spec["title"], {
-            "input": inputs,
-            "phase": record.get("phase"),
-            "status": record.get("status"),
-            "run": record,
-        })
-
     return {
         "run_id": record.get("run_id"),
         "workflow_id": record.get("workflow_id"),
-        "title": title,
+        "title": run_title(workflow, record),
         "status": record.get("status"),
         "phase": record.get("phase"),
         "stages": stages,

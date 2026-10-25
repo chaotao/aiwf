@@ -24,7 +24,7 @@ description: 创建、运行与审计 aiwf 工作流。用户要求创建或修�
 | 找完整范例；小说、短剧、游戏、修代码 | [范例目录](references/examples.md) — 演示件，选中后再读取或复制 assets 中的 JSON；可直接安装的通用模板见模板库 |
 | 启动、执行、接管、临时失败续跑 | [执行指南](references/run-workflow.md) |
 | 查看进度、记录、产物、耗时、失败原因 | [审计与检索](references/inspect-runs.md) |
-| 想知道「做到哪一步、还剩什么」而不是「哪些节点跑完了」 | [业务进展视图](references/view.md) — 定义里声明 `view` 段，`runs show` 按业务阶段渲染并给出下一步命令 |
+| 想知道「做到哪一步、还剩什么」而不是「哪些节点跑完了」 | [业务进展视图](references/view.md) — 定义里声明 `view` 段，`runs show` 按业务阶段渲染并给出下一步命令；`view.dynamic_title` 让 `runs list` 显示作品名而不是启动时的临时名 |
 
 ### 常用专题
 
@@ -50,11 +50,17 @@ description: 创建、运行与审计 aiwf 工作流。用户要求创建或修�
 - `inputs` 是材料；顶层 `input_schema` 校验启动入参；task `user_input_schema` 收集用户信息。
 - `{"ref":"key"}` 保留数据类型，`${key}` 仅文字插值；大产物落文件，结果回 `$file`。
 - 单节点输出 ≤2000 字符；优先把运行产物放 `${run.dir}`，代码修改仍落实际项目文件。
-- 使用根 run_id 和最新 `action.id` 驱动；依据 `action.kind` 选择命令，不把 phase 当命令。
+- 用根 run_id 驱动；每次照抄任务包的 `next.text`（它已带 action id 与正确参数），
+  不要自己从 `action.kind` 拼命令。
+- 交文件用 `--file`，交 check 结论用 `--verdict PASS|REVISE --reason "..."`，
+  结构化结果写 JSON 再 `--json-file`；Windows 上不要用内联 `--output '{"…"}'`。
+- 退出码：0 已前进；2 用法/入参错；3 产物被驳回（状态未变）；4 action 过期。
+  非 0 时先读 `error.code` 与 `hint`，不要重试同一条命令。
 - `check` 由 Agent 实际检查；`review` 的结论来自用户，不能自行代批。
 - 当前节点的缺陷走 `check` / `fail` / `revise`，不许绕过质检。
 - `.aiwf/runs/` 保留并纳入版本管理；交接先看 `context.md`，再 `current --json`。
 
-命令优先用本仓库启动入口：POSIX 用 `engine/bin/aiwf`，Windows 用
-`engine/bin/aiwf.cmd`；其次 PATH 的 `aiwf`，或在仓库中
-`PYTHONPATH=engine python -m aiwf`。下文统一写 `aiwf`；状态变更命令加 `--json`。
+命令入口优先级：项目内 `./bin/aiwf`（`aiwf init` 生成，固定了解释器与 engine 路径）→
+PATH 的 `aiwf` → 本仓库 `engine/bin/aiwf`（Windows `engine/bin/aiwf.cmd`）→
+`PYTHONPATH=engine python -m aiwf`。拿不准就先跑 `aiwf doctor`；
+下文统一写 `aiwf`，状态变更命令加 `--json`。

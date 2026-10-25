@@ -9,7 +9,7 @@
 | 工作流 | schema_version、id、name、nodes | 必填；新定义版本 1.1，id 与定义文件名一致 |
 | 工作流 | description | 业务说明 |
 | 工作流 | input_schema | 启动 / 子流程调用入参的 JSON Schema |
-| 工作流 | max_steps | 单次运行的推进预算，默认 50；有循环、返工时显式放大 |
+| 工作流 | max_steps | 单次运行的推进预算，默认 200；按 node_runs 条目计，有循环、返工时显式放大 |
 | 工作流 | exports | 子流程返回键 → JSON Schema 片段；省略时不返回业务 context |
 | 工作流 | default_model、edges | 模型提示、显式连线；见高阶集成指南 |
 | task | id、type、prompt | 必填；prompt 描述任务与验收目标 |
@@ -21,9 +21,9 @@
 | task | check、review | Agent 有限质检、人工验收 |
 | task | consumes、model | 补充依赖、模型提示；见高阶指南 |
 | subflow | workflow、inputs | 子定义 id、显式调用入参 |
-| foreach | items、nodes 或 workflow | 条目源、内联体或可复用子定义，二选一 |
+| foreach | items、nodes 或 workflow | 条目源（数组 / ref / `$file` / `{"queue": true}`）、内联体或可复用子定义，二选一 |
 | foreach | inputs、exports | 子级入参；内联体导出的键（数组或 Schema 映射） |
-| foreach | as、index_as、id_field | item/index 别名、稳定实例标识 |
+| foreach | as、index_as、id_field | item/index 别名、静态清单的稳定实例标识（队列模式恒用 `id`） |
 | foreach | outputs_key | 结果清单在 context 中的键，默认 foreach id，注意是复数 |
 | foreach | max_instances、on_fail | 默认最多 1000 项；失败 abort（默认）或 continue |
 | branch | when 或 prompt、routes、default | 确定性条件或 Agent 判断；见分支指南 |
@@ -82,6 +82,10 @@ ref 只查**当前运行的 context**，不查完整任务包、文件系统或�
 | foreach 子级 | item、index | 每个实例创建后；可用 as/index_as 改名 |
 | foreach 父级 inputs 映射 | previous | 第一项 null；以后为前一实例 exports 对象 |
 
+启动输入本身可以有默认来源：项目的 `.aiwf/config.json` 里 `run_defaults` 为它提供值
+（合并序 `run_defaults` → `--input-file` → `-p`，逐键覆盖；只注入定义声明过的键）。
+机制与用法见 [模板库](templates.md)。
+
 `run` 是保留键，不要用用户输入、材料键、输出键或循环别名覆盖。
 输出会更新同名 context 键，因此输入键与节点输出键应避免无意碰撞。
 循环重复执行同一节点会覆盖 context 最新值；旧值保存在审计记录。
@@ -113,6 +117,11 @@ ref 只查**当前运行的 context**，不查完整任务包、文件系统或�
 
 子流程仅得到父级显式映射的 inputs、自己的 run 元信息；
 foreach 另加当前 item/index。父级 plan、run.dir 不会整体继承。
+
+`run_defaults` 也一样：它只补**顶层 run** 的启动输入，不直注子流程。要让子流程拿到项目固有值
+（知识库路径、测试命令等），父级需**自己声明该入参**并在 subflow 节点显式映射
+`{"knowledge_dir": {"ref": "knowledge_dir"}}`。漏映射会被 `validate --project` 拦下
+（`does not map required inputs [...]`），不会静默变成空值。
 
 ```json
 {

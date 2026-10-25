@@ -66,17 +66,15 @@ task 增加：
 正常上报后，任务包进入 `action.kind=check`、`phase=awaiting_check`。
 读取 `check_request` 的实际产物与检查项，执行检查后上报：
 
-```json
-{"verdict":"REVISE","reason":"实测正文仅 620 字，低于 800 字要求"}
+```bash
+aiwf complete <run_id> --action <最新id> --verdict REVISE \
+  --reason "实测正文仅 620 字，低于 800 字要求" --json
+aiwf complete <run_id> --action <最新id> --verdict PASS \
+  --reason "按要求口径统计 986 字，关键事件与悬念均已核对" --json
 ```
 
-或：
-
-```json
-{"verdict":"PASS","reason":"按要求口径统计 986 字，关键事件与悬念均已核对"}
-```
-
-用 `complete --output-file verdict.json` 提交。reason 必须非空且说明依据。
+也可以把 `{"verdict":"…","reason":"…"}` 写进 JSON 再 `--json-file verdict.json`。
+reason 必须非空且说明依据。
 “自动”只指引擎安排检查动作，质量仍由 Agent 判断。字数、测试、资源加载等
 可测项目用工具验证，证据较长时写报告并在 reason 中指出位置。
 

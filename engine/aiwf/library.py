@@ -37,6 +37,8 @@ import os
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
+from .paths import data_candidates
+
 LEDGER_NAME = "installed.json"
 PREFIX = "std."  # naming convention for library templates; not enforced
 
@@ -52,7 +54,13 @@ def library_dir(explicit: Optional[str] = None) -> str:
     repo_root = os.path.dirname(
         os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     )
-    return os.path.join(repo_root, "library", "workflows")
+    checkout = os.path.join(repo_root, "library", "workflows")
+    if os.path.isdir(checkout):
+        return checkout
+    for candidate in data_candidates("library", "workflows"):
+        if os.path.isdir(candidate):
+            return candidate
+    return checkout
 
 
 def meta_dir(library: Optional[str] = None) -> str:
@@ -71,7 +79,7 @@ def ledger_path(storage) -> str:
 def _read_text(path: str) -> Optional[str]:
     if not os.path.isfile(path):
         return None
-    with open(path, "r", encoding="utf-8") as handle:
+    with open(path, "r", encoding="utf-8-sig") as handle:
         return handle.read()
 
 
@@ -124,7 +132,7 @@ def load_library(library: Optional[str] = None) -> Dict[str, Dict[str, Any]]:
         if not name.endswith(".json") or name.startswith("."):
             continue
         path = os.path.join(base, name)
-        with open(path, "r", encoding="utf-8") as handle:
+        with open(path, "r", encoding="utf-8-sig") as handle:
             text = handle.read()
         definition = json.loads(text)
         entry_id = definition.get("id") or name[:-5]

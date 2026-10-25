@@ -1,0 +1,110 @@
+{
+  "schema_version": "1.1",
+  "id": "novel-chapters",
+  "name": "小说：从方向到成书",
+  "max_steps": 120,
+  "input_schema": {
+    "type": "object",
+    "required": ["premise", "chapters"],
+    "properties": {
+      "premise": {
+        "type": "string",
+        "description": "题材、目标读者与基调；方向选型的依据"
+      },
+      "chapters": {
+        "type": "array",
+        "minItems": 1,
+        "maxItems": 20,
+        "items": {
+          "type": "object",
+          "required": ["number", "title"],
+          "properties": {"number": {"type": "integer", "minimum": 1}, "title": {"type": "string"}}
+        }
+      }
+    }
+  },
+  "nodes": [
+    {
+      "id": "direction",
+      "type": "task",
+      "name": "方向选型",
+      "inputs": {"premise": {"ref": "premise"}},
+      "prompt": "依据 premise 确定题材、目标读者与叙事视角，定下书名，写出不超过 200 字的创作方向，含核心卖点与差异化；报告时带上 title（本次定的书名），供 runs list 辨认这次运行。",
+      "output": {"file": "${run.dir}/premise.md"},
+      "check": {
+        "criteria": ["题材、受众、视角三项齐全", "与 premise 不矛盾", "书名已定，是作品名而不是题材名"],
+        "max_attempts": 3
+      }
+    },
+    {
+      "id": "outline",
+      "type": "task",
+      "name": "大纲",
+      "inputs": {"direction": {"ref": "direction"}, "chapters": {"ref": "chapters"}},
+      "prompt": "读取方向文件，为 chapters 列出的每一章写一段 2–3 句的剧情梗概，保证事件递进、章间无断层。",
+      "output": {"file": "${run.dir}/outline.md"},
+      "check": {
+        "criteria": ["章数与 chapters 一致", "每章梗概可独立读懂且与方向一致"],
+        "max_attempts": 3
+      }
+    },
+    {
+      "id": "characters",
+      "type": "task",
+      "name": "人物设定",
+      "inputs": {"outline": {"ref": "outline"}},
+      "prompt": "依据大纲确定主要人物：姓名、身份、动机、与主角的关系，并标明各自首次出场的章节。",
+      "output": {"file": "${run.dir}/characters.md"},
+      "check": {
+        "criteria": ["主要人物都有动机与关系", "出场章节与大纲对得上"],
+        "max_attempts": 3
+      }
+    },
+    {
+      "id": "write_chapters",
+      "type": "foreach",
+      "items": {"ref": "chapters"},
+      "id_field": "number",
+      "max_instances": 20,
+      "inputs": {"previous": {"ref": "previous"}},
+      "nodes": [
+        {
+          "id": "draft",
+          "type": "task",
+          "name": "草拟正文",
+          "inputs": {"chapter": {"ref": "item"}, "previous": {"ref": "previous"}},
+          "prompt": "按 chapter 创作正文，汉字数 800–1200，不计标点与空白；遵循已定大纲与人物设定，previous 非空时读取 previous.draft 文件，保持事件与人物连续。",
+          "output": {"file": "${run.dir}/chapter-${item.number}.md"},
+          "check": {
+            "criteria": ["实测正文汉字数在 800–1200 之间", "与前章连续且本章冲突推进"],
+            "max_attempts": 3
+          }
+        }
+      ],
+      "exports": ["draft"]
+    },
+    {
+      "id": "assemble",
+      "type": "task",
+      "inputs": {"manifest": {"ref": "write_chapters"}},
+      "prompt": "读取 manifest 文件，确认每项 success，按清单顺序读取 exports.draft 并合并；若存在失败项明确报告。",
+      "output": {"file": "${run.dir}/novel.md"},
+      "review": {"requirements": ["全书连续、章节齐全，可以交付"]}
+    }
+  ],
+  "view": {
+    "dynamic_title": "${node.direction.title}",
+    "stages": [
+      {"name": "方向选型", "nodes": ["direction"]},
+      {"name": "大纲", "nodes": ["outline"]},
+      {"name": "人物设定", "nodes": ["characters"]},
+      {
+        "name": "逐章创作",
+        "nodes": ["write_chapters"],
+        "detail": "已完成 ${loop.done}/${loop.total} 章，还剩 ${loop.left} 章"
+      },
+      {"name": "全书合稿", "nodes": ["assemble"], "gate": true}
+    ],
+    "items": {"label": "第 ${item.number} 章 ${item.title}"}
+  }
+}

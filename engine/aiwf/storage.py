@@ -196,7 +196,7 @@ def _iter_journal(path: str) -> Iterator[Dict[str, Any]]:
     """Yield logged ops in order, skipping a torn final line left by a crash
     in the middle of an append."""
     try:
-        handle = open(path, "r", encoding="utf-8")
+        handle = open(path, "r", encoding="utf-8-sig")
     except OSError:
         return
     with handle:
@@ -304,7 +304,7 @@ class Storage:
                 f"workflow {workflow_id!r} not found at {path}; "
                 f"run `aiwf init` and create it first"
             )
-        with open(path, "r", encoding="utf-8") as f:
+        with open(path, "r", encoding="utf-8-sig") as f:
             return json.load(f)
 
     def save_workflow(self, workflow: Dict[str, Any]) -> str:
@@ -456,7 +456,7 @@ class Storage:
         """Read a run record: its snapshot plus every delta logged since.
         ``cache`` keeps a copy for delta computation and is only worth it when
         this record is about to be saved."""
-        with open(path, "r", encoding="utf-8") as f:
+        with open(path, "r", encoding="utf-8-sig") as f:
             record = json.load(f)
         run_dir = os.path.dirname(path)
         for ops in _iter_journal(self.journal_path(run_dir)):
@@ -479,7 +479,7 @@ class Storage:
         if not os.path.isfile(path):
             return None
         try:
-            with open(path, "r", encoding="utf-8") as f:
+            with open(path, "r", encoding="utf-8-sig") as f:
                 return f.read()
         except OSError:
             return None
@@ -513,7 +513,7 @@ class Storage:
                 continue
             path = os.path.join(dirpath, "record.json")
             try:
-                with open(path, "r", encoding="utf-8") as f:
+                with open(path, "r", encoding="utf-8-sig") as f:
                     record = json.load(f)
             except (OSError, ValueError):
                 continue
@@ -560,7 +560,7 @@ class Storage:
             )
             path = os.path.normpath(path)
             if os.path.exists(path):
-                with open(path, "r", encoding="utf-8") as f:
+                with open(path, "r", encoding="utf-8-sig") as f:
                     return json.load(f)
         raise FileNotFoundError(
             f"workflow definition for run {record['run_id']!r} not found"
@@ -568,7 +568,7 @@ class Storage:
 
     # ---- JSON helper for engine-managed protocol files ---------------
     def read_json_file(self, path: str) -> Any:
-        with open(path, "r", encoding="utf-8") as f:
+        with open(path, "r", encoding="utf-8-sig") as f:
             return json.load(f)
 
     def write_json_file(self, path: str, value: Any) -> str:

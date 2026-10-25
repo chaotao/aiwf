@@ -51,19 +51,22 @@
     },
     "view": {
       "$ref": "#/$defs/view",
-      "description": "Optional business-stage view. Purely presentational: it is derived from the run record on every read and never changes execution."
+      "description": "Optional presentation layer. Purely presentational: it is derived from the run record on every read and never changes execution. It may declare business stages, a run-title template, or both."
     }
   },
   "$defs": {
     "view": {
       "type": "object",
-      "description": "How this workflow's nodes map onto the stages a human cares about. Without it, `aiwf runs show` prints the raw node stream only.",
+      "description": "The presentation layer: which stages a human cares about, and/or the template that names this run. Declare `stages` to render business stages in `aiwf runs show`; declare `dynamic_title` when the run should end up named after what it produced. Either one is enough -- a short workflow with no stage vocabulary can still name its runs. With neither, `aiwf runs show` prints the raw node stream only.",
       "additionalProperties": false,
-      "required": ["stages"],
+      "anyOf": [
+        { "required": ["stages"] },
+        { "required": ["dynamic_title"] }
+      ],
       "properties": {
-        "title": {
+        "dynamic_title": {
           "type": "string",
-          "description": "Instance-title template, so a view can name *this* run rather than only its workflow (e.g. \"${input.project_name}\"). Closed placeholder set: ${input.<key>}, ${run.<field>}, ${phase}, ${status}. Absent = no title; the reader falls back to the workflow id."
+          "description": "Instance-title template, so a view can name *this* run rather than only its workflow (e.g. \"${input.project_name}\"). Unlike a stage's `detail` it may reference ${node.<id>.<path>}, which is how a run comes to be named after what it produced (a novel's real title) rather than after how it was launched. It wins only once *every* placeholder it references has a value: until then the title the run was started with is kept, and a run with neither falls back to its run id. Closed placeholder set: ${node.<id>.<path>}, ${input.<key>}, ${run.<field>}, ${phase}, ${status}."
         },
         "stages": {
           "type": "array",

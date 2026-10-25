@@ -1,24 +1,40 @@
 # 审计 / 检索工作流运行记录
 
-1.1 的 `current <根run_id> --json` 是只读叶子任务包；`runs show` 仍读取指定
-run 的原始记录。`workflow.json` 是该运行的定义快照，修改源定义不会改写快照。
+1.1 的 `current <根run_id> --json` 是只读叶子任务包；`runs show` 读取指定 run 的
+完整记录（快照 + 回放增量日志）。`workflow.json` 是该运行的定义快照，修改源定义
+不会改写快照。
 `check_requested/check_decided` 记录 Agent 质检次数、原始输入/输出、理由、起始时间、
 耗时和摘要；`review_decided` 记录人工结论，两者不得混淆。
 
 所有执行记录都在 `.aiwf/runs/<workflow_id>/<run_id>/` 下：**每次运行一个独立
-文件夹**，含 `record.json`（审计记录）与 `context.md`（自动生成的共享上下文）。
-同一工作流多次执行各自成目录，每次状态变更立即落盘。记录分两层：**events
-事件流**（用户输入、验收、修订的全过程）和 **node_runs 节点执行记录**。
+文件夹**，含 `record.json`（审计记录）、`context.md`（自动生成的共享上下文）
+与 `record.log.jsonl`（增量日志）。同一工作流多次执行各自成目录，每次状态变更
+立即落盘。记录分两层：**events 事件流**（用户输入、验收、修订的全过程）和
+**node_runs 节点执行记录**。
+
+`record.json` 是快照，`record.log.jsonl` 是它之后每次状态变更的一行增量；
+引擎每 64 次落盘（或运行结束时）重写一次快照并清空日志。因此**运行中**的
+`record.json` 最多落后日志 64 次变更，**运行结束后必然与全量状态一致**。
+自己读盘时不要只读 `record.json`：用 `runs show/events/search` 或
+`storage.load_record()`，它们会自动回放日志；直接读文件只在运行已结束可靠。
 
 **子工作流记录嵌套在父运行目录内**，不另开顶层目录：
 
 ```
 runs/<父wf>/<父rid>/
   record.json, context.md, workflow.json  # 1.1 定义快照
+  record.log.jsonl                         # 快照之后的增量日志
+  foreach-<node>-items.json                # foreach 条目快照（只读）
   foreach-<node>-results.json              # foreach 实例结果清单
   children/<node>/subflow.json             # 内联 nodes 合成的子流程定义
   children/<node>/<instance>/record.json   # 每个实例一份子记录（single 固定 "0"）
+  children/<node>/<instance>/record.log.jsonl
 ```
+
+引擎队列（`items: {"queue": true}`）**没有清单文件**：队列本体是记录顶层的
+`queues` 字段（`queues.<节点 id>` = `{items, done}`）——运行中它可能还在
+`record.log.jsonl` 增量里、尚未并进快照，读权威值请用 `runs show --json`。
+`foreach-<node>-items.json` 只是它的只读快照，改快照无效。
 
 子记录的 `parent` 字段指向父 run 与节点；查找时引擎沿该链定位。
 
@@ -33,16 +49,26 @@ aiwf runs list --all                # 含子工作流实例（标注 "(of <父ru
 
 `runs list` 默认只列顶层运行；子级用 `--all` 显示。
 
-每行显示：开始时间、run_id、workflow、状态、总耗时、节点数。
+每行显示：**标题**、开始时间、run_id、workflow、状态、总耗时、节点数。标题在最前，
+它就是「这次是哪个实例」的答案（来自 `run --title`，或被定义的 `view.dynamic_title`
+取代）；标题过长的会截断并带 `…`，`--json` 里对应 `title` 字段，取的是完整值。
+仍在运行的运行耗时列显示 `-`（`--json` 里 `duration_ms` 为 null）。
 
 ## 2. 查看单次运行
 
 ```bash
-aiwf runs show <run_id>                       # 概览：节点耗时与摘要
+aiwf runs show <run_id>                       # 概览：业务阶段视图 + 节点耗时与摘要
+aiwf runs show <run_id> --view                # 只看业务阶段视图（定义声明了 view 时）
+aiwf runs show <run_id> --view --json         # 同上，机器可读
 aiwf runs show <run_id> --node <node_id>      # 某节点的完整记录
 aiwf runs show <run_id> --json                # 整条记录原始 JSON
-aiwf runs events <run_id>                     # 只看事件流时间线（纯文本，不支持 --json）
+aiwf runs events <run_id> [--json]            # 事件流时间线
 ```
+
+定义声明了 `view` 时，概览**最前面**先渲染业务阶段（按节点顺序排列；阶段名、状态、
+结论，卡住时连该敲的命令一起给出），循环阶段的队列条目**缩进在所属阶段下面**，
+再是节点流水，最后是实例表；`--view` 只看这一层。
+字段、占位符与默认渲染见 [业务进展视图](view.md)。
 
 父运行含 subflow/foreach 节点时，概览额外列出**实例表**：实例 key、状态、
 exports 摘要、子 run_id 与记录目录；单实例细节用 `runs show <child_run_id>`。
@@ -75,7 +101,9 @@ exports 摘要、子 run_id 与记录目录；单实例细节用 `runs show <chi
 `parent`（子记录专用：父 workflow/run/node/instance）、`subflow_state`（父记录
 专用：每个 subflow/foreach 节点的 kind、items_mode、done、instances 列表）。
 1.1 额外有 `workflow_version` 和 `pending_check`；foreach 的 `items_snapshot`
-指向本次运行使用的清单快照。输出文件存在不代表内容已通过业务检查。
+指向本次运行使用的条目快照（队列模式随每次投喂重写）。输出文件存在不代表内容已通过业务检查。
+顶层 `queues` 只在定义里出现 `items: {"queue": true}` 时才有，
+存 `{items, done}`（`done` 即封口），改动一律经 `aiwf items`。
 
 ## 3. events 事件流
 
@@ -96,6 +124,10 @@ exports 摘要、子 run_id 与记录目录；单实例细节用 `runs show <chi
 | `subflow_started` | 实例启动（含 instance、child_run_id） |
 | `instance_completed` / `instance_failed` | 实例结束（含 exports 快照 / error） |
 | `instance_redone` | redo 重开单个实例（含 reason） |
+| `queue_items_added` / `queue_item_updated` / `queue_item_removed` / `queue_item_moved` / `queue_sealed` | 引擎队列的投喂与改动记账（含 node 与 items/item；`moved` 另带目标位 `to`） |
+
+队列事件只记「调用方喂了什么数据」，不改动 run 的调度位移，
+因此**不进 action 指纹**——节点给队列投喂后仍持有自己那个有效的 action。
 
 context 始终只存最新值；输入与决策的演变历史只在 events 中。
 
@@ -103,7 +135,7 @@ context 始终只存最新值；输入与决策的演变历史只在 events 中�
 
 ```bash
 aiwf runs search "赛博"
-aiwf runs search "revision"
+aiwf runs search "revision" --json
 ```
 
 检索范围含 workflow、状态、error、inputs、events、各节点 id/名称/摘要。
@@ -114,7 +146,8 @@ aiwf runs search "revision"
 与 `record.json` 同目录的 `context.md` 由引擎在每次落盘时自动重写（确定性、
 无 LLM），含：运行状态与当前节点、输入、共享上下文内联短值、**产物索引**
 （每个 `$file` 路径 + 来源节点）。产物索引递归收集：节点输出与嵌套对象/数组
-中的全部 `$file`、foreach items 源里的文件、以及所有子运行（含更深层嵌套）的
+中的全部 `$file`、foreach items 源里的文件（`{$file}` 形态；队列模式没有清单文件，
+队列是 run 状态、不进产物索引）、以及所有子运行（含更深层嵌套）的
 产物；只有 `{"$file": "..."}` 标记的路径会被收录，普通字符串路径不算。用途：
 
 - 给人看进度：不用翻 JSON，读 context.md 即知当前在哪、产物在哪；

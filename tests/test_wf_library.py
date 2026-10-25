@@ -54,7 +54,7 @@ class TemplateLibraryTest(unittest.TestCase):
             env["AIWF_LIBRARY_DIR"] = str(library_dir)
         return subprocess.run(
             [*CLI, *args], cwd=self.project, env=env,
-            text=True, capture_output=True,
+            text=True, encoding="utf-8", capture_output=True,
         )
 
     def local(self, workflow_id):

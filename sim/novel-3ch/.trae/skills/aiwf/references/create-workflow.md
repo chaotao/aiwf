@@ -61,7 +61,7 @@ Agent 执行 prompt 并写文件，再上报 `{"$file":"任务包给出的实际
 ```bash
 aiwf validate .aiwf/workflows/opening.json
 aiwf validate --project
-aiwf run opening -p idea="末世里每次重生都失去一段记忆" --json
+aiwf run opening --title "末世重生" -p idea="末世里每次重生都失去一段记忆" --json
 ```
 
 启动输入复杂时写 JSON 文件，改用 `--input-file inputs.json`。

@@ -29,10 +29,10 @@
       "type": "task",
       "name": "方向选型",
       "inputs": {"premise": {"ref": "premise"}},
-      "prompt": "依据 premise 确定题材、目标读者与叙事视角，写出不超过 200 字的创作方向，含核心卖点与差异化。",
+      "prompt": "依据 premise 确定题材、目标读者与叙事视角，定下书名，写出不超过 200 字的创作方向，含核心卖点与差异化；报告时带上 title（本次定的书名），供 runs list 辨认这次运行。",
       "output": {"file": "${run.dir}/premise.md"},
       "check": {
-        "criteria": ["题材、受众、视角三项齐全", "与 premise 不矛盾"],
+        "criteria": ["题材、受众、视角三项齐全", "与 premise 不矛盾", "书名已定，是作品名而不是题材名"],
         "max_attempts": 3
       }
     },
@@ -93,6 +93,7 @@
     }
   ],
   "view": {
+    "dynamic_title": "${node.direction.title}",
     "stages": [
       {"name": "方向选型", "nodes": ["direction"]},
       {"name": "大纲", "nodes": ["outline"]},

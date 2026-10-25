@@ -2,7 +2,7 @@
   "schema_version": "1.1",
   "id": "std.novel-writing",
   "name": "AI 长篇小说创作",
-  "description": "以 AI 创作为主、人工在关键节点做验收与方案选择的标准长篇小说创作流程。覆盖立项构思→世界观构建→角色设计→故事大纲→章节细纲→逐章写作→修订润色→终审定稿八个阶段，每阶段含 AI 自检与人工验收。",
+  "description": "以 AI 创作为主、人工在关键节点做验收与方案选择的标准长篇小说创作流程。覆盖立项构思→书名确定→世界观构建→角色设计→故事大纲→章节细纲→逐章写作→修订润色→终审定稿九个阶段，每阶段含 AI 自检与人工验收。书名由独立的 naming 节点判定、人工确认，运行中要改名就单独重做该节点（aiwf revise <run_id> --target naming --mode return），runs list 随之更新。",
   "max_steps": 500,
   "input_schema": {
     "type": "object",
@@ -65,6 +65,31 @@
         "requirements": [
           "请审阅 3 个方案；选出 1 个进入下一步（在通过理由中写明编号），或驳回提出修改方向",
           "确认故事类型与整体基调"
+        ]
+      }
+    },
+    {
+      "id": "naming",
+      "type": "task",
+      "name": "书名确定",
+      "prompt": "你负责给这本书定名。\n\n【故事构思】\n请阅读文件：${concept}\n\n【任务】\n1. 确认人工在立项门选定了哪个方案：本次运行的 `aiwf runs events <run_id>` 里最近一条 `review_decided` 的 `feedback` 写明编号；取不到就以第一个方案为准。\n2. 定下正式书名：以选定方案的暂定标题为起点，打磨成一个有记忆点的作品名——是书名，不是题材或类型标签。\n3. 把书名与一句话理由写入文件：${project_dir}/novel/title.md\n\n如收到上一轮反馈，请优先据此调整。\n\n完成后报告 JSON：{\"$file\": \"${project_dir}/novel/title.md\", \"title\": \"<正式书名>\"}",
+      "output": {
+        "file": "${project_dir}/novel/title.md"
+      },
+      "output_key": "naming",
+      "consumes": ["concept"],
+      "check": {
+        "criteria": [
+          "书名是作品名，不是题材或类型标签",
+          "与选定方案的基调一致",
+          "报告里的 title 与 title.md 中写的书名一致"
+        ],
+        "max_attempts": 2
+      },
+      "review": {
+        "requirements": [
+          "书名是否成立、有记忆点，与选定方案的基调是否一致",
+          "不满意就驳回，并写明想要的名字或调整方向——驳回会重做本节点；已跑过后续阶段时，也可以只重做定名：aiwf revise <run_id> --target naming --mode return"
         ]
       }
     },
@@ -324,13 +349,19 @@
     }
   ],
   "view": {
-    "title": "${input.genre} · ${input.inspiration}",
+    "dynamic_title": "${node.naming.title}",
     "stages": [
       {
         "name": "立项构思",
         "nodes": ["concept"],
         "gate": true,
         "detail": "AI 生成 3 个故事方案，人工选择 1 个进入下一步"
+      },
+      {
+        "name": "书名确定",
+        "nodes": ["naming"],
+        "gate": true,
+        "detail": "从人工选定的方案定下正式书名，人工确认；此后 runs list 显示书名"
       },
       {
         "name": "世界观构建",

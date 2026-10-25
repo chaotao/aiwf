@@ -31,7 +31,7 @@ class SkillExamplesTest(unittest.TestCase):
         self.engine = WorkflowEngine(self.storage)
         self.definitions = {}
         for path in EXAMPLES.glob("*.json"):
-            value = json.loads(path.read_text())
+            value = json.loads(path.read_text(encoding="utf-8"))
             if "schema_version" in value:
                 validate_workflow(value)
                 self.definitions[value["id"]] = value
@@ -53,7 +53,7 @@ class SkillExamplesTest(unittest.TestCase):
     def file(self, path, contents="Synthetic test fixture"):
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(contents)
+        path.write_text(contents, encoding="utf-8")
         return {"$file": str(path)}
 
     def result(self, spec, exit_code=0):
@@ -126,7 +126,8 @@ class SkillExamplesTest(unittest.TestCase):
         self.assertEqual(set(self.definitions), set(cases) | {"queue-items"})
         validated = subprocess.run(
             [*CLI, "validate", "--project"],
-            cwd=self.base, env=CLI_ENV, text=True, capture_output=True,
+            cwd=self.base, env=CLI_ENV, text=True, encoding="utf-8",
+            capture_output=True,
         )
         self.assertEqual(validated.returncode, 0, validated.stdout + validated.stderr)
         for name, inputs in cases.items():
