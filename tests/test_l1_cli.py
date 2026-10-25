@@ -155,6 +155,25 @@ class L1CliTest(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(len(proc.stdout.strip().splitlines()), 1)
 
+    def test_current_prefers_running_over_a_newer_finished_run(self):
+        """`current` answers "what am I working on"; `runs show` answers
+        "what happened last". With two live runs and a newer finished one, the
+        two commands must disagree."""
+        self.save(two_step())
+        self.start(title="live A")
+        live_b = self.start(title="live B")
+        finished = self.start(title="finished C")
+        first = self.artifact(finished)
+        step2 = json.loads(self.cli(
+            "complete", finished["run_id"], "--file", first, "--json").stdout)
+        second = self.artifact(step2)
+        self.cli("complete", finished["run_id"], "--file", second)
+
+        current = self.cli("current", "--json")
+        self.assertEqual(json.loads(current.stdout)["run_id"], live_b["run_id"])
+        latest = self.cli("runs", "show", "--json")
+        self.assertEqual(json.loads(latest.stdout)["run_id"], finished["run_id"])
+
     # ---- resume ----------------------------------------------------------
     def test_resume_takes_only_the_run_id(self):
         self.save(two_step())

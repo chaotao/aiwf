@@ -517,16 +517,16 @@ L3 未做：`aiwf new` 脚手架、`use` 简写、文档三件套、弱模型基
 
 ## 10. L1 实施记录（2026-10-25）
 
-L1（协议人机工程）已落地，全量 **195 passed / 20 subtests**，两种编码环境都绿。
+L1（协议人机工程）已落地，全量 **196 passed / 20 subtests**，两种编码环境都绿。
 
 | L1 项 | 实施 |
 |---|---|
-| run 选择器 | `run_id` 可省：唯一 running → 用它，否则最近一个；多个 running 又没指定时报错并列出 `run_id (title)`；支持唯一前缀（`current/complete/provide/review/fail/items/runs show/status/resume`） |
+| run 选择器 | `run_id` 可省：优先最近的 running，没有 running 才取最近记录；`current/status` 优先 running，`runs show` 取最近活动；多个 running 又没指定时，写操作报错并列出 `run_id (title)`；支持唯一前缀 |
 | action 容错 | `--action` 可省（用当前 action）、可给唯一前缀（≥4 位）、可给当前节点 id、或 `current`/`latest`；解析在 CLI 层，`engine.act` 仍严格校验 |
 | resume | `aiwf resume RUN_ID`（workflow 自动推断）；旧的 `resume WF RUN` 仍兼容 |
 | items | `run_id` 可省；`--node` 在只有一个队列时可省（沿 parent 链找队列）；新增 `--item-file` 投喂数组/对象，避开 shell 引号 |
 | 观测 | `runs list --limit N`（默认 20，0=全部）；`runs show` 无参取最近；新增 `aiwf status`（标题/当前节点/next/阻塞原因，支持 `--json`） |
-| 测试 | 新增 `tests/test_l1_cli.py`（13 项） |
+| 测试 | 新增 `tests/test_l1_cli.py`（14 项） |
 
 **代价与边界**：省略 `--action` 意味着引擎无法再比对"你看到的是哪个动作"，只剩节点/产物契约在兜底；
 多个 run 并行时必须显式给 `run_id`。这是为弱模型降低复制成本的有意取舍，L2 的 `submit.json`

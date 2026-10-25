@@ -603,13 +603,21 @@ def _resolve_run_id(raw: str, storage: Storage) -> str:
 
 
 def _pick_run(
-    storage: Storage, raw: Optional[str], *, need_running: bool
+    storage: Storage,
+    raw: Optional[str],
+    *,
+    need_running: bool,
+    prefer_running: bool = True,
 ) -> str:
     """Resolve an omitted run id: the sole running run, else the latest.
 
     A weak caller usually has exactly one run in flight and should not have to
     copy a 22-character id. When several are running the ambiguity is reported
     with the candidates instead of guessing.
+
+    ``prefer_running=False`` means "latest activity" (used by `runs show`),
+    while the default means "the run I am working on" (used by `current` /
+    `status` / `items`): a still-running run wins over a newer finished one.
     """
     if raw:
         return _resolve_run_id(raw, storage)
@@ -645,6 +653,8 @@ def _pick_run(
             hint="; ".join(f"{rid} ({title})" for _s, rid, title in running),
         )
     if len(running) == 1:
+        return running[0][1]
+    if running and prefer_running:
         return running[0][1]
     if latest is not None:
         return latest[2]
@@ -1330,7 +1340,9 @@ def cmd_runs_list(args, storage: Storage) -> int:
 
 
 def cmd_runs_show(args, storage: Storage) -> int:
-    args.run_id = _pick_run(storage, args.run_id, need_running=False)
+    args.run_id = _pick_run(
+        storage, args.run_id, need_running=False, prefer_running=False
+    )
     record = storage.find_run(args.run_id)
     if getattr(args, "view", False):
         workflow, error = _resolve_definition(record, storage)
