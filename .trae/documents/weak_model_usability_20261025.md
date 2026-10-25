@@ -1,7 +1,7 @@
 # 让"不太聪明的模型"也用对 aiwf：易用性诊断与改造建议
 
 日期：2026-10-25
-状态：L0 已于同日实施（见 §9）；L1–L3 仍是待评估建议。
+状态：L0、L1 已于同日实施（见 §9/§10）；L2–L3 仍是待评估建议。
 范围：引擎 / CLI 协议 / 定义格式 / Skill 文档 / 分发。
 方法：通读实现（`cli.py` 1198 行、`engine.py` 2990 行、`schema.py`、`storage.py`、`view.py`、14 份 reference），
 在中文 Windows + PowerShell 5.1 下逐条实跑命令，并让一个只读 Skill 文档的 Agent（环境变量由外部给出）完整跑一遍两步流程。
@@ -489,7 +489,7 @@ $ aiwf runs list
 
 ## 9. L0 实施记录（2026-10-25）
 
-L0（不改协议的热修）已落地，验证为 **182 passed / 20 subtests**，且在
+L0（不改协议的热修）已落地，L0 时验证为 **182 passed / 20 subtests**，且在
 `PYTHONUTF8=1` 与默认中文 Windows（不设该变量）两种环境下都全绿。
 
 | L0 项 | 实施 |
@@ -509,9 +509,28 @@ L0（不改协议的热修）已落地，验证为 **182 passed / 20 subtests**�
 
 1. **错误 JSON 仍保留字符串 `error`**（同时加 `code/at/hint/next`），避免破坏已有消费者；
    提案里的嵌套结构留到 L1 再统一。
-2. **`--action` 缺失仍是用法错误（2）**，只有"给了但与当前状态不符"才是 stale（4）；
-   L1 再做"可省略 / 前缀匹配"。
+2. **L0 时 `--action` 缺失仍是用法错误（2）**，只有"给了但与当前状态不符"才是 stale（4）；
+   L1 已放开为"省略即当前 action"，见 §10。
 
-L1 未做：`action` 可省、run 选择器、`resume RUN_ID`、`items --node` 可省、`runs list --limit`、
-`aiwf status`、`submit.json` 工作流。L3 未做：`aiwf new` 脚手架、`use` 简写、文档三件套、弱模型基准。
+L1 已落地，见 §10。L2 未做：`submit.json` 工作流（让引擎写待填模板、`aiwf submit` 自带 action）。
+L3 未做：`aiwf new` 脚手架、`use` 简写、文档三件套、弱模型基准。
+
+## 10. L1 实施记录（2026-10-25）
+
+L1（协议人机工程）已落地，全量 **195 passed / 20 subtests**，两种编码环境都绿。
+
+| L1 项 | 实施 |
+|---|---|
+| run 选择器 | `run_id` 可省：唯一 running → 用它，否则最近一个；多个 running 又没指定时报错并列出 `run_id (title)`；支持唯一前缀（`current/complete/provide/review/fail/items/runs show/status/resume`） |
+| action 容错 | `--action` 可省（用当前 action）、可给唯一前缀（≥4 位）、可给当前节点 id、或 `current`/`latest`；解析在 CLI 层，`engine.act` 仍严格校验 |
+| resume | `aiwf resume RUN_ID`（workflow 自动推断）；旧的 `resume WF RUN` 仍兼容 |
+| items | `run_id` 可省；`--node` 在只有一个队列时可省（沿 parent 链找队列）；新增 `--item-file` 投喂数组/对象，避开 shell 引号 |
+| 观测 | `runs list --limit N`（默认 20，0=全部）；`runs show` 无参取最近；新增 `aiwf status`（标题/当前节点/next/阻塞原因，支持 `--json`） |
+| 测试 | 新增 `tests/test_l1_cli.py`（13 项） |
+
+**代价与边界**：省略 `--action` 意味着引擎无法再比对"你看到的是哪个动作"，只剩节点/产物契约在兜底；
+多个 run 并行时必须显式给 `run_id`。这是为弱模型降低复制成本的有意取舍，L2 的 `submit.json`
+会用"模板里带 action"把这道保护补回来。
+
+L1 未做（属 L2/L3）：`submit.json` 工作流、`aiwf new`、`use` 简写、文档三件套、弱模型基准。
 

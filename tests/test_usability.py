@@ -588,18 +588,21 @@ class UsabilityTest(unittest.TestCase):
                                   capture_output=True, check=True)
             return json.loads(proc.stdout)
         spec = call("run", "usability", "--title", "round trip")
-        missing_action = subprocess.run(
+        stale = subprocess.run(
+            [*CLI, "complete", spec["run_id"], "--action", "deadbeef",
+             "--output", "late", "--json"],
+            env=env, text=True, encoding="utf-8", capture_output=True,
+        )
+        self.assertEqual(stale.returncode, 4)
+        self.assertEqual(json.loads(stale.stdout)["code"], "E_STALE_ACTION")
+        # L1: omitting --action uses the current action (no id to copy)
+        implicit = subprocess.run(
             [*CLI, "complete", spec["run_id"], "--output", "late", "--json"],
             env=env, text=True, encoding="utf-8", capture_output=True,
         )
-        self.assertEqual(missing_action.returncode, 2)
-        error = json.loads(missing_action.stdout)
-        self.assertEqual(error["code"], "E_USAGE")
-        self.assertIn("missing --action", error["error"])
-        self.assertEqual(missing_action.stderr, "")
-        finished = call("complete", spec["run_id"], "--action", spec["action"]["id"],
-                        "--output", '{"ok":true}')
-        self.assertEqual(finished["status"], "completed")
+        self.assertEqual(implicit.returncode, 0, implicit.stderr)
+        self.assertEqual(implicit.stderr, "")
+        self.assertEqual(json.loads(implicit.stdout)["status"], "completed")
 
 
 if __name__ == "__main__":

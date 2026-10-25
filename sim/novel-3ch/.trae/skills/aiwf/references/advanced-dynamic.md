@@ -47,12 +47,14 @@
 
 | 命令 | 作用 |
 |---|---|
-| `aiwf items list <run_id> --node <node>` | 打印队列与每项的派生状态 |
-| `aiwf items add <run_id> --node <node> --item '<JSON>'` | 追加一项（`--item` 可重复） |
-| `aiwf items update <run_id> --node <node> --id <id> --set '<JSON>'` | 改一项**未启动**条目的字段 |
-| `aiwf items remove <run_id> --node <node> --id <id>` | 删一项**未启动**条目 |
-| `aiwf items move <run_id> --node <node> --id <id> --to <index>` | 重排一项**未启动**条目（0 基目标位） |
-| `aiwf items seal <run_id> --node <node>` | 封口：不再接受追加，停止等待 |
+| `aiwf items list <run_id> [--node <node>]` | 打印队列与每项的派生状态 |
+| `aiwf items add <run_id> [--node <node>] --item-file items.json` | 追加一项或一批（JSON 数组/对象；`--item '<JSON>'` 仍可用） |
+| `aiwf items update <run_id> [--node <node>] --id <id> --set '<JSON>'` | 改一项**未启动**条目的字段 |
+| `aiwf items remove <run_id> [--node <node>] --id <id>` | 删一项**未启动**条目 |
+| `aiwf items move <run_id> [--node <node>] --id <id> --to <index>` | 重排一项**未启动**条目（0 基目标位） |
+| `aiwf items seal <run_id> [--node <node>]` | 封口：不再接受追加，停止等待 |
+
+`run_id` 可省略（唯一 running / 最近）；`--node` 在一个 run 只有一个队列时可省。
 
 `<run_id>` 是**声明该节点的那一层**的 run。队列可以挂在根 run，也可以挂在子流程里，
 引擎会沿 parent 链找到持有该节点的记录。

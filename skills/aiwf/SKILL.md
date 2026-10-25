@@ -51,7 +51,9 @@ description: 创建、运行与审计 aiwf 工作流。用户要求创建或修�
 - `{"ref":"key"}` 保留数据类型，`${key}` 仅文字插值；大产物落文件，结果回 `$file`。
 - 单节点输出 ≤2000 字符；优先把运行产物放 `${run.dir}`，代码修改仍落实际项目文件。
 - 用根 run_id 驱动；每次照抄任务包的 `next.text`（它已带 action id 与正确参数），
-  不要自己从 `action.kind` 拼命令。
+  不要自己从 `action.kind` 拼命令。`aiwf status` 给一行"当前节点 + next"。
+- run_id 可省略（唯一 running → 用它，否则最近一个），也可只给唯一前缀；
+  `--action` 可省略（用当前 action），也可给唯一前缀或当前节点 id。多个 run 同时跑时必须指定。
 - 交文件用 `--file`，交 check 结论用 `--verdict PASS|REVISE --reason "..."`，
   结构化结果写 JSON 再 `--json-file`；Windows 上不要用内联 `--output '{"…"}'`。
 - 退出码：0 已前进；2 用法/入参错；3 产物被驳回（状态未变）；4 action 过期。

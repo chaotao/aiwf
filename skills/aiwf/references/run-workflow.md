@@ -7,12 +7,17 @@
 
 ```bash
 aiwf run <workflow_id> --title "这次要做什么" --input-file inputs.json --json
-aiwf current <root_run_id> --json
+aiwf current                 # 省略 run_id：唯一运行中的 run，否则最近一个
+aiwf status                  # 更短的一行：标题 / 当前节点 / next 命令
 ```
 
 `--title` **必填**：它认领这次运行，`aiwf runs list` 靠它辨认是哪个实例。定不出正式名字
 就给个能认出来的（「末世/重生」即可）；定义里若声明了 `view.dynamic_title`，等它引用的
 变量有值时会自动换成正式名。
+
+**id 都可以少抄**：`run_id` 可省略（唯一 running → 用它；否则最近一个；多个 running 又
+没指定时报错并列出候选），也可以只给唯一前缀。`--action` 可省略（用当前 action），也可给
+唯一前缀或当前节点 id。只有在"同时跑多个 run"或"确认提交的不是当前节点"时才需要完整 id。
 
 任务包的 `run_id` 是根运行；`action` 指向当前真实目标，`next` 直接给出下一行命令：
 
@@ -105,7 +110,7 @@ aiwf review <root_run_id> --action <最新action.id> --verdict REJECT --feedback
 
 ```bash
 aiwf fail <root_run_id> --action <最新action.id> --error "具体失败原因" --json
-aiwf resume <root_workflow_id> <root_run_id> --json
+aiwf resume <root_run_id> --json          # workflow id 自动推断
 ```
 
 临时工具失败修好后 resume；嵌套子运行一起恢复。质检次数耗尽不能靠 resume
@@ -114,8 +119,10 @@ aiwf resume <root_workflow_id> <root_run_id> --json
 
 awaiting_items 表示引擎队列在等投喂或封口，不能忙循环 resume；
 正等投喂时优先 `aiwf items add`——run 停在 awaiting_items 时 add 会自动推进；
-业务结束时 `aiwf items seal`。实际处理时加载主入口“运行时队列”。
+业务结束时 `aiwf items seal`。只有一个队列时 `--node` 可省，条目用
+`--item-file items.json` 投喂（数组或单个对象），避免在 shell 里拼 JSON。
 汇总 foreach 时读取结果清单并检查失败项，不数目录。
+实际处理时加载主入口“运行时队列”。
 
 ## 交接与交付
 

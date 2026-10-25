@@ -41,13 +41,14 @@ runs/<父wf>/<父rid>/
 ## 1. 列出运行
 
 ```bash
-aiwf runs list                      # 全部工作流的运行
+aiwf runs list                      # 最近 20 条运行（--limit 0 看全部）
 aiwf runs list short-drama          # 某个工作流的运行
 aiwf runs list --status failed      # 只看失败
 aiwf runs list --all                # 含子工作流实例（标注 "(of <父run_id>)"）
 ```
 
-`runs list` 默认只列顶层运行；子级用 `--all` 显示。
+`runs list` 默认只列顶层运行、按时间倒序取前 20 条；子级用 `--all` 显示，
+`--limit N` 调整条数（`0` = 全部）。
 
 每行显示：**标题**、开始时间、run_id、workflow、状态、总耗时、节点数。标题在最前，
 它就是「这次是哪个实例」的答案（来自 `run --title`，或被定义的 `view.dynamic_title`
@@ -57,6 +58,7 @@ aiwf runs list --all                # 含子工作流实例（标注 "(of <父ru
 ## 2. 查看单次运行
 
 ```bash
+aiwf runs show                               # 最近一次运行
 aiwf runs show <run_id>                       # 概览：业务阶段视图 + 节点耗时与摘要
 aiwf runs show <run_id> --view                # 只看业务阶段视图（定义声明了 view 时）
 aiwf runs show <run_id> --view --json         # 同上，机器可读

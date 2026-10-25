@@ -162,8 +162,7 @@ def _next_for_spec(spec: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         return None
     status = spec.get("status")
     if status == "failed":
-        wf = spec.get("root_workflow_id") or spec.get("workflow_id")
-        return {"kind": "resume", "text": f"aiwf resume {wf} {run_id} --json"}
+        return {"kind": "resume", "text": f"aiwf resume {run_id} --json"}
     if status == "completed":
         return {"kind": "done", "text": f"aiwf runs show {run_id}"}
 
@@ -191,7 +190,8 @@ def _next_for_spec(spec: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     if spec.get("phase") == "awaiting_items":
         node_id = node.get("id") or "<node>"
         return {"kind": "items",
-                "text": f"aiwf items add {target} --node {node_id} --item '<json>'"
+                "text": f"aiwf items add {target} --node {node_id} "
+                        f"--item-file items.json"
                         f"   # or: aiwf items seal {target} --node {node_id}"}
     if action.get("kind") == "resume":
         wf = spec.get("root_workflow_id") or spec.get("workflow_id")
@@ -577,6 +577,101 @@ def _load_workflow_for_record(storage: Storage, record: Dict[str, Any]):
     return storage.load_workflow_for_record(record)
 
 
+# ---- run / action selectors ---------------------------------------------
+def _resolve_run_id(raw: str, storage: Storage) -> str:
+    """Exact run id, or a unique prefix of one."""
+    try:
+        return storage.find_run(raw)["run_id"]
+    except FileNotFoundError:
+        pass
+    matches = [
+        rid for _wf, rid, _path, parent in storage.iter_run_files()
+        if parent is None and rid.startswith(raw)
+    ]
+    if len(matches) == 1:
+        return matches[0]
+    if matches:
+        raise UsageError(
+            f"run id {raw!r} is ambiguous",
+            at="run",
+            hint="matches: " + ", ".join(sorted(matches)[:8]),
+        )
+    raise NotFoundError(
+        f"no run with id or prefix {raw!r}",
+        hint="list runs with `aiwf runs list`",
+    )
+
+
+def _pick_run(
+    storage: Storage, raw: Optional[str], *, need_running: bool
+) -> str:
+    """Resolve an omitted run id: the sole running run, else the latest.
+
+    A weak caller usually has exactly one run in flight and should not have to
+    copy a 22-character id. When several are running the ambiguity is reported
+    with the candidates instead of guessing.
+    """
+    if raw:
+        return _resolve_run_id(raw, storage)
+    running: List[tuple] = []
+    latest: Optional[tuple] = None
+    for _wf, rid, path, parent in storage.iter_run_files():
+        if parent is not None:
+            continue
+        try:
+            record = storage.load_record(path)
+            mtime = os.path.getmtime(path)
+        except (OSError, ValueError):
+            continue
+        started = record.get("started_at") or ""
+        # started_at has one-second resolution; mtime breaks ties between two
+        # runs created in the same second (the later record.json is newer).
+        stamp = (started, mtime, rid)
+        if latest is None or stamp > latest:
+            latest = stamp
+        if record.get("status") == "running":
+            running.append((stamp, rid, record.get("title") or rid))
+    running.sort(reverse=True)
+    if need_running:
+        if len(running) == 1:
+            return running[0][1]
+        if not running:
+            raise UsageError(
+                "no running run",
+                hint="start one with `aiwf run ...`, or pass a run_id",
+            )
+        raise UsageError(
+            "multiple runs are running; pass a run_id",
+            hint="; ".join(f"{rid} ({title})" for _s, rid, title in running),
+        )
+    if len(running) == 1:
+        return running[0][1]
+    if latest is not None:
+        return latest[2]
+    raise NotFoundError("no runs found", hint="start one with `aiwf run ...`")
+
+
+def _resolve_action_id(engine, run_id: str, raw: Optional[str]) -> Optional[str]:
+    """Accept the full action id, a unique prefix, the current node id, or
+    ``current``/``latest``/omitted.
+
+    The digest still guards against reporting to a *different* node: anything
+    that does not resolve is passed through unchanged and the engine rejects it
+    as stale.
+    """
+    spec = engine.action_spec(run_id)
+    action = spec.get("action")
+    if not action:
+        return raw
+    if raw in (None, "", "current", "latest", action["node_id"]):
+        return action["id"]
+    if raw == action["id"]:
+        return raw
+    if len(raw) >= 4 and action["id"].startswith(raw):
+        return action["id"]
+    return raw
+
+
 # ---- command handlers ----------------------------------------------------
 def _new_protocol(engine, record):
     root = engine.root_record(record)
@@ -611,7 +706,14 @@ def _attach_rejection(engine, spec):
 
 
 def _act(engine, args, command, **kwargs):
-    spec = engine.act(args.run_id, args.action, command, **kwargs)
+    raw = getattr(args, "action", None)
+    action_id = _resolve_action_id(engine, args.run_id, raw)
+    if raw in (None, "") and not getattr(args, "json", False):
+        print(
+            f"note: --action omitted; using the current action ({action_id})",
+            file=sys.stderr,
+        )
+    spec = engine.act(args.run_id, action_id, command, **kwargs)
     _attach_rejection(engine, spec)
     print_spec(spec, args.json)
     if engine.last_rejection:
@@ -802,8 +904,50 @@ def cmd_run(args, storage: Storage) -> int:
 
 
 def cmd_current(args, storage: Storage) -> int:
+    args.run_id = _pick_run(storage, args.run_id, need_running=False)
     record = storage.find_run(args.run_id)
     return _emit(WorkflowEngine(storage), record, args, advance=False)
+
+
+def cmd_status(args, storage: Storage) -> int:
+    """One read-only answer to "where is this run, and what do I type next?"."""
+    args.run_id = _pick_run(storage, args.run_id, need_running=False)
+    engine = WorkflowEngine(storage)
+    record = storage.find_run(args.run_id)
+    if _new_protocol(engine, record):
+        spec = engine.action_spec(record["run_id"])
+    else:
+        spec = engine.node_spec(_load_workflow_for_record(storage, record), record)
+    workflow, _error = _resolve_definition(record, storage)
+    spec["title"] = view_mod.run_title(workflow, record)
+    next_command = _next_for_spec(spec)
+
+    if getattr(args, "json", False):
+        payload = dict(spec)
+        if next_command is not None:
+            payload["next"] = next_command
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+        return 0
+
+    print(f"run  {record['run_id']}  {spec['title']}  {spec['status']}")
+    node = spec.get("node")
+    if node:
+        print(f"now  [{node['id']}] {node.get('name', node['id'])}")
+    elif spec.get("input_request"):
+        print(f"now  [{spec['input_request']['node_id']}] (awaiting user input)")
+    else:
+        print("now  (none; run finished)")
+    if next_command:
+        print(f"next {next_command['text']}")
+    review = spec.get("review_request")
+    if review:
+        requirements = review.get("requirements")
+        if isinstance(requirements, list) and requirements:
+            print("wait 用户验收：" + " / ".join(map(str, requirements[:3])))
+    reason = spec.get("error") or (node or {}).get("feedback")
+    if reason:
+        print(f"why  {str(reason)[:300]}")
+    return 0
 
 
 def _read_output(args) -> Any:
@@ -883,6 +1027,7 @@ def _read_tokens(args) -> Optional[Dict[str, int]]:
 
 
 def cmd_complete(args, storage: Storage) -> int:
+    args.run_id = _pick_run(storage, args.run_id, need_running=True)
     record = storage.find_run(args.run_id)
     engine = WorkflowEngine(storage)
     # The root record's phase stays "executing" while a child is the leaf, so
@@ -926,6 +1071,9 @@ def cmd_complete(args, storage: Storage) -> int:
 
 
 def cmd_provide(args, storage: Storage) -> int:
+    args.run_id = _pick_run(
+        storage, args.run_id, need_running=not bool(getattr(args, "node", None))
+    )
     values = _read_data(args)
     if not values:
         raise UsageError(
@@ -945,6 +1093,7 @@ def cmd_provide(args, storage: Storage) -> int:
 
 
 def cmd_review(args, storage: Storage) -> int:
+    args.run_id = _pick_run(storage, args.run_id, need_running=True)
     record = storage.find_run(args.run_id)
     workflow = _load_workflow_for_record(storage, record)
     engine = WorkflowEngine(storage)
@@ -970,6 +1119,7 @@ def cmd_revise(args, storage: Storage) -> int:
 
 
 def cmd_fail(args, storage: Storage) -> int:
+    args.run_id = _pick_run(storage, args.run_id, need_running=True)
     record = storage.find_run(args.run_id)
     workflow = _load_workflow_for_record(storage, record)
     engine = WorkflowEngine(storage)
@@ -983,10 +1133,27 @@ def cmd_fail(args, storage: Storage) -> int:
 
 
 def cmd_resume(args, storage: Storage) -> int:
-    record = storage.find_run(args.run_id)
-    workflow = storage.load_workflow_for_record(record)
-    if workflow["id"] != args.workflow_id:
-        raise ValueError("workflow id does not match run")
+    targets = args.targets
+    if len(targets) == 1:
+        run_id = _resolve_run_id(targets[0], storage)
+        record = storage.find_run(run_id)
+        workflow = storage.load_workflow_for_record(record)
+    elif len(targets) == 2:
+        workflow_id, raw = targets
+        run_id = _resolve_run_id(raw, storage)
+        record = storage.find_run(run_id)
+        workflow = storage.load_workflow_for_record(record)
+        if workflow["id"] != workflow_id:
+            raise UsageError(
+                f"workflow {workflow_id!r} does not own run {run_id!r}",
+                at=f"run {run_id}",
+                hint=f"its workflow is {workflow['id']!r}; `aiwf resume {run_id}` infers it",
+            )
+    else:
+        raise UsageError(
+            "resume needs RUN_ID, or WORKFLOW_ID RUN_ID",
+            hint="e.g. aiwf resume 20261025-...-abcdef",
+        )
     engine = WorkflowEngine(storage)
     if _new_protocol(engine, record) and record["status"] == "running":
         leaf = engine._leaf_record(record)
@@ -1036,6 +1203,30 @@ def _json_arg(raw: str) -> Any:
         ) from None
 
 
+def _only_queue_node(engine, leaf: Dict[str, Any]) -> str:
+    """The only queue in this run's parent chain, or a typed ambiguity error."""
+    found: Dict[str, Any] = {}
+    cur, seen = leaf, set()
+    while True:
+        found.update(cur.get("queues") or {})
+        parent = cur.get("parent")
+        if not parent or parent["run_id"] in seen:
+            break
+        seen.add(parent["run_id"])
+        cur = engine.storage.find_run(parent["run_id"])
+    if len(found) == 1:
+        return next(iter(found))
+    if not found:
+        raise UsageError(
+            "this run has no engine-owned queue",
+            hint='a foreach node must declare items: {"queue": true}',
+        )
+    raise UsageError(
+        "this run has multiple queues; pass --node",
+        hint="queues: " + ", ".join(sorted(found)),
+    )
+
+
 def cmd_items(args, storage: Storage) -> int:
     """The engine-owned foreach queue -- the engine is its only writer.
 
@@ -1043,19 +1234,32 @@ def cmd_items(args, storage: Storage) -> int:
     where the run stands, because an edit may be exactly what the run was
     waiting for (``add``/``seal`` on an ``awaiting_items`` run resume it).
     """
+    args.run_id = _pick_run(
+        storage, args.run_id, need_running=args.items_command != "list"
+    )
     engine = WorkflowEngine(storage)
     root = engine.root_record(storage.find_run(args.run_id))
     leaf = engine._leaf_record(root)
-    node, verb = args.node, args.items_command
+    node = args.node or _only_queue_node(engine, leaf)
+    verb = args.items_command
 
     if verb == "list":
         table = engine.queue_table(leaf["run_id"], node)
     elif verb == "add":
-        if not args.item:
-            raise UsageError("items add needs at least one --item '<json>'")
-        table = engine.queue_add(
-            leaf["run_id"], node, [_json_arg(raw) for raw in args.item]
-        )
+        items: List[Any] = []
+        for raw in args.item or []:
+            parsed = _json_arg(raw)
+            items.extend(parsed if isinstance(parsed, list) else [parsed])
+        for path in getattr(args, "item_file", None) or []:
+            parsed = _read_json(path)
+            items.extend(parsed if isinstance(parsed, list) else [parsed])
+        if not items:
+            raise UsageError(
+                "items add needs --item '<json>' or --item-file FILE",
+                hint='write [{"id":"T1","name":"first"}] to items.json, then '
+                     'pass --item-file items.json',
+            )
+        table = engine.queue_add(leaf["run_id"], node, items)
     elif verb == "update":
         table = engine.queue_update(
             leaf["run_id"], node, args.id, _json_arg(args.set)
@@ -1099,21 +1303,25 @@ def cmd_runs_list(args, storage: Storage) -> int:
         rows.append((r["started_at"], rid, wf, r["status"], r.get("duration_ms"),
                      len(r["node_runs"]), parent_run,
                      view_mod.run_title(workflow, r)))
+    ordered = sorted(rows, reverse=True)
+    limit = getattr(args, "limit", 20)
+    if limit and limit > 0:
+        ordered = ordered[:limit]
     if getattr(args, "json", False):
         print(json.dumps(
             [{"started_at": started, "run_id": rid, "workflow_id": wf,
               "title": title, "status": status, "duration_ms": dur,
               "node_count": node_count, "parent_run": parent_run}
              for started, rid, wf, status, dur, node_count, parent_run, title
-             in sorted(rows, reverse=True)],
+             in ordered],
             ensure_ascii=False, indent=2,
         ))
         return 0
-    if not rows:
+    if not ordered:
         print("(no runs)")
         return 0
     # The title leads: it is the only column that answers "which run is this?".
-    for started, rid, wf, status, dur, n, parent_run, title in sorted(rows, reverse=True):
+    for started, rid, wf, status, dur, n, parent_run, title in ordered:
         tag = f" (of {parent_run})" if parent_run else ""
         duration = f"{dur} ms" if dur is not None else "-"
         print(f"{_cell(title, TITLE_COLUMN)}  {started}  {rid}  "
@@ -1122,6 +1330,7 @@ def cmd_runs_list(args, storage: Storage) -> int:
 
 
 def cmd_runs_show(args, storage: Storage) -> int:
+    args.run_id = _pick_run(storage, args.run_id, need_running=False)
     record = storage.find_run(args.run_id)
     if getattr(args, "view", False):
         workflow, error = _resolve_definition(record, storage)
@@ -1402,17 +1611,30 @@ def build_parser() -> argparse.ArgumentParser:
     pr.set_defaults(func=cmd_run)
 
     pc = sub.add_parser("current", help="print the current spec of a run")
-    pc.add_argument("run_id")
+    pc.add_argument("run_id", nargs="?",
+                    help="run id (prefix ok); default: the sole running run, else the latest")
     pc.add_argument("--json", action="store_true")
     pc.set_defaults(func=cmd_current)
+
+    ps = sub.add_parser(
+        "status", help="one-line answer: current node and the next command",
+        description="Read-only. Prints the run title/status, the current node, "
+                    "and the command that continues it.",
+    )
+    ps.add_argument("run_id", nargs="?")
+    ps.add_argument("--json", action="store_true")
+    ps.set_defaults(func=cmd_status)
 
     pcomp = sub.add_parser(
         "complete", help="report task/branch output and advance",
         description="Report the current action's result. Pick exactly one "
                     "payload flag; the task packet's `next` line shows which.",
     )
-    pcomp.add_argument("run_id")
-    pcomp.add_argument("--action", help="current action id (recommended for 1.1)")
+    pcomp.add_argument("run_id", nargs="?",
+                       help="run id (prefix ok); default: the sole running run")
+    pcomp.add_argument("--action",
+                       help="action id (full, unique prefix, node id, or 'current'; "
+                            "default: the current action)")
     pcomp.add_argument("--file", metavar="PATH",
                        help='report {"$file": PATH} for the artifact you wrote')
     pcomp.add_argument("--verdict", choices=["PASS", "REVISE"],
@@ -1433,8 +1655,8 @@ def build_parser() -> argparse.ArgumentParser:
     pcomp.set_defaults(func=cmd_complete)
 
     pprov = sub.add_parser("provide", help="supply user input for a task node")
-    pprov.add_argument("run_id")
-    pprov.add_argument("--action", help="current action id (required for 1.1 input)")
+    pprov.add_argument("run_id", nargs="?")
+    pprov.add_argument("--action", help="action id (default: the current action)")
     pprov.add_argument("--node", help="completed task node whose input is changed")
     pprov.add_argument("-p", "--param", action="append", help="key=value; repeatable")
     pprov.add_argument("--data-file", help="JSON object file with answers")
@@ -1443,8 +1665,8 @@ def build_parser() -> argparse.ArgumentParser:
     pprov.set_defaults(func=cmd_provide)
 
     prev2 = sub.add_parser("review", help="submit human review verdict")
-    prev2.add_argument("run_id")
-    prev2.add_argument("--action", help="current action id (required for 1.1)")
+    prev2.add_argument("run_id", nargs="?")
+    prev2.add_argument("--action", help="action id (default: the current action)")
     prev2.add_argument("--verdict", required=True, choices=["APPROVE", "REJECT"],
                        help="accept or reject")
     prev2.add_argument("--feedback", help="review comments for the agent")
@@ -1462,15 +1684,19 @@ def build_parser() -> argparse.ArgumentParser:
     prev3.set_defaults(func=cmd_revise)
 
     pf = sub.add_parser("fail", help="report a node failure")
-    pf.add_argument("run_id")
-    pf.add_argument("--action", help="current action id (required for 1.1)")
+    pf.add_argument("run_id", nargs="?")
+    pf.add_argument("--action", help="action id (default: the current action)")
     pf.add_argument("--error", required=True)
     pf.add_argument("--json", action="store_true")
     pf.set_defaults(func=cmd_fail)
 
-    pres = sub.add_parser("resume", help="reopen a failed run; prints its spec")
-    pres.add_argument("workflow_id")
-    pres.add_argument("run_id")
+    pres = sub.add_parser(
+        "resume", help="reopen a failed run; prints its spec",
+        description="RUN_ID alone infers the workflow; the legacy "
+                    "WORKFLOW_ID RUN_ID form is still accepted.",
+    )
+    pres.add_argument("targets", nargs="+", metavar="RUN_ID",
+                      help="RUN_ID, or WORKFLOW_ID RUN_ID")
     pres.add_argument("--json", action="store_true")
     pres.set_defaults(func=cmd_resume)
 
@@ -1493,8 +1719,10 @@ def build_parser() -> argparse.ArgumentParser:
     isub = pit.add_subparsers(dest="items_command", required=True)
 
     def _items_common(parser):
-        parser.add_argument("run_id")
-        parser.add_argument("--node", required=True, help="foreach node id")
+        parser.add_argument("run_id", nargs="?",
+                            help="run id (default: the sole running run, else latest)")
+        parser.add_argument("--node",
+                            help="foreach node id (default: the only queue in the run)")
         parser.add_argument("--json", action="store_true")
         parser.set_defaults(func=cmd_items)
         return parser
@@ -1505,8 +1733,10 @@ def build_parser() -> argparse.ArgumentParser:
     pi_add = _items_common(isub.add_parser(
         "add", help="append items (never a started one)"
     ))
-    pi_add.add_argument("--item", action="append", required=True,
-                        help="one item as JSON: '{\"id\": \"T1\", \"name\": \"…\"}'; repeatable")
+    pi_add.add_argument("--item", action="append",
+                        help="one item as JSON (repeatable)")
+    pi_add.add_argument("--item-file", action="append", metavar="FILE",
+                        help="JSON file holding one item or an array of items")
     pi_up = _items_common(isub.add_parser(
         "update", help="edit an item that has not started yet"
     ))
@@ -1534,13 +1764,16 @@ def build_parser() -> argparse.ArgumentParser:
     rl.add_argument("workflow_id", nargs="?")
     rl.add_argument("--status", choices=["running", "completed", "failed"])
     rl.add_argument("--all", action="store_true", help="include nested child runs")
+    rl.add_argument("--limit", type=int, default=20,
+                    help="max rows, newest first (0 = all; default 20)")
     rl.add_argument("--json", action="store_true")
     rl.set_defaults(func=cmd_runs_list)
 
     rs = rsub.add_parser(
         "show", help="show one run record (its declared business view first)"
     )
-    rs.add_argument("run_id")
+    rs.add_argument("run_id", nargs="?",
+                    help="run id (prefix ok); default: the latest run")
     rs.add_argument("--node", help="full detail of one node run")
     rs.add_argument("--view", action="store_true",
                     help="only the workflow's declared view; with --json, as JSON")
