@@ -101,7 +101,7 @@ def queue_rows(rid, node="work"):
 # ---- simulated node bodies ----------------------------------------------
 def do_intake(node):
     requirement()  # the brief is derived from it; text is canned for the demo
-    # short object -> inline, no file (outputs.md: short objects stay in context)
+    # short object -> inline, no file (create.md 产物设计: short objects stay in context)
     out = {
         "goal": GOAL, "scope": SCOPE,
         "constraints": CONSTRAINTS, "acceptance": ACCEPTANCE,

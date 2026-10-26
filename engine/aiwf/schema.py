@@ -209,7 +209,7 @@ def validate_workflow(workflow: Dict[str, Any]) -> None:
     _jsonschema_validate(
         workflow, load_schema("workflow"),
         hint="按 at 定位定义字段（如 nodes/0/output）；字段名与类型见 "
-             "skills/aiwf/references/data-reference.md",
+             "skills/aiwf/references/create.md（字段与数据作用域）",
     )
     if (workflow["schema_version"] == "1.1"
             and "run" in (workflow.get("input_schema") or {}).get("properties", {})):

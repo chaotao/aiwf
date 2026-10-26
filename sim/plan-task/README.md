@@ -195,7 +195,7 @@ aiwf items seal   <run_id> --node work
 ## 为什么 plan 节点不再有「两份产物」之争
 
 上一版任务清单外置成 `plan.json`，于是 `plan` 要产 {`plan.json`, `plan.md`} **两份文件**，
-而 `output` 是**单文件契约**（`outputs.md` 明确规定不支持 `output.files` / 数组）——
+而 `output` 是**单文件契约**（`create.md` 产物设计明确规定不支持 `output.files` / 数组）——
 只能一份进契约、另一份靠 `check` 兜底，并因此多出一整段取舍说明。
 
 本版把清单交给**引擎队列**：清单不再是文件，不参与任何文件契约。于是取舍消失了：

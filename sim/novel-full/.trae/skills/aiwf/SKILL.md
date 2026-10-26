@@ -19,28 +19,28 @@ description: 创建、运行与审计 aiwf 工作流。用户要求创建或修�
 |---|---|
 | 执行 / 接管 / 续跑 | [RUN-CARD](RUN-CARD.md) |
 | 找现成流程 | [模板库](references/templates.md) — 先 `aiwf wf list` |
-| 新建、修改定义；第一次使用 | [创建入门](references/create-workflow.md) — 可先 `aiwf new <id> --kind sequential\|checked\|batch` |
+| 新建、修改定义；第一次使用 | [创建](references/create.md#创建入门) — 可先 `aiwf new <id> --kind sequential\|checked\|batch` |
 | 找完整范例 | [范例目录](references/examples.md) — 选中后再读 assets 里的 JSON |
-| 查看进度、记录、产物 | [审计与检索](references/inspect-runs.md) |
-| 业务进展视图 / 标题 | [业务进展视图](references/view.md) |
+| 查看进度、记录、产物 | [审计](references/audit.md#审计--检索工作流运行记录) |
+| 业务进展视图 / 标题 | [审计 § 业务进展视图](references/audit.md#业务进展视图view) |
 
 ### 常用专题
 
 | 疑问 / 能力 | 读取 |
 |---|---|
-| inputs 能放什么、ref 引用范围、变量与字段命名 | [字段与数据作用域](references/data-reference.md) |
-| 单文件、多文件、结构化结果、修代码节点 output 怎么写 | [产物设计](references/outputs.md) |
-| 运行前入参、途中提问、Agent 质检、人工验收 | [输入与验收](references/interaction.md) |
-| 批量章节 / 资源、上一项结果、复用子工作流 | [批量与子流程](references/patterns.md) |
-| 条件判断、Agent 分类、多出口 | [分支与路由](references/routing.md) |
+| inputs 能放什么、ref 引用范围、变量与字段命名 | [创建 § 字段与数据作用域](references/create.md#字段与数据作用域) |
+| 单文件、多文件、结构化结果、修代码节点 output 怎么写 | [创建 § 产物设计](references/create.md#产物设计对象文件与代码修改) |
+| 运行前入参、途中提问、Agent 质检、人工验收 | [执行 § 启动入参](references/run.md#启动入参途中提问质检与人工验收) |
+| 批量章节 / 资源、上一项结果、复用子工作流 | [高阶 § 批量与子流程](references/advanced.md#批量任务与子工作流) |
+| 条件判断、Agent 分类、多出口 | [创建 § 分支与路由](references/create.md#分支与路由) |
 
 ### 高阶玩法（出错或需要时再读）
 
 | 需求 | 读取 |
 |---|---|
-| 数量事先未知、运行中追加条目 | [运行时队列](references/advanced-dynamic.md) |
-| 改已完成任务、依赖级联、局部重做 | [修订与重做](references/advanced-revisions.md) |
-| SDK 驱动、显式 edges、旧 1.0 迁移 | [集成与兼容](references/advanced-integration.md) |
+| 数量事先未知、运行中追加条目 | [高阶 § 运行时队列](references/advanced.md#高阶运行中追加条目的引擎队列) |
+| 改已完成任务、依赖级联、局部重做 | [高阶 § 修订与重做](references/advanced.md#高阶修订依赖级联与实例重做) |
+| SDK 驱动、显式 edges、旧 1.0 迁移 | [高阶 § 集成与兼容](references/advanced.md#高阶sdk显式图与兼容) |
 
 ## 始终遵守
 
