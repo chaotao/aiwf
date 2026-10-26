@@ -1737,7 +1737,7 @@ class WorkflowEngine:
                 f"{action['node_id']})",
                 at=f"run {root}, node {action['node_id']}",
                 hint=f"pass the action id from the task packet: --action {action['id']}",
-                next_command=f"aiwf current {root} --json",
+                next_command=f"aiwf status {root} --json",
             )
         if action_id != action["id"]:
             raise StaleActionError(
@@ -1746,7 +1746,7 @@ class WorkflowEngine:
                 at=f"run {root}, node {action['node_id']}",
                 hint="re-read the task packet, confirm the work still matches, "
                      "then report again",
-                next_command=f"aiwf current {root} --json",
+                next_command=f"aiwf status {root} --json",
             )
         expected = "complete" if action["kind"] == "check" else action["kind"]
         if command not in (expected, "fail"):
@@ -1755,7 +1755,7 @@ class WorkflowEngine:
                 f"(node {action['node_id']})",
                 at=f"run {root}, node {action['node_id']}",
                 hint=f"use `{expected}` for this action",
-                next_command=f"aiwf current {root} --json",
+                next_command=f"aiwf status {root} --json",
             )
         record = self.storage.find_run(action["run_id"])
         workflow = self.storage.load_workflow_for_record(record)
@@ -2094,7 +2094,7 @@ class WorkflowEngine:
             child_id = inst.get("run_id") if inst else None
             raise RuntimeError(
                 f"node {current!r} has child run {child_id} in progress; "
-                f"drive that child (aiwf current {child_id}) or finish it"
+                f"drive that child (aiwf status {child_id}) or finish it"
             )
 
         # a child run reaches end only if its exports contract is satisfied

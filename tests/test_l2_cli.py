@@ -362,12 +362,26 @@ class L2CliTest(unittest.TestCase):
         self.assertIn("complete", full.stdout)
         self.assertIn("items", full.stdout)
 
-    def test_current_does_not_write_the_template(self):
+    def test_status_does_not_write_the_template(self):
         self.save(file_task())
         spec = self.start()
         before = self.template_path(spec).read_bytes()
-        self.cli("current", spec["run_id"], "--json")
+        self.cli("status", spec["run_id"], "--json")
         self.assertEqual(self.template_path(spec).read_bytes(), before)
+
+    def test_hidden_current_is_a_compatible_subset_of_status(self):
+        """`current` stays as a hidden entry for SDK / legacy scripts (R2 甲);
+        `status --json` is its superset, so docs and in-repo callers use `status`."""
+        self.save(file_task())
+        spec = self.start()
+        legacy = json.loads(self.cli("current", spec["run_id"], "--json").stdout)
+        current = json.loads(self.cli("status", spec["run_id"], "--json").stdout)
+        for key, value in legacy.items():
+            self.assertEqual(current.get(key), value, key)
+        self.assertEqual({"title", "submit_file", "submit_missing"},
+                         set(current) - set(legacy))
+        self.assertIn("current", self.cli("--help-all").stdout)
+        self.assertNotIn("aiwf current", self.cli("--help").stdout)
 
     def test_deprecated_complete_still_works_with_a_note(self):
         self.save(file_task())

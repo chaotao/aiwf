@@ -117,17 +117,17 @@ class L1CliTest(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(json.loads(proc.stdout)["node"]["id"], "second")
 
-    def test_current_without_a_run_id_picks_the_running_run(self):
+    def test_status_without_a_run_id_picks_the_running_run(self):
         self.save(two_step())
         spec = self.start()
-        proc = self.cli("current", "--json")
+        proc = self.cli("status", "--json")
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(json.loads(proc.stdout)["run_id"], spec["run_id"])
 
     def test_run_id_accepts_a_unique_prefix(self):
         self.save(two_step())
         spec = self.start()
-        proc = self.cli("current", spec["run_id"][:12], "--json")
+        proc = self.cli("status", spec["run_id"][:12], "--json")
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(json.loads(proc.stdout)["run_id"], spec["run_id"])
 
@@ -155,8 +155,8 @@ class L1CliTest(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(len(proc.stdout.strip().splitlines()), 1)
 
-    def test_current_prefers_running_over_a_newer_finished_run(self):
-        """`current` answers "what am I working on"; `runs show` answers
+    def test_status_prefers_running_over_a_newer_finished_run(self):
+        """`status` answers "what am I working on"; `runs show` answers
         "what happened last". With two live runs and a newer finished one, the
         two commands must disagree."""
         self.save(two_step())
@@ -169,7 +169,7 @@ class L1CliTest(unittest.TestCase):
         second = self.artifact(step2)
         self.cli("complete", finished["run_id"], "--file", second)
 
-        current = self.cli("current", "--json")
+        current = self.cli("status", "--json")
         self.assertEqual(json.loads(current.stdout)["run_id"], live_b["run_id"])
         latest = self.cli("runs", "show", "--json")
         self.assertEqual(json.loads(latest.stdout)["run_id"], finished["run_id"])

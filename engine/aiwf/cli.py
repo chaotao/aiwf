@@ -9,7 +9,9 @@ The CLI is the boundary between an AI agent / human and the engine state machine
                                          start a run; --title names this run
                                          (what the work is about right now),
                                          then print the first spec
-    aiwf current RUN_ID                  print the current spec (any phase)
+    aiwf current RUN_ID                  print the current spec (any phase;
+                                         hidden, kept for SDK / old scripts --
+                                         `aiwf status RUN_ID --json` is a superset)
     aiwf complete RUN_ID --output...     report task/branch output, advance
     aiwf provide RUN_ID [-p k=v] ...     answer a node's user-input questions;
                                          --node changes a completed node (revision)
@@ -455,7 +457,7 @@ def print_spec(spec_envelope: Dict[str, Any], as_json: bool) -> None:
         child = node.get("child")
         if child:
             print(f"child    : run {child['run_id']} instance {child['instance']}"
-                  f" — drive it with `aiwf current {child['run_id']}`")
+                  f" — drive it with `aiwf status {child['run_id']}`")
         if node.get("message"):
             print(node["message"])
         if not child:
