@@ -53,7 +53,8 @@ check/review 要求、`submit.json` 路径、`next` 命令。**照 `next` 做**�
   run 完成/失败时删除 `submit.json`。
 - **旧 run 可能没有 `submit.json`**（L2 之前启动，或 SDK 驱动）：`aiwf status` 会标
   `(missing)`；`aiwf status --ensure` 补建，或直接 `aiwf submit`——单个文件任务且文件
-  已存在时首次 submit 会补建并完成，其余情况会以退出码 2 提示先编辑模板。
+  已存在时首次 submit 会补建并提交（若还有 output_schema 额外要求，会以驳回返回）；
+  其余情况会以退出码 2 提示先编辑模板。
 
 ## 接管与交接
 

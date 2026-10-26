@@ -561,7 +561,7 @@ L2 未做（属 L3）：`aiwf new` 脚手架、`use` 简写、弱模型基准、
 
 | 项 | 实施 |
 |---|---|
-| 旧 run 补 submit.json | `aiwf status` 在缺模板时显示 `(missing)` 与 `--ensure` 提示（保持只读）；`aiwf status --ensure` 显式补建；`aiwf submit` 首次遇到旧 run 会补建，单个文件任务且产物已存在时**直接完成**，其余以退出码 2 提示先编辑；`aiwf doctor` 统计缺模板的 running run |
+| 旧 run 补 submit.json | `aiwf status` 在缺模板时显示 `(missing)` 与 `--ensure` 提示（保持只读）；`aiwf status --ensure` 显式补建；`aiwf submit` 首次遇到旧 run 会补建，单个文件任务且产物已存在时**直接提交**（schema 额外要求会以驳回 3 返回），其余以退出码 2 提示先编辑；`aiwf doctor` 统计缺模板的 running run |
 | `aiwf new` | `--kind sequential\|checked\|batch` 生成可运行骨架（validate 必过）；已存在需 `--force`；公开命令 |
 | `use` 简写 | task/branch 可写 `use: ["idea","tone"]`，等价同名字段 inputs；显式 `inputs` 重名优先；校验拒绝用在 foreach/subflow；入库/运行/`validate` 前展开 |
 | `redo` 并入 revise | `aiwf revise RUN --target <node> --instance <key> --reason ...` 单实例重做；旧 `redo` 隐藏保留 |

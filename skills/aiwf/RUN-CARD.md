@@ -30,8 +30,9 @@ check/review 要求、`submit.json` 路径、`next` 命令。**照 `next` 做**�
 旧模板重放会退 4，此时 `aiwf status` 后 `aiwf submit --print` 重建。
 
 **旧 run 没有 `submit.json`**（L2 之前启动的）：`aiwf status` 会标 `(missing)`；
-首次 `aiwf submit` 会自动补建——单个文件任务且文件已存在时会直接完成，否则按提示
-编辑/加 flag 后重跑。也可以显式 `aiwf status --ensure` 补建。
+首次 `aiwf submit` 会自动补建——单个文件任务且文件已存在时会直接提交（若还有
+output_schema 的额外字段要求，会以驳回返回），否则按提示编辑/加 flag 后重跑。
+也可以显式 `aiwf status --ensure` 补建。
 
 ## 启动与准备
 
