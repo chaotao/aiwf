@@ -2,10 +2,11 @@
 
 日期：2026-10-26
 基线提交：`266d9db`（此前 `abf30de` / `f2c3a3e` / `d16f974` / `449a99a`）
-当前状态（2026-10-26 21:20 更新）：L0–L3 主要项已完成；
-**R1 / R2 / R3 已完成并提交**（`7dce0a6` / `6a02487` / `7c47bcd`，见各节标题）。
-本文剩下 **R4**（真实弱模型基准，需模型与预算，主人已定「先不做」）与
-**R5**（4 个可选决策，见 §6，不阻塞）。
+当前状态（2026-10-26 22:00 更新）：L0–L3 主要项已完成；
+**R1 / R2 / R3 已完成并提交**（`7dce0a6` / `6a02487` / `7c47bcd`，见各节标题）；
+**R5 已拍板：四项全部维持现状，不改**（见 §6）；
+**R4 主人已定先不做**（需模型与预算）。
+即：本文所列事项**全部收口，无待办代码项**。
 工作区：`F:\data\project\github\aiwf`。未跟踪的 `.acl-diagnostics/` 是 2026-10-25
 修复工作区 Windows 权限时留下的恢复记录，**不要提交**。
 
@@ -93,8 +94,8 @@ templates.md (84)            view.md (142)
 
 ### 实施步骤
 
-1. 先决定**删除旧文件还是留重定向 stub**（见 §6 决策 1）；推荐删除，并在同一次提交
-   改完所有链接。
+1. 先决定**删除旧文件还是留重定向 stub**（本条已按"删除、不留 stub"执行，
+   并在同一次提交里改完所有链接）；
 2. 按上表拼接内容；每份加目录、统一 H1/H2 层级；把跨文件链接改成新文件 + 锚点。
 3. 更新 `SKILL.md`、`RUN-CARD.md`、`TROUBLESHOOT.md`、`references/*.md` 中所有
    `references/<old>.md` 链接。
@@ -193,34 +194,38 @@ templates.md (84)            view.md (142)
 产出：一份 `sim/report-<date>.md`（沿用仓库 `sim/report*.md` 的写法），
 不要改写历史报告。
 
-## 6. R5：可选的遗留决策（4 项，2026-10-26 已逐项核实代码现状）
+## 6. ✅ R5：可选的遗留决策（已拍板，全部维持现状，2026-10-26）
 
-1. **`run --title` 是否给默认值**（唯一需要推翻历史拍板的一项）
+> **决议：四项都不改。** `run --title` 继续必填（不给默认值）；`submit` 不吸收
+> `revise --instance`；`status --ensure` 不改名；skill 副本漂移继续靠人工复制 + md5。
+> 下方是当时的现状核实与选项分析，**仅作留档**，不要再按「推荐」去实施。
+
+1. **`run --title` 是否给默认值** → **拍板：维持必填**（`cli.py:2199` 不动）
    - 现状：`cli.py:2199` `required=True`；`engine.py:1571` 的 `title` 本身是
      `Optional`，`record` 里干脆不写这个键；`view.run_title()` 的取值顺序是
      `view.dynamic_title` → `record.title` → `run_id`。
    - 影响：漏传 = argparse 失败重试一轮（退 2，弱模型多烧一次上下文）。
-   - 甲（推荐）：`required=False`，缺省生成 `<workflow name> · <YYYY-MM-DD>`
+   - 甲（**未采纳**）：`required=False`，缺省生成 `<workflow name> · <YYYY-MM-DD>`
      （`name` 是 workflow 必填字段，可靠）；`dynamic_title` 仍优先覆盖。
      代价：`runs list` 上同一天同流程的 run 名字会重复，要靠 run_id 区分。
    - 乙：维持必填（2026-10-11 的拍板：名字必须由人给，避免"自动名"淹没真意图）。
-2. **`submit` 是否吸收 `revise --instance`**
+2. **`submit` 是否吸收 `revise --instance`** → **拍板：不吸收**，`revise` 保持独立
    - 现状：`revise --instance` 走 `engine.redo()`（单实例重跑），与
      `--mode/--scope/--nodes` 互斥（`cli.py:1701-1710`）；`submit --node` 走的是
      「改历史输入 + 开修订」，两者语义不同。
    - 推荐：**不吸收**。revise 是逃生舱，塞进 submit 会让一个命令背 target /
      instance / mode / scope 四组互斥参数，弱模型更容易选错。
-3. **`status --ensure` 是否改名**（`--repair` 之类）
+3. **`status --ensure` 是否改名**（`--repair` 之类） → **拍板：不改名**
    - 现状：10 处引用（`RUN-CARD.md:35`、`run.md:64`、`TROUBLESHOOT.md:22` 三处
      文档 + engine/tests/README）。语义是"确保 submit.json 存在"。
    - 推荐：**不改**。改名收益近零、要动 10 处 + 破坏旧脚本；`--ensure` 的
      help 文本已经写清"create submit.json if a running run lacks one"。
-4. **skill 安装副本漂移检测**
+4. **skill 安装副本漂移检测** → **拍板：维持现状**（不加 `skills status`，不加版本戳）
    - 现状：靠人工全量复制 + md5 比对；`aiwf skills install` 内部是
      `shutil.copytree(dirs_exist_ok=True)`，**只覆盖、不删除** → 源里删掉的文件
      会残留在副本里（R1 删 12 份旧 reference 时正是这个风险）。`doctor` 只检查
      `.trae/skills/aiwf/SKILL.md` 存在，不比对内容。
-   - 甲（推荐）：给 `skills` 加 `status` 子命令，逐文件比对并分三类报：
+   - 甲（**未采纳**）：给 `skills` 加 `status` 子命令，逐文件比对并分三类报：
      缺失 / 内容不一致 / 多余（源里已删）；`--json` 可入 CI，不自动删。
    - 乙：只加版本戳（SKILL.md front-matter 写 version，副本落后就告警）。
      便宜，但查不出"改了一行没升版本"。
@@ -277,7 +282,9 @@ git diff --check
 2. ~~R2 current~~ ✅ `6a02487`（甲）
 3. ~~R3 别名清理~~ ✅ `7c47bcd`（本轮已提前做完）
 4. **R4 真实弱模型基准** —— 主人已定**先不做**（需模型与预算）。
-5. **R5** 逐项拍板，不阻塞（见 §6，四项均已有现状与推荐）。
+5. ~~R5 逐项拍板~~ ✅ 2026-10-26 拍板：**四项全部维持现状**（§6）
+
+结论：本移交文档已无待办项。后续若要动 R5 任一项，先读 §6 的留档分析再重新拍板。
 
 ## 10. 关键文件索引
 
