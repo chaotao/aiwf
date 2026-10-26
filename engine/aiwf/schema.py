@@ -183,6 +183,27 @@ def _validate_view(workflow: Dict[str, Any], spec: Dict[str, Any]) -> None:
     )
 
 
+def normalize_workflow(workflow: Dict[str, Any]) -> Dict[str, Any]:
+    """Expand ``use: [name, ...]`` into ``inputs: {name: {"ref": name}}``.
+
+    In place and idempotent. Explicit ``inputs`` wins on a duplicate name. Only
+    a well-formed list of strings is expanded; anything else is left for the
+    schema to reject.
+    """
+    for node in workflow.get("nodes") or []:
+        use = node.get("use")
+        if (node.get("type") in ("task", "branch")
+                and isinstance(use, list) and use
+                and all(isinstance(name, str) for name in use)):
+            merged = {name: {"ref": name} for name in use}
+            merged.update(node.get("inputs") or {})
+            node["inputs"] = merged
+            node.pop("use", None)
+        if isinstance(node.get("nodes"), list):
+            normalize_workflow({"nodes": node["nodes"]})
+    return workflow
+
+
 def validate_workflow(workflow: Dict[str, Any]) -> None:
     """Structural validation against workflow.schema.json + semantic checks."""
     _jsonschema_validate(
@@ -235,6 +256,10 @@ def validate_workflow(workflow: Dict[str, Any]) -> None:
         node_input = node_user_input_schema(node)
         if "user_input_schema" in node and node["type"] != "task":
             raise ValueError(f"node {node['id']!r}: user_input_schema is only supported on task nodes")
+        if "use" in node and node["type"] not in ("task", "branch"):
+            raise ValueError(
+                f"node {node['id']!r}: use is only supported on task/branch nodes"
+            )
         for value in (node.get("inputs"), node.get("items"), node.get("when")):
             validate_data_refs(value, node["id"])
         if workflow["schema_version"] == "1.0":

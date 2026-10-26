@@ -18,6 +18,8 @@
 
 - **`aiwf submit` 说 template created**：这是正常的第一次；模板已写到 `file` 行，
   填 `output`（或直接给 `--file` / `--verdict`）后再跑一次。
+- **旧 run 的 `submit.json` 缺失**：`aiwf status` 显示 `(missing)`；
+  `aiwf status --ensure` 补建，或直接 `aiwf submit`（文件任务且产物已就绪会直接完成）。
 - **`submit.json` 的 `output` 还是占位符**：check 的 `PASS|REVISE`、review 的
   `APPROVE|REJECT`、branch 的 `TRUE|FALSE` 必须替换成一个值。
 - **不知道写哪个文件**：`aiwf status` 的 `artifact:` 就是它；模板里的 `$file` 已经指向同一路径。

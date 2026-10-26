@@ -36,6 +36,21 @@ JSON Schema 本身不填默认值。未列出的任意自定义节点字段不�
 
 ## inputs 的值可以是什么
 
+同名字段可先用 `use` 简写，再按需覆盖：
+
+```json
+{
+  "use": ["idea", "tone"],
+  "inputs": {"idea": {"ref": "seed"}},
+  "prompt": "用 ${tone} 改写 seed"
+}
+```
+
+上面等价于 `inputs: {"idea": {"ref":"seed"}, "tone": {"ref":"tone"}}`；
+显式 `inputs` 在重名时优先。`use` 只用于 task/branch，且只能引用 context 里已有的键。
+
+完整映射写法：
+
 ```json
 {
   "inputs": {

@@ -51,6 +51,9 @@ check/review 要求、`submit.json` 路径、`next` 命令。**照 `next` 做**�
   不会把旧结果交给新步骤。此时 `aiwf status` 后 `aiwf submit --print` 重建。
 - 提交成功后引擎归档 payload 到 `submissions/NNNN-<node>.json`，并写下一份模板；
   run 完成/失败时删除 `submit.json`。
+- **旧 run 可能没有 `submit.json`**（L2 之前启动，或 SDK 驱动）：`aiwf status` 会标
+  `(missing)`；`aiwf status --ensure` 补建，或直接 `aiwf submit`——单个文件任务且文件
+  已存在时首次 submit 会补建并完成，其余情况会以退出码 2 提示先编辑模板。
 
 ## 接管与交接
 

@@ -19,7 +19,7 @@ description: 创建、运行与审计 aiwf 工作流。用户要求创建或修�
 |---|---|
 | 执行 / 接管 / 续跑 | [RUN-CARD](RUN-CARD.md) |
 | 找现成流程 | [模板库](references/templates.md) — 先 `aiwf wf list` |
-| 新建、修改定义；第一次使用 | [创建入门](references/create-workflow.md) |
+| 新建、修改定义；第一次使用 | [创建入门](references/create-workflow.md) — 可先 `aiwf new <id> --kind sequential\|checked\|batch` |
 | 找完整范例 | [范例目录](references/examples.md) — 选中后再读 assets 里的 JSON |
 | 查看进度、记录、产物 | [审计与检索](references/inspect-runs.md) |
 | 业务进展视图 / 标题 | [业务进展视图](references/view.md) |

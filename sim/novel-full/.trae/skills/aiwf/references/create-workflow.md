@@ -7,6 +7,8 @@
 ## 1. 初始化与选择范例
 
 在目标项目执行 `aiwf init`，定义放 `.aiwf/workflows/<id>.json`。
+`aiwf new <id> --kind sequential|checked|batch` 会生成一份可运行的骨架（可再改
+prompt/产物/验收），比从空 JSON 起步更稳。
 `aiwf skills install` 将本 Skill 安装到该项目的 `.trae/skills/aiwf`。
 若命令不在 PATH，使用引擎脚本的绝对路径；相对文件路径按命令工作目录解释。
 可从主入口的“范例目录”选择完整定义；先复制再按需求修改，勿修改 Skill 的模板。

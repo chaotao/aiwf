@@ -10,7 +10,7 @@
 | 改已完成 task，自动重做依赖它的结果 | revise --mode cascade（默认） |
 | 仅改目标 task，完成后返回发起位置 | revise --mode return |
 | 更改已完成 task 的用户答案并启动修订 | provide --node |
-| 只重做 foreach / subflow 的一个实例 | redo --node --instance |
+| 只重做 foreach / subflow 的一个实例 | revise --target --instance |
 | 代码或工具临时失败，定义本身正确 | 修好外部条件后 resume |
 | 定义写错、需要改变节点图 | 修改源定义、校验并启动新 run |
 
@@ -61,7 +61,7 @@ values 仍按该 task 的 user_input_schema 校验，成功后开启修订。
 ## 单实例重做
 
 ```bash
-aiwf redo <parent_run_id> --node chapters --instance 1 --reason "第一章需要重写" --json
+aiwf revise <parent_run_id> --target chapters --instance 1 --reason "第一章需要重写" --json
 ```
 
 instance 是稳定实例 key：静态清单取 `id_field` 字段，队列模式 (`{"queue": true}`)

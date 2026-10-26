@@ -29,10 +29,15 @@ check/review 要求、`submit.json` 路径、`next` 命令。**照 `next` 做**�
 `submit.json` 里带 action 指纹和预填 payload；**只改 `output`，不要改 `action`/`kind`**。
 旧模板重放会退 4，此时 `aiwf status` 后 `aiwf submit --print` 重建。
 
+**旧 run 没有 `submit.json`**（L2 之前启动的）：`aiwf status` 会标 `(missing)`；
+首次 `aiwf submit` 会自动补建——单个文件任务且文件已存在时会直接完成，否则按提示
+编辑/加 flag 后重跑。也可以显式 `aiwf status --ensure` 补建。
+
 ## 启动与准备
 
 ```bash
 aiwf init                                  # .aiwf + ./bin/aiwf
+aiwf new my-flow --kind checked            # 生成可运行骨架：sequential|checked|batch
 aiwf wf list                               # 有没有现成模板
 aiwf wf install std.review-loop            # 装模板（可选）
 aiwf validate --project                    # 装/改定义后必跑

@@ -316,7 +316,13 @@
         },
         "inputs": {
           "$ref": "#/$defs/inputs_mapping",
-          "description": "[subflow|foreach] Values passed into the child; rendered against parent context (foreach also exposes item/index)."
+          "description": "[task|branch|subflow|foreach] Materials/child inputs: name -> literal or ref. For task/branch, `use` is a same-name shorthand and explicit inputs wins."
+        },
+        "use": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "type": "string", "pattern": "^[A-Za-z_][A-Za-z0-9_]*$" },
+          "description": "[task|branch] Shorthand for inputs: each name becomes {name: {ref: name}}. Explicit inputs wins on a duplicate."
         },
         "items": {
           "$ref": "#/$defs/items_source",

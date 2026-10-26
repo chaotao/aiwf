@@ -40,6 +40,7 @@ from .errors import SchemaError, StaleActionError, UsageError
 from .schema import (
     _jsonschema_validate,
     node_user_input_schema,
+    normalize_workflow,
     validate_inputs,
     validate_run_record,
     validate_workflow,
@@ -1574,6 +1575,7 @@ class WorkflowEngine:
         Child records are built by :meth:`_new_child_record` instead and carry
         none, so they fall back to their run id.
         """
+        workflow = normalize_workflow(copy.deepcopy(workflow))
         validate_workflow(workflow)
         inputs = inputs or {}
         validate_inputs(workflow, inputs)

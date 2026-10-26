@@ -1,7 +1,7 @@
 # 让"不太聪明的模型"也用对 aiwf：易用性诊断与改造建议
 
 日期：2026-10-25
-状态：L0、L1、L2 已实施（见 §9–§11）；L3 仍是待评估建议。
+状态：L0–L3 的主要项已实施（见 §9–§12）；仅"物理合并 reference"与"移除 current"未做。
 范围：引擎 / CLI 协议 / 定义格式 / Skill 文档 / 分发。
 方法：通读实现（`cli.py` 1198 行、`engine.py` 2990 行、`schema.py`、`storage.py`、`view.py`、14 份 reference），
 在中文 Windows + PowerShell 5.1 下逐条实跑命令，并让一个只读 Skill 文档的 Agent（环境变量由外部给出）完整跑一遍两步流程。
@@ -554,3 +554,22 @@ L2（submit 协议）已落地，全量 **216 passed / 20 subtests**，两种编
 （`submit --approve` 只是搬运）；items 正常投喂走模板/`--item-file`，`aiwf items` 仅保留为排查/精细编辑。
 
 L2 未做（属 L3）：`aiwf new` 脚手架、`use` 简写、弱模型基准、把 `current` 彻底并入 `status`。
+
+## 12. L3 与旧 run 补齐（2026-10-26）
+
+全量 **226 passed / 20 subtests**，两种编码环境都绿。
+
+| 项 | 实施 |
+|---|---|
+| 旧 run 补 submit.json | `aiwf status` 在缺模板时显示 `(missing)` 与 `--ensure` 提示（保持只读）；`aiwf status --ensure` 显式补建；`aiwf submit` 首次遇到旧 run 会补建，单个文件任务且产物已存在时**直接完成**，其余以退出码 2 提示先编辑；`aiwf doctor` 统计缺模板的 running run |
+| `aiwf new` | `--kind sequential\|checked\|batch` 生成可运行骨架（validate 必过）；已存在需 `--force`；公开命令 |
+| `use` 简写 | task/branch 可写 `use: ["idea","tone"]`，等价同名字段 inputs；显式 `inputs` 重名优先；校验拒绝用在 foreach/subflow；入库/运行/`validate` 前展开 |
+| `redo` 并入 revise | `aiwf revise RUN --target <node> --instance <key> --reason ...` 单实例重做；旧 `redo` 隐藏保留 |
+| 弱模型基准 | 新增 `bench/run_bench.py`：盲跟随者只用 `status`/`submit` 跑 5 个场景（顺序/check+review/队列/provide/旧 run 删模板），记录命令数、错误、traceback；当前全部 completed、0 错误、0 traceback |
+| 测试 | 新增 `tests/test_l2_cli.py`（23 项，含补建）与 `tests/test_l3_cli.py`（7 项） |
+
+仍未做：
+
+- **物理合并 14 份 reference**：默认路径已经只读 SKILL → RUN-CARD/TROUBLESHOOT →
+  按需参考；物理合并是编辑工作，不影响弱模型的默认行为，暂不做以免丢细节。
+- **移除 `current`**：它是 SDK/旧脚本的稳定入口，`status --json` 是其超集；保留为隐藏命令。

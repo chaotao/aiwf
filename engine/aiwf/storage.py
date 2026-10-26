@@ -305,7 +305,8 @@ class Storage:
                 f"run `aiwf init` and create it first"
             )
         with open(path, "r", encoding="utf-8-sig") as f:
-            return json.load(f)
+            from .schema import normalize_workflow
+            return normalize_workflow(json.load(f))
 
     def save_workflow(self, workflow: Dict[str, Any]) -> str:
         os.makedirs(self.workflows_dir, exist_ok=True)
@@ -543,7 +544,8 @@ class Storage:
         workflow_id = record["workflow_id"]
         snapshot = os.path.join(self.run_dir_for_record(record), "workflow.json")
         if os.path.exists(snapshot):
-            return self.read_json_file(snapshot)
+            from .schema import normalize_workflow
+            return normalize_workflow(self.read_json_file(snapshot))
         if self.workflow_exists(workflow_id):
             workflow = self.load_workflow(workflow_id)
             if workflow["schema_version"] != record.get("workflow_version", "1.0"):

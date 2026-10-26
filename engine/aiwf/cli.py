@@ -53,7 +53,7 @@ from .errors import (
     UsageError,
 )
 from .paths import data_candidates
-from .schema import validate_workflow
+from .schema import normalize_workflow, validate_workflow
 from .storage import Storage
 
 
@@ -864,6 +864,88 @@ def _write_project_launchers() -> List[str]:
     return written
 
 
+def _scaffold_workflow(workflow_id: str, kind: str) -> Dict[str, Any]:
+    base: Dict[str, Any] = {
+        "schema_version": "1.1",
+        "id": workflow_id,
+        "name": workflow_id,
+    }
+    if kind == "checked":
+        base["input_schema"] = {
+            "type": "object", "required": ["idea"],
+            "properties": {"idea": {"type": "string"}},
+        }
+        base["nodes"] = [{
+            "id": "draft",
+            "type": "task",
+            "inputs": {"idea": {"ref": "idea"}},
+            "prompt": "按 idea 产出第一版。要求写清楚：目标读者、核心内容、验收标准。",
+            "output": {"file": "${run.dir}/draft.md"},
+            "check": {
+                "criteria": ["产物覆盖 idea 的核心要求", "结构与表达可直接交付"],
+                "max_attempts": 3,
+            },
+            "review": {"requirements": ["是否达到可交付标准"]},
+        }]
+    elif kind == "batch":
+        base["nodes"] = [{
+            "id": "work",
+            "type": "foreach",
+            "items": {"queue": True},
+            "nodes": [{
+                "id": "step",
+                "type": "task",
+                "inputs": {"item": {"ref": "item"}},
+                "prompt": "处理 item：${item.name}。只改必要内容，完成后写产物。",
+                "output": {"file": "${run.dir}/${item.id}.md"},
+                "review": {"requirements": ["该项可以验收"]},
+            }],
+        }]
+    else:  # sequential
+        base["input_schema"] = {
+            "type": "object", "required": ["idea"],
+            "properties": {"idea": {"type": "string"}},
+        }
+        base["nodes"] = [
+            {
+                "id": "draft",
+                "type": "task",
+                "inputs": {"idea": {"ref": "idea"}},
+                "prompt": "按 idea 产出第一版；把目标、范围和验收标准写清楚。",
+                "output": {"file": "${run.dir}/draft.md"},
+            },
+            {
+                "id": "polish",
+                "type": "task",
+                "inputs": {"draft": {"ref": "draft"}},
+                "prompt": "读取 draft 文件，按目标润色；保留事实与结构。",
+                "output": {"file": "${run.dir}/final.md"},
+                "review": {"requirements": ["是否达到可交付标准"]},
+            },
+        ]
+    return base
+
+
+def cmd_new(args, storage: Storage) -> int:
+    workflow = _scaffold_workflow(args.workflow_id, args.kind)
+    validate_workflow(workflow)  # also enforces the id pattern
+    path = storage.workflow_path(workflow["id"])
+    if os.path.exists(path) and not getattr(args, "force", False):
+        raise UsageError(
+            f"workflow file already exists: {path}",
+            hint="choose another id, or pass --force to overwrite",
+        )
+    storage.save_workflow(workflow)
+    print(f"created: {path}  (kind={args.kind})")
+    if args.kind == "batch":
+        print("next: aiwf validate --project; aiwf run "
+              f"{workflow['id']} --title \"...\" --json")
+    else:
+        print("next: aiwf validate --project; aiwf run "
+              f"{workflow['id']} --title \"...\" -p idea=\"...\" --json")
+    return 0
+
+
 def cmd_init(args, storage: Storage) -> int:
     storage.init_dirs()
     print(f"initialized aiwf storage at {storage.root}")
@@ -897,6 +979,24 @@ def cmd_doctor(args, storage: Storage) -> int:
     add("storage", "ok" if os.path.isdir(storage.root) else "warn",
         f"{storage.root}  workflows={len(storage.list_workflows())}  "
         f"runs={sum(1 for _ in storage.iter_run_files())}")
+    missing_templates = []
+    for _wf, rid, path, parent in storage.iter_run_files():
+        if parent is not None:
+            continue
+        try:
+            candidate = storage.load_record(path)
+        except (OSError, ValueError):
+            continue
+        if candidate.get("status") != "running":
+            continue
+        template = os.path.join(
+            storage.run_dir_for_record(candidate), SUBMIT_NAME
+        )
+        if not os.path.isfile(template):
+            missing_templates.append(rid)
+    add("submit-files", "warn" if missing_templates else "ok",
+        (f"{len(missing_templates)} running run(s) without submit.json; "
+         f"run `aiwf status --ensure`" if missing_templates else "all running runs"))
     schemas_ok = all(
         os.path.isfile(os.path.join(schema_mod.SCHEMA_DIR, f"{name}.schema.json"))
         for name in ("workflow", "run_record")
@@ -979,6 +1079,7 @@ def cmd_validate(args, storage: Storage) -> int:
         validate_workflow(workflow)
     except SchemaError as e:
         raise SchemaError(e.message, at=f"{args.path}:{e.at}", hint=e.hint) from None
+    workflow = normalize_workflow(workflow)
     WorkflowEngine(storage).references_check(workflow)
     print(f"valid: {args.path} (workflow {workflow['id']!r}, {len(workflow['nodes'])} nodes)")
     return 0
@@ -1017,7 +1118,11 @@ def cmd_current(args, storage: Storage) -> int:
     return _emit(WorkflowEngine(storage), record, args, advance=False)
 
 
-def _print_status(spec: Dict[str, Any], submit_file: Optional[str] = None) -> None:
+def _print_status(
+    spec: Dict[str, Any],
+    submit_file: Optional[str] = None,
+    submit_missing: bool = False,
+) -> None:
     print(f"run   {spec['run_id']}  {spec.get('title', '')}  {spec['status']}")
     node = spec.get("node")
     input_request = spec.get("input_request")
@@ -1105,6 +1210,8 @@ def _print_status(spec: Dict[str, Any], submit_file: Optional[str] = None) -> No
         print(f"error : {str(spec['error'])[:300]}")
     if submit_file:
         print(f"file  : {_posix(submit_file)}")
+    elif submit_missing:
+        print("file  : (missing; run `aiwf status --ensure` or `aiwf submit --print`)")
     next_command = _next_for_spec(spec)
     if next_command:
         print(f"next  : {next_command['text']}")
@@ -1123,20 +1230,24 @@ def cmd_status(args, storage: Storage) -> int:
         spec = engine.node_spec(_load_workflow_for_record(storage, record), record)
     workflow, _error = _resolve_definition(record, storage)
     spec["title"] = view_mod.run_title(workflow, record)
+    if getattr(args, "ensure", False) and spec.get("action"):
+        write_submit_template(storage, spec)
     submit_file = _submit_path(storage, spec["run_id"])
     if not os.path.isfile(submit_file):
         submit_file = None
+    submit_missing = bool(spec.get("action") and not submit_file)
 
     if getattr(args, "json", False):
         payload = dict(spec)
         payload["submit_file"] = _posix(submit_file) if submit_file else None
+        payload["submit_missing"] = submit_missing
         next_command = _next_for_spec(spec)
         if next_command is not None:
             payload["next"] = next_command
         print(json.dumps(payload, ensure_ascii=False, indent=2))
         return 0
 
-    _print_status(spec, submit_file)
+    _print_status(spec, submit_file, submit_missing)
     return 0
 
 
@@ -1216,6 +1327,23 @@ def _validate_submit_flags(kind: str, args) -> None:
         raise UsageError("--verdict only applies to check or review")
 
 
+def _template_ready(template: Dict[str, Any], spec: Dict[str, Any]) -> bool:
+    """Whether a freshly created template can be submitted without edits.
+
+    Only a single-file task (file already written) or an empty mechanical step
+    qualifies. check/review/provide always need a human/agent decision, and a
+    structured output needs a payload.
+    """
+    kind = template.get("kind")
+    if kind == "empty":
+        return True
+    if kind == "complete":
+        output = template.get("output")
+        if isinstance(output, dict) and output.get("$file"):
+            return os.path.isfile(output["$file"])
+    return False
+
+
 def _submit_items(args) -> List[Any]:
     items: List[Any] = []
     for raw in getattr(args, "item", None) or []:
@@ -1285,13 +1413,15 @@ def cmd_submit(args, storage: Storage) -> int:
             )
     elif not _has_submit_flags(args):
         write_submit_template(storage, spec)
-        raise UsageError(
-            f"submit template created at {template_path}",
-            at=template_path,
-            hint="fill `output` and run `aiwf submit`, or pass a payload flag "
-                 "(e.g. --file PATH / --verdict PASS --reason \"...\")",
-            next_command="aiwf submit",
-        )
+        template = build_submit_template(spec)
+        if not _template_ready(template, spec):
+            raise UsageError(
+                f"submit template created at {template_path}",
+                at=template_path,
+                hint="fill `output` and run `aiwf submit`, or pass a payload flag "
+                     "(e.g. --file PATH / --verdict PASS --reason \"...\")",
+                next_command="aiwf submit",
+            )
 
     kind = (template or {}).get("kind") or _submit_kind(spec)
     expected_kind = _submit_kind(spec)
@@ -1611,9 +1741,21 @@ def cmd_review(args, storage: Storage) -> int:
 
 
 def cmd_revise(args, storage: Storage) -> int:
+    args.run_id = _pick_run(storage, args.run_id, need_running=False)
     record = storage.find_run(args.run_id)
     workflow = _load_workflow_for_record(storage, record)
     engine = WorkflowEngine(storage)
+    if getattr(args, "instance", None):
+        if args.mode != "cascade" or args.scope != "auto" or args.nodes:
+            raise UsageError(
+                "--instance is a single-instance redo; drop --mode/--scope/--nodes",
+                hint="e.g. aiwf revise <run> --target work --instance TASK-002 --reason '...'",
+            )
+        record = engine.redo(
+            workflow, args.run_id, args.target, args.instance,
+            reason=args.reason,
+        )
+        return _emit(engine, record, args)
     manual = args.nodes.split(",") if args.nodes else None
     record = engine.revise(
         workflow, args.run_id, args.target, args.reason,
@@ -2118,6 +2260,20 @@ def build_parser() -> argparse.ArgumentParser:
     pw.add_argument("--json", action="store_true")
     pw.set_defaults(func=cmd_workflows)
 
+    pn = sub.add_parser(
+        "new", help="scaffold a runnable workflow definition",
+        description="Write .aiwf/workflows/<id>.json from a minimal template, "
+                    "then validate and run it.",
+    )
+    pn.add_argument("workflow_id")
+    pn.add_argument("--kind", choices=["sequential", "checked", "batch"],
+                    default="sequential",
+                    help="sequential: two tasks; checked: one task + check/review; "
+                         "batch: queue foreach (default sequential)")
+    pn.add_argument("--force", action="store_true",
+                    help="overwrite an existing definition file")
+    pn.set_defaults(func=cmd_new)
+
     pr = sub.add_parser("run", help="start a workflow run; prints first spec")
     pr.add_argument("workflow_id")
     pr.add_argument("--title", required=True,
@@ -2142,6 +2298,8 @@ def build_parser() -> argparse.ArgumentParser:
                     "and the command that continues it.",
     )
     ps.add_argument("run_id", nargs="?")
+    ps.add_argument("--ensure", action="store_true",
+                    help="create submit.json if a running run lacks one")
     ps.add_argument("--json", action="store_true")
     ps.set_defaults(func=cmd_status)
 
@@ -2241,6 +2399,8 @@ def build_parser() -> argparse.ArgumentParser:
     prev3.add_argument("--mode", choices=["cascade", "return"], default="cascade")
     prev3.add_argument("--scope", choices=["auto", "all", "manual"], default="auto")
     prev3.add_argument("--nodes", help="scope=manual: comma-separated node ids")
+    prev3.add_argument("--instance",
+                       help="redo one subflow/foreach instance (the node's instance key)")
     prev3.add_argument("--json", action="store_true")
     prev3.set_defaults(func=cmd_revise)
 
@@ -2428,6 +2588,7 @@ def _full_help() -> str:
   aiwf                      show the current step (same as `aiwf status`)
   aiwf status [RUN]         task packet: node, materials, artifact, next
   aiwf submit [RUN]         report the current step's result (one write verb)
+  aiwf new ID --kind K      scaffold a runnable definition
   aiwf run WF --title ...   start a run
   aiwf runs ...             audit runs
   aiwf resume RUN           recover a failed run

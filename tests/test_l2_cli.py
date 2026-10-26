@@ -196,6 +196,43 @@ class L2CliTest(unittest.TestCase):
         self.assertIn("submit.json", proc.stdout)
         self.assertEqual(self.template(spec)["action"], spec["action"]["id"])
 
+    def test_status_reports_a_missing_template_and_ensure_creates_it(self):
+        self.save(file_task())
+        spec = self.start()
+        self.template_path(spec).unlink()
+        status = self.cli("status", spec["run_id"])
+        self.assertIn("missing", status.stdout)
+        self.assertFalse(self.template_path(spec).is_file())
+
+        payload = json.loads(self.cli("status", spec["run_id"], "--json").stdout)
+        self.assertTrue(payload["submit_missing"])
+        self.assertIsNone(payload["submit_file"])
+
+        ensured = self.cli("status", spec["run_id"], "--ensure")
+        self.assertEqual(ensured.returncode, 0, ensured.stderr)
+        self.assertTrue(self.template_path(spec).is_file())
+
+    def test_submit_backfills_an_old_run_and_finishes_when_ready(self):
+        self.save(file_task())
+        spec = self.start()
+        self.artifact(spec)
+        self.template_path(spec).unlink()
+        proc = self.cli("submit", spec["run_id"], "--json")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(json.loads(proc.stdout)["status"], "completed")
+
+    def test_submit_backfills_a_check_and_asks_for_an_edit(self):
+        self.save(file_task(check=True))
+        spec = self.start()
+        self.artifact(spec)
+        checked = json.loads(self.cli("submit", spec["run_id"], "--json").stdout)
+        self.assertEqual(checked["phase"], "awaiting_check")
+        self.template_path(checked).unlink()
+        proc = self.cli("submit", spec["run_id"])
+        self.assertEqual(proc.returncode, 2)
+        self.assertIn("template created", proc.stderr)
+        self.assertEqual(self.template(checked)["kind"], "check")
+
     # ---- phase dispatch --------------------------------------------------
     def test_check_then_review_through_submit(self):
         self.save(file_task(check=True, review=True))
