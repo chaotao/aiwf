@@ -383,14 +383,97 @@ class L2CliTest(unittest.TestCase):
         self.assertIn("current", self.cli("--help-all").stdout)
         self.assertNotIn("aiwf current", self.cli("--help").stdout)
 
-    def test_deprecated_complete_still_works_with_a_note(self):
+    def test_removed_commands_point_at_submit(self):
+        """R3: complete/provide/review/fail/redo are gone, not just hidden.
+
+        A stale script must get a pointer instead of argparse's traceback."""
+        self.save(file_task())
+        self.start()
+        for verb, replacement in (
+            ("complete", "aiwf submit"),
+            ("provide", "aiwf submit"),
+            ("review", "aiwf submit --verdict APPROVE|REJECT"),
+            ("fail", 'aiwf submit --fail "..."'),
+            ("redo", "aiwf revise"),
+        ):
+            proc = self.cli(verb, "--json")
+            self.assertEqual(proc.returncode, 2, (verb, proc.stdout))
+            payload = json.loads(proc.stdout)
+            self.assertEqual(payload["code"], "E_USAGE", verb)
+            self.assertIn(replacement, payload["next"], verb)
+            self.assertIn("no longer exists", payload["error"], verb)
+        self.assertIn("complete", self.cli("--help-all").stdout)
+        self.assertNotIn("complete", self.cli("--help").stdout)
+
+    def test_submit_reports_model_and_tokens_for_the_audit_trail(self):
+        """R3 folded `complete --model/--tokens` into `submit`."""
         self.save(file_task())
         spec = self.start()
         path = self.artifact(spec)
-        proc = self.cli("complete", spec["run_id"], "--file", path)
+        proc = self.cli("submit", spec["run_id"], "--file", path,
+                        "--model", "fixture-model",
+                        "--tokens", '{"prompt_tokens": 11, "completion_tokens": 7,'
+                                    ' "total_tokens": 18}',
+                        "--json")
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertIn("deprecated", proc.stderr)
-        self.assertIn("aiwf submit", proc.stderr)
+        record = json.loads(self.cli("runs", "show", spec["run_id"], "--json").stdout)
+        node_run = [n for n in record["node_runs"] if n["node_id"] == "write"][0]
+        self.assertEqual(node_run["model"], "fixture-model")
+        self.assertEqual(node_run["tokens"]["total_tokens"], 18)
+
+    def test_submit_node_changes_completed_input_and_starts_a_revision(self):
+        """R3 folded `provide --node` into `submit --node`.
+
+        The target must be a *finished* node inside a run that is still going;
+        a completed run needs `resume` first, same as before."""
+        self.save({
+            "schema_version": "1.1", "id": "twostep", "name": "twostep",
+            "input_schema": {"type": "object", "required": ["idea"],
+                             "properties": {"idea": {"type": "string"}}},
+            "nodes": [
+                {"id": "draft", "type": "task",
+                 "user_input_schema": {
+                     "type": "object", "required": ["tone"],
+                     "properties": {"tone": {"type": "string",
+                                             "enum": ["冷峻", "温暖"]}}},
+                 "inputs": {"tone": {"ref": "tone"}},
+                 "prompt": "用 ${tone} 写。",
+                 "output": {"file": "${run.dir}/draft.md"}},
+                {"id": "polish", "type": "task", "prompt": "润色。",
+                 "output": {"file": "${run.dir}/polish.md"}},
+            ],
+        })
+        run = self.start("twostep")
+        self.assertEqual(run["action"]["kind"], "provide")
+        self.cli("submit", run["run_id"], "-p", "tone=冷峻")
+        spec = json.loads(self.cli("status", "--json").stdout)
+        raw = spec["node"]["output"]["file"]
+        path = Path(raw) if Path(raw).is_absolute() else self.base / raw
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("正文", encoding="utf-8")
+        advanced = self.cli("submit", spec["run_id"], "--file", str(path), "--json")
+        self.assertEqual(json.loads(advanced.stdout)["node"]["id"], "polish")
+
+        bad = self.cli("submit", spec["run_id"], "--node", "draft",
+                       "-p", "tone=暴躁", "--reason", "非法取值", "--json")
+        self.assertEqual(bad.returncode, 2, bad.stdout)
+        self.assertEqual(json.loads(bad.stdout)["code"], "E_INPUT_INVALID")
+
+        revised = self.cli("submit", spec["run_id"], "--node", "draft",
+                           "-p", "tone=温暖", "--reason", "用户调整风格", "--json")
+        self.assertEqual(revised.returncode, 0, revised.stdout)
+        payload = json.loads(revised.stdout)
+        self.assertEqual(payload["status"], "running")
+        self.assertEqual(payload["node"]["id"], "draft")
+        record = json.loads(self.cli("runs", "show", spec["run_id"], "--json").stdout)
+        self.assertIsNotNone(record["revision"])
+
+    def test_submit_node_needs_answers(self):
+        self.save(ask_workflow())
+        run = self.start("ask")
+        proc = self.cli("submit", run["run_id"], "--node", "draft", "--json")
+        self.assertEqual(proc.returncode, 2, proc.stdout)
+        self.assertIn("--node needs the new answers", proc.stdout)
 
 
 if __name__ == "__main__":

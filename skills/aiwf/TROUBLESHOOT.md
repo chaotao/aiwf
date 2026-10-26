@@ -24,7 +24,7 @@
   `APPROVE|REJECT`、branch 的 `TRUE|FALSE` 必须替换成一个值。
 - **不知道写哪个文件**：`aiwf status` 的 `artifact:` 就是它；模板里的 `$file` 已经指向同一路径。
 - **改了定义但 run 没变**：1.1 run 用启动时的定义快照；修定义后新建 run。
-- **多个 run 在跑**：`aiwf runs list --status running`，给 `status/complete/submit`
+- **多个 run 在跑**：`aiwf runs list --status running`，给 `status/submit`
   显式 `run_id`（或唯一前缀）。
 - **命令找不到**：`./bin/aiwf` 不存在就跑 `aiwf init` 生成；再不行 `aiwf doctor`。
 - **Windows 中文乱码**：CLI 已强制 UTF-8；若终端仍乱码，先 `chcp 65001` 或用
@@ -34,5 +34,6 @@
 
 - 不要用 `--force` 绕过 stale；过期就重新 `status`。
 - 不要手改 `submit.json` 的 `action` / `kind`。
-- 不要用 `complete` / `provide` / `review` / `fail`（已隐藏、弃用）；统一 `submit`。
+- `complete` / `provide` / `review` / `fail` / `redo` 已移除；统一 `submit`
+  （改历史输入用 `submit --node`，单实例重做用 `revise --instance`）。
 - 不要在 check 未通过时补报 PASS；不要替用户 APPROVE。

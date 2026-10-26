@@ -513,16 +513,17 @@ class UsabilityTest(unittest.TestCase):
             action = spec["action"]
             args = (root_id, "--action", action["id"])
             if action["kind"] == "provide":
-                spec = call("provide", *args, "-p", "premise=测试设定", "-p", "protagonist=测试人物")
+                spec = call("submit", *args, "-p", "premise=测试设定", "-p", "protagonist=测试人物")
             elif action["kind"] == "review":
                 approvals += 1
-                spec = call("review", *args, "--verdict", "APPROVE", "--feedback", "TEST FIXTURE ONLY")
+                spec = call("submit", *args, "--verdict", "APPROVE", "--feedback", "TEST FIXTURE ONLY")
             elif action["kind"] == "check":
                 reject = action["node_id"] == "draft" and not first_revision
                 first_revision |= reject
-                output = {"verdict": "REVISE" if reject else "PASS",
-                          "reason": "TEST FIXTURE: add ending" if reject else "TEST FIXTURE: accepted"}
-                spec = call("complete", *args, "--output", json.dumps(output))
+                spec = call("submit", *args,
+                            "--verdict", "REVISE" if reject else "PASS",
+                            "--reason", "TEST FIXTURE: add ending" if reject
+                            else "TEST FIXTURE: accepted")
             else:
                 self.assertEqual(action["kind"], "complete")
                 node = spec["node"]
@@ -537,7 +538,7 @@ class UsabilityTest(unittest.TestCase):
                     ]}
                     invalid = copy.deepcopy(output)
                     invalid["chapters"].pop()
-                    rejected = call("complete", *args, "--output", json.dumps(invalid),
+                    rejected = call("submit", *args, "--output", json.dumps(invalid),
                                     expect=3)
                     self.assertEqual(rejected["action"]["node_id"], "plan")
                     args = (root_id, "--action", rejected["action"]["id"])
@@ -566,7 +567,7 @@ class UsabilityTest(unittest.TestCase):
                         encoding="utf-8",
                     )
                     output = {"$file": str(path), "total_word_count": 3240}
-                spec = call("complete", *args, "--output", json.dumps(output))
+                spec = call("submit", *args, "--output", json.dumps(output))
         self.assertEqual(spec["status"], "completed")
         self.assertEqual(len(chapter_paths), 3)
         self.assertEqual(approvals, 2)
@@ -589,7 +590,7 @@ class UsabilityTest(unittest.TestCase):
             return json.loads(proc.stdout)
         spec = call("run", "usability", "--title", "round trip")
         stale = subprocess.run(
-            [*CLI, "complete", spec["run_id"], "--action", "deadbeef",
+            [*CLI, "submit", spec["run_id"], "--action", "deadbeef",
              "--output", "late", "--json"],
             env=env, text=True, encoding="utf-8", capture_output=True,
         )
@@ -597,7 +598,7 @@ class UsabilityTest(unittest.TestCase):
         self.assertEqual(json.loads(stale.stdout)["code"], "E_STALE_ACTION")
         # L1: omitting --action uses the current action (no id to copy)
         implicit = subprocess.run(
-            [*CLI, "complete", spec["run_id"], "--output", "late", "--json"],
+            [*CLI, "submit", spec["run_id"], "--output", "late", "--json"],
             env=env, text=True, encoding="utf-8", capture_output=True,
         )
         self.assertEqual(implicit.returncode, 0, implicit.stderr)

@@ -61,4 +61,5 @@ description: 创建、运行与审计 aiwf 工作流。用户要求创建或修�
 解释器与 engine 路径）→ PATH 的 `aiwf` → 本仓库 `engine/bin/aiwf`（Windows
 `engine/bin/aiwf.cmd`）→ `PYTHONPATH=engine python -m aiwf`。拿不准先跑 `aiwf doctor`；
 `aiwf --help-all` 列出隐藏命令：`current`（已隐藏，兼容旧脚本；`status --json` 是其超集）、
-`complete/provide/review/fail`（已弃用，统一用 `submit`）、`items`（队列排查/精细编辑）。
+`items`（队列排查/精细编辑）。`complete/provide/review/fail/redo` 已移除，
+调用退 2 并指向 `submit` / `revise`。

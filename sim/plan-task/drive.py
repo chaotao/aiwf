@@ -247,12 +247,13 @@ def main():
             else:
                 sys.exit(f"! unexpected node {node_id!r}")
             # the reported object is short by design -> inline, no scratch file
-            spec = cli("complete", root, "--action", act["id"],
+            spec = cli("submit", root, "--action", act["id"],
                        "--output", json.dumps(out, ensure_ascii=False), "--json")
 
         elif kind == "check":
-            spec = cli("complete", root, "--action", act["id"],
-                       "--output", '{"verdict":"PASS","reason":"逐条核对验收点，达标"}', "--json")
+            spec = cli("submit", root, "--action", act["id"],
+                       "--verdict", "PASS", "--reason", "逐条核对验收点，达标",
+                       "--json")
 
         elif kind == "review":
             if args.stop_at_accept and node_id == "accept":
@@ -262,7 +263,7 @@ def main():
                     and approved_tasks >= args.stop_at_task - 1):
                 print(f"\n停在 TASK-{args.stop_at_task:03d} 的验收门；run {root} 仍在运行。")
                 return root
-            spec = cli("review", root, "--action", act["id"],
+            spec = cli("submit", root, "--action", act["id"],
                        "--verdict", "APPROVE", "--feedback", "仿真验收通过", "--json")
             if node_id == "execute":
                 approved_tasks += 1

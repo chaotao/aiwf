@@ -85,7 +85,7 @@ class L1CliTest(unittest.TestCase):
         self.save(two_step())
         spec = self.start()
         path = self.artifact(spec)
-        proc = self.cli("complete", spec["run_id"], "--file", path, "--json")
+        proc = self.cli("submit", spec["run_id"], "--file", path, "--json")
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(json.loads(proc.stdout)["node"]["id"], "second")
 
@@ -94,7 +94,7 @@ class L1CliTest(unittest.TestCase):
         spec = self.start()
         path = self.artifact(spec)
         prefix = spec["action"]["id"][:6]
-        proc = self.cli("complete", spec["run_id"], "--action", prefix,
+        proc = self.cli("submit", spec["run_id"], "--action", prefix,
                         "--file", path, "--json")
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(json.loads(proc.stdout)["node"]["id"], "second")
@@ -103,7 +103,7 @@ class L1CliTest(unittest.TestCase):
         self.save(two_step())
         spec = self.start()
         path = self.artifact(spec)
-        proc = self.cli("complete", spec["run_id"], "--action", "first",
+        proc = self.cli("submit", spec["run_id"], "--action", "first",
                         "--file", path, "--json")
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(json.loads(proc.stdout)["node"]["id"], "second")
@@ -113,7 +113,7 @@ class L1CliTest(unittest.TestCase):
         self.save(two_step())
         spec = self.start()
         path = self.artifact(spec)
-        proc = self.cli("complete", "--file", path, "--json")
+        proc = self.cli("submit", "--file", path, "--json")
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(json.loads(proc.stdout)["node"]["id"], "second")
 
@@ -135,7 +135,7 @@ class L1CliTest(unittest.TestCase):
         self.save(two_step())
         self.start(title="first")
         self.start(title="second")
-        proc = self.cli("complete", "--file", "x")
+        proc = self.cli("submit", "--file", "x")
         self.assertEqual(proc.returncode, 2)
         self.assertIn("multiple runs", proc.stderr)
 
@@ -165,9 +165,9 @@ class L1CliTest(unittest.TestCase):
         finished = self.start(title="finished C")
         first = self.artifact(finished)
         step2 = json.loads(self.cli(
-            "complete", finished["run_id"], "--file", first, "--json").stdout)
+            "submit", finished["run_id"], "--file", first, "--json").stdout)
         second = self.artifact(step2)
-        self.cli("complete", finished["run_id"], "--file", second)
+        self.cli("submit", finished["run_id"], "--file", second)
 
         current = self.cli("status", "--json")
         self.assertEqual(json.loads(current.stdout)["run_id"], live_b["run_id"])
@@ -178,8 +178,8 @@ class L1CliTest(unittest.TestCase):
     def test_resume_takes_only_the_run_id(self):
         self.save(two_step())
         spec = self.start()
-        failed = self.cli("fail", spec["run_id"], "--action",
-                          spec["action"]["id"], "--error", "temporary")
+        failed = self.cli("submit", spec["run_id"], "--action",
+                          spec["action"]["id"], "--fail", "temporary")
         self.assertEqual(failed.returncode, 1, failed.stderr)
         proc = self.cli("resume", spec["run_id"], "--json")
         self.assertEqual(proc.returncode, 0, proc.stderr)
@@ -206,9 +206,9 @@ class L1CliTest(unittest.TestCase):
         spec = self.start()
         first = self.artifact(spec)
         step2 = json.loads(self.cli(
-            "complete", spec["run_id"], "--file", first, "--json").stdout)
+            "submit", spec["run_id"], "--file", first, "--json").stdout)
         second = self.artifact(step2)
-        self.cli("complete", spec["run_id"], "--file", second)
+        self.cli("submit", spec["run_id"], "--file", second)
         proc = self.cli("status")
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("(none; run finished)", proc.stdout)

@@ -300,7 +300,7 @@ view       :
   [wait] 逐条执行  -- 已完成 1/2 · 当前 潮汐谜题与关卡原型｜依赖：TASK-001（执行与自检） · 还剩 1
     [ok  ] TASK-001  核心循环 spec｜依赖：无
     [>>  ] TASK-002  潮汐谜题与关卡原型｜依赖：TASK-001  <- 当前（执行与自检）
-    -> aiwf review 20261005-203111-5aca78 --action f488c0ce2df55c59fb0d9fed --verdict APPROVE|REJECT
+    -> aiwf submit --verdict APPROVE|REJECT --feedback "..."
   [    ] 整体验收
   [    ] 交付完成
 ```
@@ -317,7 +317,7 @@ view       :
     [ok  ] TASK-001  核心循环 spec｜依赖：无
     [ok  ] TASK-002  潮汐谜题与关卡原型｜依赖：TASK-001
   [wait] 整体验收  -- 整体回归通过，闭环成立
-    -> aiwf review 20261005-203108-d85a1c --action 43681819b5dac56dbe3bdd21 --verdict APPROVE|REJECT
+    -> aiwf submit --verdict APPROVE|REJECT --feedback "..."
   [    ] 交付完成
 ```
 

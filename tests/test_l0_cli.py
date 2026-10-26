@@ -142,7 +142,7 @@ class L0CliTest(unittest.TestCase):
         result.write_bytes(
             b"\xef\xbb\xbf" + json.dumps({"$file": path}).encode("utf-8")
         )
-        proc = self.cli("complete", spec["run_id"], "--action",
+        proc = self.cli("submit", spec["run_id"], "--action",
                         spec["action"]["id"], "--output-file", str(result),
                         "--json")
         self.assertEqual(proc.returncode, 0, proc.stderr)
@@ -163,7 +163,7 @@ class L0CliTest(unittest.TestCase):
         self.save(file_workflow())
         spec = self.start_json()
         missing = spec["node"]["output"]["file"] + ".nope"
-        proc = self.cli("complete", spec["run_id"], "--action",
+        proc = self.cli("submit", spec["run_id"], "--action",
                         spec["action"]["id"], "--file", missing, "--json")
         self.assertEqual(proc.returncode, 3)
         payload = json.loads(proc.stdout)
@@ -178,7 +178,7 @@ class L0CliTest(unittest.TestCase):
         self.save(file_workflow())
         spec = self.start_json()
         path = self.artifact(spec).replace("\\", "/")
-        proc = self.cli("complete", spec["run_id"], "--action",
+        proc = self.cli("submit", spec["run_id"], "--action",
                         spec["action"]["id"], "--file", path, "--json")
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(json.loads(proc.stdout)["status"], "completed")
@@ -187,10 +187,10 @@ class L0CliTest(unittest.TestCase):
         self.save(two_step_workflow())
         spec = self.start_json("two")
         path = self.artifact(spec)
-        first = self.cli("complete", spec["run_id"], "--action",
+        first = self.cli("submit", spec["run_id"], "--action",
                          spec["action"]["id"], "--file", path)
         self.assertEqual(first.returncode, 0, first.stderr)
-        again = self.cli("complete", spec["run_id"], "--action",
+        again = self.cli("submit", spec["run_id"], "--action",
                          spec["action"]["id"], "--file", path, "--json")
         self.assertEqual(again.returncode, 4)
         self.assertEqual(json.loads(again.stdout)["code"], "E_STALE_ACTION")
@@ -203,14 +203,14 @@ class L0CliTest(unittest.TestCase):
         self.assertEqual(spec["next"]["text"], "aiwf submit")
 
         path = self.artifact(spec)
-        after = self.cli("complete", spec["run_id"], "--action",
+        after = self.cli("submit", spec["run_id"], "--action",
                          spec["action"]["id"], "--file", path, "--json")
         payload = json.loads(after.stdout)
         self.assertEqual(payload["phase"], "awaiting_check")
         self.assertEqual(payload["next"]["kind"], "submit")
         self.assertIn("--verdict", payload["next"]["text"])
 
-        review = self.cli("complete", payload["run_id"], "--action",
+        review = self.cli("submit", payload["run_id"], "--action",
                           payload["action"]["id"], "--verdict", "PASS",
                           "--reason", "非空", "--json")
         review_payload = json.loads(review.stdout)
@@ -242,7 +242,7 @@ class L0CliTest(unittest.TestCase):
         self.save(file_workflow())
         spec = self.start_json()
         path = self.artifact(spec)
-        self.cli("complete", spec["run_id"], "--action", spec["action"]["id"],
+        self.cli("submit", spec["run_id"], "--action", spec["action"]["id"],
                  "--file", path)
         proc = self.cli("runs", "show", spec["run_id"])
         self.assertIn("status     : completed", proc.stdout)

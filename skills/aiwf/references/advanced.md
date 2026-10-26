@@ -329,11 +329,12 @@ glob 匹配被引用产物的文件路径，不是让引擎执行文件搜索或
 ### 修改历史用户输入
 
 ```bash
-aiwf provide <target_run_id> --node outline -p tone="冷峻" --reason "用户调整风格" --json
+aiwf submit <target_run_id> --node outline -p tone="冷峻" --reason "用户调整风格" --json
 ```
 
 values 仍按该 task 的 user_input_schema 校验，成功后开启修订。
-这与当前 awaiting_input 的 `provide --action` 不同；不要混用。
+目标必须是**运行中 run 里已完成的节点**；整个 run 已完成时先 `resume`。
+这是修订入口，不要和 awaiting_input 阶段的普通 `submit -p` 混用。
 
 ### 单实例重做
 
@@ -414,11 +415,12 @@ foreach 内联体自动生成 start/end，不手写它们。
 引擎不创建模型客户端、不调用 LLM，也不保证当前 Agent 能切换模型。
 
 ```bash
-aiwf complete <root_run_id> --action <最新id> --output-file result.json \
+aiwf submit <root_run_id> --output-file result.json \
   --model <实际模型> --tokens-file usage.json --json
 ```
 
-usage.json 可包含 prompt/completion/total；不知道的值不编造。
+usage.json 用 `prompt_tokens` / `completion_tokens` / `total_tokens`（三个都是必填整数）；
+不知道的值不编造。
 节点 duration_ms 包含思考、工具、等待时间，不等于纯模型耗时。
 
 ### 1.0 与 1.1 的边界
@@ -435,11 +437,13 @@ usage.json 可包含 prompt/completion/total；不知道的值不编造。
 新建或编辑 task 时用 user_input_schema，不同时写两者；
 **工作流顶层的 input_schema 不改名**。
 
-旧记录的执行方式：
+旧记录的查看与恢复：
 
-- start/end 与确定性分支按旧协议 `complete --empty`。
-- foreach 从 node.child.run_id 取得子运行，分别 current/complete/provide/review。
-- 子级完成会回传父级；current 只读，需要重新调度时显式 resume。
+- `runs show` 仍能读旧记录；定义版本已变的 run，`status` 会拒绝解析
+  （`workflow version changed for an existing run`），这是刻意的静默升级保护。
+- CLI 不再提供旧协议的执行命令（`complete/provide/review` 已移除）：要续跑旧记录，
+  用 SDK 的 `engine.complete` / `engine.provide` / `engine.review`。
+- foreach 的子运行从 node.child.run_id 取得；子级完成会回传父级。
 
 不要直接改一个未完成 1.0 run 的 schema_version。
 保留旧定义供旧运行恢复，另存新 id 的 1.1 定义并创建新运行。

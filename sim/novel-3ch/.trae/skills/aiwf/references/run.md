@@ -84,11 +84,24 @@ aiwf resume <run>                         # workflow id 自动推断
 后 `aiwf submit`；或 `--item-file items.json`。只有一个队列时 `--node` 可省。
 汇总 foreach 时读取结果清单并检查失败项，不数目录。
 
-### 旧命令（保留兼容，已隐藏）
+### 已移除的旧命令
 
-`complete` / `provide` / `review` / `fail` 仍可用，但已弃用；文本模式会打印
-`deprecated: use aiwf submit`。新代码不要再用它们。`current` 保留为机器可读的
-任务包（SDK/旧脚本），`aiwf status --json` 是它的超集。
+`complete` / `provide` / `review` / `fail` / `redo` 已删除：调用会退 2、给出 `E_USAGE`，
+并在 `next` 里写出替换命令。对照表：
+
+| 旧命令 | 现在 |
+|---|---|
+| `complete --file/--output-file/--set/--empty` | `submit` 同名参数 |
+| `complete --model/--tokens/--tokens-file` | `submit` 同名参数（审计上报） |
+| `complete --action <id>` | `submit --action <id>`（可选的过期校验） |
+| `complete --verdict PASS --reason` | `submit --verdict PASS --reason` |
+| `provide -p k=v` | `submit -p k=v` |
+| `provide --node <id>` | `submit --node <id>`（改历史输入、开启修订） |
+| `review --verdict/--feedback` | `submit --verdict/--feedback` |
+| `fail --error "..."` | `submit --fail "..."` |
+| `redo --node X --instance Y` | `revise --target X --instance Y` |
+
+`current` 仍保留为机器可读任务包（SDK / 旧脚本），`aiwf status --json` 是它的超集。
 
 ### Windows / PowerShell
 

@@ -9,17 +9,21 @@ The CLI is the boundary between an AI agent / human and the engine state machine
                                          start a run; --title names this run
                                          (what the work is about right now),
                                          then print the first spec
+    aiwf submit RUN_ID [--file|--verdict|--fail|--node] ...
+                                         report the current step's result
+                                         (task output, check verdict, review
+                                         verdict, user answers, queue items;
+                                         --model/--tokens for the audit trail;
+                                         --node ID changes a completed node)
     aiwf current RUN_ID                  print the current spec (any phase;
                                          hidden, kept for SDK / old scripts --
                                          `aiwf status RUN_ID --json` is a superset)
-    aiwf complete RUN_ID --output...     report task/branch output, advance
-    aiwf provide RUN_ID [-p k=v] ...     answer a node's user-input questions;
-                                         --node changes a completed node (revision)
-    aiwf review RUN_ID --verdict V ...   human acceptance verdict
     aiwf revise RUN_ID --target ID ...   out-of-plan jump to a prior task
-    aiwf fail RUN_ID --error "..."       report node failure
     aiwf resume WF_ID RUN_ID             reopen a failed run
     aiwf runs list|show|search ...       inspect audit records
+
+Removed in this version (folded into `submit` / `revise`): complete provide
+review fail redo. They exit 2 with E_USAGE and a pointer to the replacement.
     aiwf items list|add|update|remove|move|seal
                                          the engine-owned foreach queue behind
                                          `items: {"queue": true}`; the engine is
@@ -42,7 +46,7 @@ import shutil
 import sys
 import unicodedata
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from . import __version__, library as template_library
 from . import view as view_mod
@@ -270,8 +274,8 @@ def _next_for_spec(spec: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """The command that continues this run, computed from the packet itself.
 
     This is the one piece an agent must get right every turn; deriving it here
-    means the model never has to translate action.kind into a command, copy a
-    24-hex id, or decide between `complete`/`provide`/`review`.
+    means the model never has to translate action.kind into a command or copy a
+    24-hex action id.
     """
     run_id = spec.get("run_id")
     if not run_id:
@@ -757,28 +761,6 @@ def _pick_run(
     )
 
 
-def _resolve_action_id(engine, run_id: str, raw: Optional[str]) -> Optional[str]:
-    """Accept the full action id, a unique prefix, the current node id, or
-    ``current``/``latest``/omitted.
-
-    The digest still guards against reporting to a *different* node: anything
-    that does not resolve is passed through unchanged and the engine rejects it
-    as stale.
-    """
-    spec = engine.action_spec(run_id)
-    action = spec.get("action")
-    if not action:
-        return raw
-    if raw in (None, "", "current", "latest", action["node_id"]):
-        return action["id"]
-    if raw == action["id"]:
-        return raw
-    if len(raw) >= 4 and action["id"].startswith(raw):
-        return action["id"]
-    return raw
-
-
-# ---- command handlers ----------------------------------------------------
 def _new_protocol(engine, record):
     root = engine.root_record(record)
     return root.get("workflow_version") == "1.1"
@@ -811,24 +793,6 @@ def _attach_rejection(engine, spec):
     if getattr(engine, "last_rejection", None):
         spec["rejected"] = engine.last_rejection
     return spec
-
-
-def _act(engine, args, command, **kwargs):
-    raw = getattr(args, "action", None)
-    action_id = _resolve_action_id(engine, args.run_id, raw)
-    if raw in (None, "") and not getattr(args, "json", False):
-        print(
-            f"note: --action omitted; using the current action ({action_id})",
-            file=sys.stderr,
-        )
-    spec = engine.act(args.run_id, action_id, command, **kwargs)
-    _attach_rejection(engine, spec)
-    if not engine.last_rejection:
-        write_submit_template(engine.storage, spec)
-    print_spec(spec, args.json)
-    if engine.last_rejection:
-        return 3
-    return 1 if spec["status"] == "failed" else 0
 
 
 def _write_project_launchers() -> List[str]:
@@ -1357,6 +1321,51 @@ def _submit_items(args) -> List[Any]:
     return items
 
 
+def _resolve_action_id(engine, run_id: str, raw: Optional[str]) -> Optional[str]:
+    """Accept the full action id, a unique prefix, the current node id, or
+    ``current``/``latest``/omitted.
+
+    Only used by ``submit --action``: the template's fingerprint is the normal
+    guard, but a caller that caches an action id (old `complete` scripts, SDK
+    wrappers) can restate it and get the same staleness check.
+    """
+    spec = engine.action_spec(run_id)
+    action = spec.get("action")
+    if not action:
+        return raw
+    if raw in (None, "", "current", "latest", action["node_id"]):
+        return action["id"]
+    if raw == action["id"]:
+        return raw
+    if len(raw) >= 4 and action["id"].startswith(raw):
+        return action["id"]
+    return raw
+
+
+def _submit_revise_input(args, storage: Storage) -> int:
+    """Change a completed node's user input and start a revision.
+
+    This is the `provide --node` path folded into `submit`: it needs no action
+    fingerprint because it deliberately reopens finished work, and the engine
+    records the change as `input_changed` + a revision.
+    """
+    values = _read_data(args)
+    if not values:
+        raise UsageError(
+            "--node needs the new answers",
+            hint='e.g. aiwf submit <run> --node outline -p tone=冷峻 '
+                 '--reason "用户调整风格"',
+        )
+    record = storage.find_run(args.run_id)
+    workflow = _load_workflow_for_record(storage, record)
+    engine = WorkflowEngine(storage)
+    record = engine.provide(
+        workflow, args.run_id, values,
+        node_id=args.node, reason=getattr(args, "reason", None),
+    )
+    return _emit(engine, record, args)
+
+
 def cmd_submit(args, storage: Storage) -> int:
     """The single write verb: report the current step's result.
 
@@ -1366,8 +1375,11 @@ def cmd_submit(args, storage: Storage) -> int:
     """
     args.run_id = _pick_run(
         storage, args.run_id,
-        need_running=not getattr(args, "print_template", False),
+        need_running=not (getattr(args, "print_template", False)
+                          or getattr(args, "node", None)),
     )
+    if getattr(args, "node", None):
+        return _submit_revise_input(args, storage)
     engine = WorkflowEngine(storage)
     spec = engine.action_spec(args.run_id)
     if not spec.get("action"):
@@ -1382,6 +1394,16 @@ def cmd_submit(args, storage: Storage) -> int:
             f"run {args.run_id} is {status}; nothing to submit",
             hint=f"inspect it with `aiwf runs show {args.run_id}`",
         )
+
+    if getattr(args, "action", None):
+        if _resolve_action_id(engine, args.run_id, args.action) != spec["action"]["id"]:
+            raise StaleActionError(
+                "stale action: the run has moved past " + str(args.action),
+                at=f"run {args.run_id}",
+                hint="re-read the packet with `aiwf status`, confirm the work "
+                     "still matches, then submit again",
+                next_command=f"aiwf status {args.run_id} --json",
+            )
 
     template_path = _submit_path(storage, spec["run_id"])
     if getattr(args, "print_template", False):
@@ -1398,6 +1420,7 @@ def cmd_submit(args, storage: Storage) -> int:
                              ensure_ascii=False, indent=2))
         return 0
 
+    explicit_action = bool(getattr(args, "action", None))
     template = _read_json(template_path) if os.path.isfile(template_path) else None
     if template is not None:
         if not isinstance(template, dict) or not template.get("action"):
@@ -1406,13 +1429,18 @@ def cmd_submit(args, storage: Storage) -> int:
                 hint="rebuild it with `aiwf submit --print`",
             )
         if template["action"] != spec["action"]["id"]:
-            raise StaleActionError(
-                "submit.json is stale: the run has moved to another action",
-                at=template_path,
-                hint="run `aiwf status` to see the current step, then "
-                     "`aiwf submit --print` to refresh the template",
-                next_command="aiwf status",
-            )
+            if not explicit_action:
+                raise StaleActionError(
+                    "submit.json is stale: the run has moved to another action",
+                    at=template_path,
+                    hint="run `aiwf status` to see the current step, then "
+                         "`aiwf submit --print` to refresh the template",
+                    next_command="aiwf status",
+                )
+            # An explicit --action wins. In a nested run the root's template
+            # can belong to a different action than the leaf being answered;
+            # the payload flags already carry everything this submit needs.
+            template = None
     elif not _has_submit_flags(args):
         write_submit_template(storage, spec)
         template = build_submit_template(spec)
@@ -1564,6 +1592,11 @@ def cmd_submit(args, storage: Storage) -> int:
         kwargs: Dict[str, Any] = {}
         if kind in ("check", "complete", "empty"):
             kwargs["output"] = payload
+            if getattr(args, "model", None):
+                kwargs["model"] = args.model
+            tokens = _read_tokens(args)
+            if tokens:
+                kwargs["tokens"] = tokens
         elif kind == "provide":
             kwargs["values"] = payload
         elif kind == "review":
@@ -1660,88 +1693,6 @@ def _read_tokens(args) -> Optional[Dict[str, int]]:
         raise UsageError(f"--tokens is not valid JSON: {e.msg}", at="--tokens") from None
 
 
-def cmd_complete(args, storage: Storage) -> int:
-    args.run_id = _pick_run(storage, args.run_id, need_running=True)
-    record = storage.find_run(args.run_id)
-    engine = WorkflowEngine(storage)
-    # The root record's phase stays "executing" while a child is the leaf, so
-    # ask the protocol for the phase of the action actually being answered.
-    if _new_protocol(engine, record):
-        phase = engine.action_spec(record["run_id"]).get("phase")
-    else:
-        phase = record.get("phase")
-    if getattr(args, "verdict", None) is not None and phase != "awaiting_check":
-        raise UsageError(
-            f"--verdict does not apply in phase {phase!r}",
-            at=f"run {args.run_id}",
-            hint="a task result uses --file / --json-file / --set; "
-                 "only a check action takes --verdict",
-        )
-    if getattr(args, "file", None) is not None and phase == "awaiting_check":
-        raise UsageError(
-            "a check action expects a verdict, not a file",
-            at=f"run {args.run_id}",
-            hint='use --verdict PASS|REVISE --reason "..."',
-        )
-    workflow = _load_workflow_for_record(storage, record)
-    if _new_protocol(engine, record):
-        return _act(engine, args, "complete", output=_read_output(args),
-                    model=args.model, tokens=_read_tokens(args))
-    record = engine.complete(
-        workflow, args.run_id,
-        output=_read_output(args),
-        model=args.model,
-        tokens=_read_tokens(args),
-    )
-    # completing a child end propagates into the (possibly parent) record
-    workflow = _load_workflow_for_record(storage, record)
-    spec = engine.node_spec(workflow, record)
-    if engine.last_rejection:
-        spec["rejected"] = engine.last_rejection
-    else:
-        write_submit_template(storage, spec)
-    print_spec(spec, args.json)
-    if engine.last_rejection:
-        return 3
-    return 0 if record["status"] != "failed" else 1
-
-
-def cmd_provide(args, storage: Storage) -> int:
-    args.run_id = _pick_run(
-        storage, args.run_id, need_running=not bool(getattr(args, "node", None))
-    )
-    values = _read_data(args)
-    if not values:
-        raise UsageError(
-            "provide answers via -p key=value and/or --data-file",
-            hint="e.g. aiwf provide <run> --action <id> -p tone=冷峻",
-        )
-    record = storage.find_run(args.run_id)
-    workflow = _load_workflow_for_record(storage, record)
-    engine = WorkflowEngine(storage)
-    if _new_protocol(engine, record) and not args.node:
-        return _act(engine, args, "provide", values=values)
-    record = engine.provide(
-        workflow, args.run_id, values,
-        node_id=args.node, reason=args.reason,
-    )
-    return _emit(engine, record, args)
-
-
-def cmd_review(args, storage: Storage) -> int:
-    args.run_id = _pick_run(storage, args.run_id, need_running=True)
-    record = storage.find_run(args.run_id)
-    workflow = _load_workflow_for_record(storage, record)
-    engine = WorkflowEngine(storage)
-    if _new_protocol(engine, record):
-        return _act(engine, args, "review", verdict=args.verdict, feedback=args.feedback)
-    record = engine.review(
-        workflow, args.run_id, args.verdict,
-        feedback=args.feedback,
-    )
-    return _emit(engine, record, args)
-
-
 def cmd_revise(args, storage: Storage) -> int:
     args.run_id = _pick_run(storage, args.run_id, need_running=False)
     record = storage.find_run(args.run_id)
@@ -1764,22 +1715,6 @@ def cmd_revise(args, storage: Storage) -> int:
         mode=args.mode, scope=args.scope, manual_nodes=manual,
     )
     return _emit(engine, record, args)
-
-
-def cmd_fail(args, storage: Storage) -> int:
-    args.run_id = _pick_run(storage, args.run_id, need_running=True)
-    record = storage.find_run(args.run_id)
-    workflow = _load_workflow_for_record(storage, record)
-    engine = WorkflowEngine(storage)
-    if _new_protocol(engine, record):
-        _act(engine, args, "fail", error=args.error)
-        return 1
-    record = engine.fail(workflow, args.run_id, args.error)
-    workflow = _load_workflow_for_record(storage, record)
-    spec = engine.node_spec(workflow, record)
-    write_submit_template(storage, spec)
-    print_spec(spec, args.json)
-    return 1
 
 
 def cmd_resume(args, storage: Storage) -> int:
@@ -1812,23 +1747,6 @@ def cmd_resume(args, storage: Storage) -> int:
             workflow = storage.load_workflow_for_record(record)
     record = engine.resume(workflow, record["run_id"])
     return _emit(engine, record, args)
-
-
-def cmd_redo(args, storage: Storage) -> int:
-    record = storage.find_run(args.run_id)
-    workflow = _load_workflow_for_record(storage, record)
-    engine = WorkflowEngine(storage)
-    record = engine.redo(
-        workflow, args.run_id, args.node, args.instance,
-        reason=args.reason,
-    )
-    workflow = _load_workflow_for_record(storage, record)
-    return _emit(engine, record, args)
-
-
-#: Instance status -> row mark for `aiwf items list`. The status vocabulary is
-#: the engine's own instance one, so it matches `view --json` exactly.
-_ITEM_MARKS = {"pending": "  ", "running": ">>", "success": "ok", "failed": "!!"}
 
 
 def _items_text(table: Dict[str, Any]) -> str:
@@ -2339,60 +2257,19 @@ def build_parser() -> argparse.ArgumentParser:
     psub.add_argument("-p", "--param", action="append",
                       help="user-input answer key=value (provide phase)")
     psub.add_argument("--data-file", help="JSON file with user answers")
+    psub.add_argument("--action",
+                      help="the action id you are answering (prefix or node id "
+                           "ok); submit refuses when the run has moved on")
+    psub.add_argument("--node",
+                      help="completed task node whose input is changed; starts "
+                           "a revision (needs -p / --data-file)")
+    psub.add_argument("--model", help="model used by the agent (audit)")
+    psub.add_argument("--tokens", help="token usage JSON (audit)")
+    psub.add_argument("--tokens-file", help="JSON file with token usage")
     psub.add_argument("--print", dest="print_template", action="store_true",
                       help="rebuild submit.json from the current state")
     psub.add_argument("--json", action="store_true")
     psub.set_defaults(func=cmd_submit)
-
-    pcomp = sub.add_parser(
-        "complete", help=argparse.SUPPRESS,
-        description="Report the current action's result. Pick exactly one "
-                    "payload flag; the task packet's `next` line shows which.",
-    )
-    pcomp.add_argument("run_id", nargs="?",
-                       help="run id (prefix ok); default: the sole running run")
-    pcomp.add_argument("--action",
-                       help="action id (full, unique prefix, node id, or 'current'; "
-                            "default: the current action)")
-    pcomp.add_argument("--file", metavar="PATH",
-                       help='report {"$file": PATH} for the artifact you wrote')
-    pcomp.add_argument("--verdict", choices=["PASS", "REVISE"],
-                       help="check verdict; requires --reason")
-    pcomp.add_argument("--reason", help="check reason (why PASS/REVISE)")
-    pcomp.add_argument("--set", action="append", metavar="KEY=VALUE",
-                       help="one scalar result field (repeatable; value parsed "
-                            "as JSON); use --json-file for arrays/objects")
-    pcomp.add_argument("--output", help="output; parsed as JSON when possible")
-    pcomp.add_argument("--output-file", "--json-file", dest="output_file",
-                       metavar="FILE",
-                       help="JSON file containing the whole output (not the artifact)")
-    pcomp.add_argument("--empty", action="store_true", help="no output (start/end)")
-    pcomp.add_argument("--model", help="model used by the agent (audit)")
-    pcomp.add_argument("--tokens", help="token usage JSON (audit)")
-    pcomp.add_argument("--tokens-file", help="JSON file with token usage")
-    pcomp.add_argument("--json", action="store_true")
-    pcomp.set_defaults(func=cmd_complete)
-
-    pprov = sub.add_parser("provide", help=argparse.SUPPRESS,
-                           description="supply user input for a task node")
-    pprov.add_argument("run_id", nargs="?")
-    pprov.add_argument("--action", help="action id (default: the current action)")
-    pprov.add_argument("--node", help="completed task node whose input is changed")
-    pprov.add_argument("-p", "--param", action="append", help="key=value; repeatable")
-    pprov.add_argument("--data-file", help="JSON object file with answers")
-    pprov.add_argument("--reason", help="why the input changed (audit)")
-    pprov.add_argument("--json", action="store_true")
-    pprov.set_defaults(func=cmd_provide)
-
-    prev2 = sub.add_parser("review", help=argparse.SUPPRESS,
-                           description="submit human review verdict")
-    prev2.add_argument("run_id", nargs="?")
-    prev2.add_argument("--action", help="action id (default: the current action)")
-    prev2.add_argument("--verdict", required=True, choices=["APPROVE", "REJECT"],
-                       help="accept or reject")
-    prev2.add_argument("--feedback", help="review comments for the agent")
-    prev2.add_argument("--json", action="store_true")
-    prev2.set_defaults(func=cmd_review)
 
     prev3 = sub.add_parser("revise", help="jump back to a prior task node")
     prev3.add_argument("run_id")
@@ -2406,14 +2283,6 @@ def build_parser() -> argparse.ArgumentParser:
     prev3.add_argument("--json", action="store_true")
     prev3.set_defaults(func=cmd_revise)
 
-    pf = sub.add_parser("fail", help=argparse.SUPPRESS,
-                        description="report a node failure")
-    pf.add_argument("run_id", nargs="?")
-    pf.add_argument("--action", help="action id (default: the current action)")
-    pf.add_argument("--error", required=True)
-    pf.add_argument("--json", action="store_true")
-    pf.set_defaults(func=cmd_fail)
-
     pres = sub.add_parser(
         "resume", help="reopen a failed run; prints its spec",
         description="RUN_ID alone infers the workflow; the legacy "
@@ -2423,15 +2292,6 @@ def build_parser() -> argparse.ArgumentParser:
                       help="RUN_ID, or WORKFLOW_ID RUN_ID")
     pres.add_argument("--json", action="store_true")
     pres.set_defaults(func=cmd_resume)
-
-    prd = sub.add_parser("redo", help=argparse.SUPPRESS,
-                         description="redo one subflow/foreach instance")
-    prd.add_argument("run_id")
-    prd.add_argument("--node", required=True, help="subflow/foreach node id")
-    prd.add_argument("--instance", required=True, help="instance key (index or id_field)")
-    prd.add_argument("--reason", help="why this instance is redone (audit)")
-    prd.add_argument("--json", action="store_true")
-    prd.set_defaults(func=cmd_redo)
 
     pit = sub.add_parser(
         "items",
@@ -2571,8 +2431,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     # argparse prints `==SUPPRESS==` for a subparser help set to SUPPRESS, so
     # drop the hidden entries from the listing and replace the usage metavar.
-    hidden = {"init", "workflows", "current", "complete", "provide",
-              "review", "fail", "redo", "items", "skills"}
+    hidden = {"init", "workflows", "current", "items", "skills"}
     sub._choices_actions = [
         action for action in sub._choices_actions if action.dest not in hidden
     ]
@@ -2600,7 +2459,10 @@ def _full_help() -> str:
   aiwf wf ...               template library
 
 advanced (hidden from --help, still supported):
-  current  complete  provide  review  fail  redo  items
+  current  items
+
+removed (folded into `submit` / `revise`; they exit 2 with E_USAGE):
+  complete  provide  review  fail  redo
 
 maintenance:
   init  workflows  skills  wf index
@@ -2616,10 +2478,47 @@ def _normalize_argv(argv: Optional[List[str]]) -> List[str]:
     return args
 
 
+#: Commands removed from the surface, mapped to (replacement, hint). They are
+#: answered before argparse so a stale script gets a pointer instead of
+#: "invalid choice".
+_REMOVED_COMMANDS: Dict[str, Tuple[str, str]] = {
+    "complete": ("aiwf submit",
+                 "task result -> --file PATH; check -> --verdict PASS --reason; "
+                 "structured result -> --json-file; audit -> --model/--tokens"),
+    "provide": ("aiwf submit",
+                "answers for the current step -> -p key=value; changing a "
+                "completed node's input -> --node <id>"),
+    "review": ("aiwf submit --verdict APPROVE|REJECT",
+               "--feedback carries the human conclusion"),
+    "fail": ('aiwf submit --fail "..."',
+             "the quoted reason is the failure message"),
+    "redo": ("aiwf revise",
+             "--target <node> --instance <key> --reason \"...\""),
+}
+
+
+def _removed_command(argv: List[str]) -> Optional[Tuple[str, str, str]]:
+    for token in argv:
+        if token.startswith("-"):
+            continue
+        entry = _REMOVED_COMMANDS.get(token)
+        return (token, entry[0], entry[1]) if entry else None
+    return None
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     _force_utf8()
     raw = _normalize_argv(argv)
     as_json = "--json" in raw
+    gone = _removed_command(raw)
+    if gone is not None:
+        command, replacement, hint = gone
+        return _fail(UsageError(
+            f"`aiwf {command}` no longer exists; it is `{replacement}` now",
+            at=f"command {command}",
+            hint=hint,
+            next_command=replacement,
+        ), as_json)
     args = build_parser().parse_args(raw)
     if getattr(args, "help_all", False):
         print(_full_help())
@@ -2632,16 +2531,6 @@ def main(argv: Optional[List[str]] = None) -> int:
             )
         except AiwfError as e:
             return _fail(e, as_json)
-
-    _deprecated = {
-        "complete": "aiwf submit",
-        "provide": "aiwf submit",
-        "review": "aiwf submit",
-        "fail": 'aiwf submit --fail "..."',
-    }
-    if args.command in _deprecated and not as_json:
-        print(f"note: `aiwf {args.command}` is deprecated; "
-              f"use `{_deprecated[args.command]}`", file=sys.stderr)
 
     try:
         return args.func(args, storage)
