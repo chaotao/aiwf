@@ -2,7 +2,10 @@
 
 日期：2026-10-26
 基线提交：`266d9db`（此前 `abf30de` / `f2c3a3e` / `d16f974` / `449a99a`）
-当前状态：L0–L3 主要项已完成；本文只列**还没做**的事，供后续接手。
+当前状态（2026-10-26 21:20 更新）：L0–L3 主要项已完成；
+**R1 / R2 / R3 已完成并提交**（`7dce0a6` / `6a02487` / `7c47bcd`，见各节标题）。
+本文剩下 **R4**（真实弱模型基准，需模型与预算，主人已定「先不做」）与
+**R5**（4 个可选决策，见 §6，不阻塞）。
 工作区：`F:\data\project\github\aiwf`。未跟踪的 `.acl-diagnostics/` 是 2026-10-25
 修复工作区 Windows 权限时留下的恢复记录，**不要提交**。
 
@@ -11,7 +14,7 @@
 ```powershell
 cd F:\data\project\github\aiwf
 $env:PYTHONPATH='engine'
-.\.venv\Scripts\python.exe -m pytest -q          # 期望 226 passed / 20 subtests
+.\.venv\Scripts\python.exe -m pytest -q          # 期望 233 passed / 20 subtests
 .\.venv\Scripts\python.exe bench\run_bench.py    # 期望 5 个场景全 True，0 错误
 git log --oneline -5
 ```
@@ -31,9 +34,11 @@ aiwf submit          # 暂存 submit.json 的 action + output，按 phase 分派
 公开命令（`aiwf --help`）：`status`、`submit`、`new`、`run`、`runs`、`resume`、
 `revise`、`validate`、`doctor`、`wf`。
 
-隐藏但仍可用（`aiwf --help-all`）：`current`、`complete`、`provide`、`review`、
-`fail`、`redo`、`items`、`workflows`、`skills`、`init`、`wf index`。
-其中 `complete` / `provide` / `review` / `fail` 文本模式会打印 `deprecated: use aiwf submit`。
+隐藏但仍可用（`aiwf --help-all`）：`current`、`items`、`workflows`、`skills`、`init`、
+`wf index`。其中 `current` 是兼容入口（`status --json` 是其超集，比它多
+`title`/`submit_file`/`submit_missing` 三个键）。
+`complete` / `provide` / `review` / `fail` / `redo` 已于 R3 **删除**：调用在 argparse
+之前被拦下，退 2 + `E_USAGE`，并给出指向 `submit` / `revise` 的 `next`。
 
 必须保持的约束：
 
@@ -46,9 +51,15 @@ aiwf submit          # 暂存 submit.json 的 action + output，按 phase 分派
   首次 `submit` 自动补建，单文件 task 且产物已存在时直接提交（若还有 output_schema
   的额外字段要求，会以驳回 3 返回，而不是卡在“缺模板”）。
 
-提交模板与分派细节见 `skills/aiwf/RUN-CARD.md` 与 `skills/aiwf/references/run-workflow.md`。
+提交模板与分派细节见 `skills/aiwf/RUN-CARD.md` 与 `skills/aiwf/references/run.md`。
 
-## 2. R1：物理合并 14 份 reference（P1，纯文档）
+## 2. ✅ R1：物理合并 14 份 reference（已完成，提交 `7dce0a6`）
+
+> 结果：`references/` 现为 6 份 —— `create.md`(494) / `run.md`(231) /
+> `advanced.md`(448) / `audit.md`(413) + 入口 `templates.md`(163) / `examples.md`(100)。
+> 旧 12 份删除、不留 stub；`SKILL.md` 表格改新文件 + 锚点；`schema.py` 的提示改指
+> `create.md`；新增 `tests/test_skill_links.py`（集合 / 链接与锚点 / 可达性 3 项）。
+> 合并由脚本按标题层级下移拼接并逐份校验原文出现，无手抄。以下为原始方案，留档。
 
 ### 现状
 
@@ -105,7 +116,14 @@ templates.md (84)            view.md (142)
 - 合并时丢段落、锚点错位；用“先拼接、再 diff 抽检”的方式，不要手抄。
 - `sim/` 副本与源目录是逐文件镜像，漏同步会造成漂移（见 §5）。
 
-## 3. R2：`current` 的最终去向（P2，兼容决策）
+## 3. ✅ R2：`current` 的最终去向（已按甲执行，提交 `6a02487`）
+
+> 结果：`current` 保留为隐藏兼容入口，不删；`drive.py`、L1/L2 测试、文档示例
+> 全部改用 `status --json`。**额外发现并修复**：`engine/aiwf/engine.py` 有 4 处会
+> 直接印给 Agent 的命令（缺 `--action` / action 过期 / 命令与阶段不匹配的
+> `next_command`，以及"去驱动子运行"的提示）原本仍写 `aiwf current`，已统一改
+> `aiwf status`。新增 `test_hidden_current_is_a_compatible_subset_of_status` 锁死
+> 兼容契约。以下为原始方案，留档。
 
 ### 现状
 
@@ -131,7 +149,16 @@ templates.md (84)            view.md (142)
 - `status --json` 字段覆盖原 `current` 的所有消费点；
 - 全量测试 + bench。
 
-## 4. R3：隐藏命令/别名的清理（P2，大版本再做）
+## 4. ✅ R3：隐藏命令/别名的清理（已完成，提交 `7c47bcd`）
+
+> 结果：**先搬能力再删命令**，执行时发现两个能力只存在于旧命令：
+> `--model/--tokens/--tokens-file` 原只挂在 `complete`、`provide --node` 是改历史
+> 输入的唯一入口 —— 均已并入 `submit`（另加可选 `--action` 做显式过期校验，
+> 顺带修掉嵌套 run 里 `submit.json` 被误判 stale）。随后删除
+> `complete/provide/review/fail/redo` 的 parser、`cmd_*` 与提示块，
+> 调用退 2 + `E_USAGE` + `next`。
+> 已知代价：1.0 旧记录现在只剩 `runs show` 可读，驱动需走 SDK（已写入 `advanced.md`）。
+> 以下为原始方案，留档。
 
 现在隐藏但保留：`current complete provide review fail redo items workflows skills init`、`wf index`。
 其中 `complete/provide/review/fail` 已弃用并提示；`redo` 已由 `revise --instance` 覆盖。
@@ -147,7 +174,7 @@ templates.md (84)            view.md (142)
 验收：`--help` 公共面不变；`--help-all` 与实现一致；旧命令给出明确 `E_USAGE`/提示；
 全量测试 + bench。
 
-## 5. R4：真实弱模型基准（P1，需要模型/外部执行）
+## 5. R4：真实弱模型基准（**主人已定：先不做**，需模型与预算）
 
 `bench/run_bench.py` 是**接口基准**：一个盲跟随者只用 `status`/`submit` 跑 5 个场景，
 证明接口自洽，不证明模型能力。真实模型基准还没做。
@@ -166,17 +193,38 @@ templates.md (84)            view.md (142)
 产出：一份 `sim/report-<date>.md`（沿用仓库 `sim/report*.md` 的写法），
 不要改写历史报告。
 
-## 6. R5：可选的遗留决策（先记录，不急）
+## 6. R5：可选的遗留决策（4 项，2026-10-26 已逐项核实代码现状）
 
-1. **`run --title` 目前必填**。弱模型漏传会多一次 argparse 失败重试。
-   可选：默认 `<workflow name> · <日期>`，`view.dynamic_title` 仍可覆盖。
-   这会推翻 2026-10-11 “必须给”的拍板，需主人确认。
-2. **`submit` 是否吸收 `revise --instance`**：目前 `revise` 是独立逃生舱；
-   不建议塞进 submit（修订需要 target/mode/scope）。
-3. **`status --ensure` 是否改名**（如 `--repair`）：`--ensure` 语义是“确保存在”，
-   保留亦可。
-4. **skill 副本漂移**：目前靠人工全量复制 + md5 校验；可加 `aiwf skills status`
-   或版本戳，减少后续漏同步。
+1. **`run --title` 是否给默认值**（唯一需要推翻历史拍板的一项）
+   - 现状：`cli.py:2199` `required=True`；`engine.py:1571` 的 `title` 本身是
+     `Optional`，`record` 里干脆不写这个键；`view.run_title()` 的取值顺序是
+     `view.dynamic_title` → `record.title` → `run_id`。
+   - 影响：漏传 = argparse 失败重试一轮（退 2，弱模型多烧一次上下文）。
+   - 甲（推荐）：`required=False`，缺省生成 `<workflow name> · <YYYY-MM-DD>`
+     （`name` 是 workflow 必填字段，可靠）；`dynamic_title` 仍优先覆盖。
+     代价：`runs list` 上同一天同流程的 run 名字会重复，要靠 run_id 区分。
+   - 乙：维持必填（2026-10-11 的拍板：名字必须由人给，避免"自动名"淹没真意图）。
+2. **`submit` 是否吸收 `revise --instance`**
+   - 现状：`revise --instance` 走 `engine.redo()`（单实例重跑），与
+     `--mode/--scope/--nodes` 互斥（`cli.py:1701-1710`）；`submit --node` 走的是
+     「改历史输入 + 开修订」，两者语义不同。
+   - 推荐：**不吸收**。revise 是逃生舱，塞进 submit 会让一个命令背 target /
+     instance / mode / scope 四组互斥参数，弱模型更容易选错。
+3. **`status --ensure` 是否改名**（`--repair` 之类）
+   - 现状：10 处引用（`RUN-CARD.md:35`、`run.md:64`、`TROUBLESHOOT.md:22` 三处
+     文档 + engine/tests/README）。语义是"确保 submit.json 存在"。
+   - 推荐：**不改**。改名收益近零、要动 10 处 + 破坏旧脚本；`--ensure` 的
+     help 文本已经写清"create submit.json if a running run lacks one"。
+4. **skill 安装副本漂移检测**
+   - 现状：靠人工全量复制 + md5 比对；`aiwf skills install` 内部是
+     `shutil.copytree(dirs_exist_ok=True)`，**只覆盖、不删除** → 源里删掉的文件
+     会残留在副本里（R1 删 12 份旧 reference 时正是这个风险）。`doctor` 只检查
+     `.trae/skills/aiwf/SKILL.md` 存在，不比对内容。
+   - 甲（推荐）：给 `skills` 加 `status` 子命令，逐文件比对并分三类报：
+     缺失 / 内容不一致 / 多余（源里已删）；`--json` 可入 CI，不自动删。
+   - 乙：只加版本戳（SKILL.md front-matter 写 version，副本落后就告警）。
+     便宜，但查不出"改了一行没升版本"。
+   - 丙：维持现状。
 
 ## 7. 文档与副本同步（每次改 skill 必做）
 
@@ -223,13 +271,13 @@ git diff --check
 - commit message 写清“改了什么 + 验证命令/结果”；
 - 若改了 skill，必须同步两份 `sim` 副本并在提交说明里写“md5 0 differences”。
 
-## 9. 建议接手顺序
+## 9. 建议接手顺序（2026-10-26 21:20 更新）
 
-1. **R1 reference 合并**（独立、可先做；先拍板删除 vs stub）。
-2. **R2 current**（拍板甲/乙；甲只需要改 `drive.py`/测试/文档）。
-3. **R4 真实弱模型基准**（需要模型与预算；先写协议再跑）。
-4. **R3 别名清理**（等大版本/一个兼容周期）。
-5. **R5** 逐项拍板，不阻塞。
+1. ~~R1 reference 合并~~ ✅ `7dce0a6`
+2. ~~R2 current~~ ✅ `6a02487`（甲）
+3. ~~R3 别名清理~~ ✅ `7c47bcd`（本轮已提前做完）
+4. **R4 真实弱模型基准** —— 主人已定**先不做**（需模型与预算）。
+5. **R5** 逐项拍板，不阻塞（见 §6，四项均已有现状与推荐）。
 
 ## 10. 关键文件索引
 
@@ -243,7 +291,7 @@ git diff --check
 | `skills/aiwf/SKILL.md` | 默认入口（一页） |
 | `skills/aiwf/RUN-CARD.md` | 两命令循环 + 分派表 |
 | `skills/aiwf/TROUBLESHOOT.md` | 错误码 → 动作 |
-| `skills/aiwf/references/` | 按需参考（R1 待合并） |
+| `skills/aiwf/references/` | 按需参考（R1 后为 6 份：create/run/advanced/audit + templates/examples） |
 | `tests/test_l0_cli.py` / `l1` / `l2` / `l3` | CLI 契约 |
 | `bench/run_bench.py` | 盲跟随者接口基准 |
 
