@@ -45,7 +45,7 @@ when 必须同时声明 TRUE/FALSE 路由，目标为节点 id。
 引擎返回 `action.kind=complete`；Agent 根据材料选择标签：
 
 ```bash
-aiwf complete <root_run_id> --action <最新id> --output FAST --json
+aiwf submit <root_run_id> --output FAST --json
 ```
 
 输出标签字符串，不是 task.check 的 verdict 对象。

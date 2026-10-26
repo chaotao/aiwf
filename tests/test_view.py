@@ -358,8 +358,8 @@ class PrintTest(unittest.TestCase):
         # the rows belong to the stage: no sibling queue block any more
         self.assertFalse(any(l.startswith("queue") for l in lines))
         gate = next(l for l in lines if "->" in l)
-        self.assertIn("aiwf review R1", gate)
-        self.assertIn("--action ", gate)  # without it the engine calls it stale
+        self.assertIn("aiwf submit R1", gate)
+        self.assertNotIn("--action", gate)  # the submit template carries the action
         self.assertIn("--verdict APPROVE|REJECT", gate)
 
 

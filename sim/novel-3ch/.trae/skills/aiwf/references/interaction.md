@@ -41,11 +41,12 @@ tone 缺失时返回 `action.kind=provide`、`phase=awaiting_input`。
 按 input_request 中的字段提问，收到答案后提交：
 
 ```bash
-aiwf provide <root_run_id> --action <最新id> -p tone="冷峻" --json
+aiwf submit <root_run_id> -p tone="冷峻" --json
 ```
 
-复杂答案用 `--data-file answers.json`。provide 会校验用户答案并写入 context，
-再渲染任务材料。inputs 本身没有与之配对的 inputs_schema 字段。
+复杂答案用 `--data-file answers.json`，或直接改 `submit.json` 的 `output`。
+submit 会校验用户答案并写入 context，再渲染任务材料。inputs 本身没有与之配对的
+inputs_schema 字段。
 
 预填信息不会重复询问；JSON Schema 的 default 不自动落值。
 同一 run 再次进入已收集过信息的节点不会重新激活提问；
@@ -67,13 +68,13 @@ task 增加：
 读取 `check_request` 的实际产物与检查项，执行检查后上报：
 
 ```bash
-aiwf complete <run_id> --action <最新id> --verdict REVISE \
+aiwf submit <run_id> --verdict REVISE \
   --reason "实测正文仅 620 字，低于 800 字要求" --json
-aiwf complete <run_id> --action <最新id> --verdict PASS \
+aiwf submit <run_id> --verdict PASS \
   --reason "按要求口径统计 986 字，关键事件与悬念均已核对" --json
 ```
 
-也可以把 `{"verdict":"…","reason":"…"}` 写进 JSON 再 `--json-file verdict.json`。
+也可以改 `submit.json` 的 `output`，或写 `--json-file verdict.json`。
 reason 必须非空且说明依据。
 “自动”只指引擎安排检查动作，质量仍由 Agent 判断。字数、测试、资源加载等
 可测项目用工具验证，证据较长时写报告并在 reason 中指出位置。
@@ -95,8 +96,8 @@ task 增加：
 展示产物位置、关键摘要及 review_request，再等待用户明确结论：
 
 ```bash
-aiwf review <root_run_id> --action <最新id> --verdict APPROVE --feedback "用户认可" --json
-aiwf review <root_run_id> --action <最新id> --verdict REJECT --feedback "用户要求增强冲突" --json
+aiwf submit <root_run_id> --verdict APPROVE --feedback "用户认可" --json
+aiwf submit <root_run_id> --verdict REJECT --feedback "用户要求增强冲突" --json
 ```
 
 默认 APPROVE 前进，REJECT 重做当前任务。人工拒绝会开启新的质检预算，

@@ -39,6 +39,7 @@ import os
 import shutil
 import sys
 import unicodedata
+from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 from . import __version__, library as template_library
@@ -150,6 +151,119 @@ def _posix(path: str) -> str:
     return str(path).replace("\\", "/")
 
 
+# ---- submit template -----------------------------------------------------
+SUBMIT_NAME = "submit.json"
+
+
+def _submit_path(storage: Storage, run_id: str) -> str:
+    record = storage.find_run(run_id)
+    return os.path.join(storage.run_dir_for_record(record), SUBMIT_NAME)
+
+
+def _default_for_type(field: Dict[str, Any]) -> Any:
+    return {
+        "integer": 0, "number": 0, "boolean": False,
+        "array": [], "object": {},
+    }.get(field.get("type", "string"), "")
+
+
+def _submit_kind(spec: Dict[str, Any]) -> str:
+    if spec.get("check_request"):
+        return "check"
+    if spec.get("review_request"):
+        return "review"
+    if spec.get("input_request"):
+        return "provide"
+    if spec.get("phase") == "awaiting_items":
+        return "items"
+    node = spec.get("node") or {}
+    if node.get("type") in ("start", "end"):
+        return "empty"
+    return "complete"
+
+
+def build_submit_template(spec: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """The one file an agent edits: action fingerprint + a pre-filled payload."""
+    action = spec.get("action")
+    if not action:
+        return None
+    node = spec.get("node") or {}
+    kind = _submit_kind(spec)
+
+    if kind == "check":
+        request = spec.get("check_request") or {}
+        criteria = request.get("criteria") or []
+        output: Any = {"verdict": "PASS|REVISE", "reason": ""}
+        hint = ("逐条核对 criteria；verdict 填 PASS 或 REVISE，reason 写依据。"
+                "\ncriteria: " + " / ".join(map(str, criteria)))
+    elif kind == "review":
+        request = spec.get("review_request") or {}
+        requirements = request.get("requirements") or []
+        if not isinstance(requirements, list):
+            requirements = [requirements]
+        output = {"verdict": "APPROVE|REJECT", "feedback": ""}
+        hint = ("结论必须来自用户；verdict 填 APPROVE 或 REJECT。"
+                "\nrequirements: " + " / ".join(map(str, requirements)))
+    elif kind == "provide":
+        request = spec.get("input_request") or {}
+        fields = request.get("fields") or []
+        output = {field["name"]: _default_for_type(field) for field in fields}
+        hint = "按 input_request 填字段；enum 只能取列出的值。"
+    elif kind == "items":
+        output = []
+        hint = "把条目对象放进 output；结束队列时把 seal 设为 true。"
+    elif kind == "empty":
+        output = None
+        hint = "无需 payload；直接 aiwf submit。"
+    else:  # complete
+        declared = (node.get("output") or {}).get("file")
+        if node.get("type") == "branch":
+            labels = "|".join(node.get("routes") or {}) or "TRUE|FALSE"
+            output = labels
+            hint = f"output 改成其中一个 route：{labels}"
+        elif declared:
+            output = {"$file": _posix(declared)}
+            hint = f"把文件写到 {_posix(declared)}；写完直接 aiwf submit。"
+        elif node.get("output_schema"):
+            output = {}
+            hint = ("按 node.output_schema 填 output；数组/对象可直接改本文件，"
+                    "或改用 --json-file。")
+        else:
+            output = {}
+            hint = "把结果放进 output；短对象可直接改本文件。"
+
+    template: Dict[str, Any] = {
+        "action": action["id"],
+        "action_run_id": action["run_id"],
+        "run_id": spec["run_id"],
+        "node": action["node_id"],
+        "kind": kind,
+        "hint": hint,
+        "output": output,
+    }
+    if kind == "items":
+        template["seal"] = False
+    return template
+
+
+def write_submit_template(storage: Storage, spec: Dict[str, Any]) -> Optional[str]:
+    """Refresh ``submit.json`` after a transition; remove it at rest."""
+    if not spec.get("run_id"):
+        return None
+    path = _submit_path(storage, spec["run_id"])
+    if spec.get("status") != "running" or not spec.get("action"):
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+        return None
+    template = build_submit_template(spec)
+    if template is None:
+        return None
+    storage.write_json_file(path, template)
+    return path
+
+
 def _next_for_spec(spec: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """The command that continues this run, computed from the packet itself.
 
@@ -167,63 +281,45 @@ def _next_for_spec(spec: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         return {"kind": "done", "text": f"aiwf runs show {run_id}"}
 
     action = spec.get("action") or {}
-    aid = action.get("id")
-    target = action.get("run_id") or run_id
     node = spec.get("node") or {}
-    action_arg = f" --action {aid}" if aid else ""
 
     if spec.get("input_request"):
         fields = spec["input_request"].get("fields") or []
         sample = f" -p {fields[0]['name']}=..." if fields else " -p key=value"
-        return {"kind": "provide",
-                "text": f"aiwf provide {target}{action_arg}{sample}"}
+        return {"kind": "submit", "text": f"aiwf submit{sample}"}
     if spec.get("review_request"):
-        return {"kind": "review",
+        return {"kind": "submit",
                 "choices": ["APPROVE", "REJECT"],
-                "text": f'aiwf review {target}{action_arg} '
-                        f'--verdict APPROVE|REJECT --feedback "..."'}
+                "text": 'aiwf submit --verdict APPROVE|REJECT --feedback "..."'}
     if spec.get("check_request"):
-        return {"kind": "check",
+        return {"kind": "submit",
                 "choices": ["PASS", "REVISE"],
-                "text": f'aiwf complete {target}{action_arg} '
-                        f'--verdict PASS|REVISE --reason "..."'}
+                "text": 'aiwf submit --verdict PASS|REVISE --reason "..."'}
     if spec.get("phase") == "awaiting_items":
-        node_id = node.get("id") or "<node>"
-        return {"kind": "items",
-                "text": f"aiwf items add {target} --node {node_id} "
-                        f"--item-file items.json"
-                        f"   # or: aiwf items seal {target} --node {node_id}"}
+        return {"kind": "submit", "text": "aiwf submit",
+                "note": "编辑 submit.json 的 output/seal，或 "
+                        "aiwf submit --item-file items.json"}
     if action.get("kind") == "resume":
-        wf = spec.get("root_workflow_id") or spec.get("workflow_id")
-        return {"kind": "resume", "text": f"aiwf resume {wf} {target} --json"}
+        return {"kind": "resume", "text": f"aiwf resume {run_id} --json"}
 
     ntype = node.get("type")
     if ntype == "task":
-        declared = (node.get("output") or {}).get("file")
-        if declared:
-            return {"kind": "complete",
-                    "text": f'aiwf complete {target}{action_arg} '
-                            f'--file "{_posix(declared)}"'}
-        if node.get("output_schema"):
-            return {"kind": "complete",
-                    "text": f"aiwf complete {target}{action_arg} "
-                            f"--json-file result.json"}
-        return {"kind": "complete",
-                "text": f'aiwf complete {target}{action_arg} --output "<result>"'}
+        return {"kind": "submit", "text": "aiwf submit"}
     if ntype == "branch":
         routes = list(node.get("routes") or {})
         labels = "|".join(routes) or "TRUE|FALSE"
-        return {"kind": "complete", "choices": routes or ["TRUE", "FALSE"],
-                "text": f'aiwf complete {target}{action_arg} --output "{labels}"'}
+        return {"kind": "submit", "choices": routes or ["TRUE", "FALSE"],
+                "text": f'aiwf submit --output "{labels}"'}
     if ntype in ("start", "end"):
-        return {"kind": "complete",
-                "text": f"aiwf complete {target}{action_arg} --empty"}
+        return {"kind": "submit", "text": "aiwf submit --empty"}
     return None
 
 
 def _print_next(next_command: Optional[Dict[str, Any]]) -> None:
     if next_command:
         print(f"next     : {next_command['text']}")
+        if next_command.get("note"):
+            print(f"note     : {next_command['note']}")
 
 
 def _print_rejection(spec: Dict[str, Any]) -> None:
@@ -469,23 +565,17 @@ def _print_view(derived: Dict[str, Any]) -> None:
 
 
 def _gate_command(action: Dict[str, Any]) -> str:
-    """The exact command that clears a gate -- action id included.
-
-    Without ``--action`` the engine rejects the instruction as stale, so a
-    command that omits it is worse than no command: it looks runnable and is
-    not.
-    """
-    kind, run_id, aid = action["kind"], action["run_id"], action.get("id")
+    """The command that clears a gate; the submit template carries the action."""
+    kind, run_id = action["kind"], action["run_id"]
     if kind == "review":
-        return f"aiwf review {run_id} --action {aid} --verdict APPROVE|REJECT"
+        return f'aiwf submit {run_id} --verdict APPROVE|REJECT --feedback "..."'
     if kind == "check":
-        return (f"aiwf complete {run_id} --action {aid} "
-                "--output '{\"verdict\":\"PASS\",\"reason\":\"...\"}'")
+        return f'aiwf submit {run_id} --verdict PASS|REVISE --reason "..."'
     if kind == "provide":
-        return f"aiwf provide {run_id} --action {aid} -p key=value"
+        return f"aiwf submit {run_id} -p key=value"
     if kind == "resume":
-        return f"aiwf resume {action.get('workflow_id')} {run_id}"
-    return f"aiwf current {run_id} --json"
+        return f"aiwf resume {run_id}"
+    return f"aiwf submit {run_id}"
 
 
 def _print_subflow_table(record: Dict[str, Any]) -> None:
@@ -646,7 +736,8 @@ def _pick_run(
         if not running:
             raise UsageError(
                 "no running run",
-                hint="start one with `aiwf run ...`, or pass a run_id",
+                hint="start one with `aiwf run ...`, or recover a failed run "
+                     "with `aiwf resume <run_id>` (see `aiwf runs list`)",
             )
         raise UsageError(
             "multiple runs are running; pass a run_id",
@@ -658,7 +749,10 @@ def _pick_run(
         return running[0][1]
     if latest is not None:
         return latest[2]
-    raise NotFoundError("no runs found", hint="start one with `aiwf run ...`")
+    raise NotFoundError(
+        "no runs found",
+        hint="create storage with `aiwf init`, then start one with `aiwf run ...`",
+    )
 
 
 def _resolve_action_id(engine, run_id: str, raw: Optional[str]) -> Optional[str]:
@@ -697,6 +791,8 @@ def _emit(engine, record, args, advance=True):
         workflow = engine.storage.load_workflow_for_record(record)
         spec = engine.node_spec(workflow, record)
     _attach_rejection(engine, spec)
+    if advance and not engine.last_rejection:
+        write_submit_template(engine.storage, spec)
     print_spec(spec, args.json)
     if engine.last_rejection:
         return 3
@@ -725,6 +821,8 @@ def _act(engine, args, command, **kwargs):
         )
     spec = engine.act(args.run_id, action_id, command, **kwargs)
     _attach_rejection(engine, spec)
+    if not engine.last_rejection:
+        write_submit_template(engine.storage, spec)
     print_spec(spec, args.json)
     if engine.last_rejection:
         return 3
@@ -919,6 +1017,101 @@ def cmd_current(args, storage: Storage) -> int:
     return _emit(WorkflowEngine(storage), record, args, advance=False)
 
 
+def _print_status(spec: Dict[str, Any], submit_file: Optional[str] = None) -> None:
+    print(f"run   {spec['run_id']}  {spec.get('title', '')}  {spec['status']}")
+    node = spec.get("node")
+    input_request = spec.get("input_request")
+    review_request = spec.get("review_request")
+    check_request = spec.get("check_request")
+
+    if input_request:
+        print(f"now   [{input_request['node_id']}] 等待用户回答")
+        fields = input_request.get("fields") or []
+        for field in fields:
+            extra = ""
+            if field.get("enum"):
+                extra = "  可选: " + " | ".join(map(str, field["enum"]))
+            print(f"  - {field['name']} ({field.get('type', 'string')})"
+                  f" {field.get('title', '')}{extra}")
+            if field.get("description"):
+                print(f"      {field['description']}")
+    elif review_request:
+        print(f"now   [{review_request['node_id']}] 人工验收"
+              f"（第 {review_request.get('attempt', 1)} 次）")
+        requirements = review_request.get("requirements")
+        if isinstance(requirements, list):
+            for item in requirements:
+                print(f"  [ ] {item}")
+        elif requirements:
+            print(f"  {requirements}")
+        if review_request.get("output") is not None:
+            print("artifact: " + json.dumps(review_request["output"], ensure_ascii=False))
+    elif node:
+        print(f"now   [{node['id']}] {node.get('name', node['id'])}")
+    else:
+        print("now   (none; run finished)")
+
+    if node:
+        if node.get("inputs"):
+            print("materials:")
+            for name, value in node["inputs"].items():
+                print(f"  {name}: {json.dumps(value, ensure_ascii=False)}")
+        if node.get("output"):
+            print(f"artifact: {_posix((node['output'] or {}).get('file', ''))}")
+        check = node.get("check")
+        if check and not check_request:
+            print(f"check : 最多 {check.get('max_attempts')} 次")
+            for criterion in check.get("criteria") or []:
+                print(f"  [ ] {criterion}")
+        review = node.get("review")
+        if review and not review_request:
+            print("review: 用户验收")
+            requirements = review.get("requirements")
+            if isinstance(requirements, list):
+                for item in requirements:
+                    print(f"  [ ] {item}")
+            elif requirements:
+                print(f"  {requirements}")
+        if node.get("feedback"):
+            print(f"feedback: {str(node['feedback'])[:300]}")
+        if node.get("previous_output") is not None:
+            print("previous: " + json.dumps(
+                node["previous_output"], ensure_ascii=False)[:300])
+        if node.get("prompt"):
+            print("prompt:")
+            for line in str(node["prompt"]).splitlines():
+                print(f"  {line}")
+        if node.get("routes"):
+            print("routes: " + ", ".join(node["routes"]))
+        if node.get("items"):
+            print("items: " + json.dumps(node["items"], ensure_ascii=False))
+        if node.get("child"):
+            print(f"child: run {node['child']['run_id']} "
+                  f"instance {node['child']['instance']}")
+        if node.get("message"):
+            print(f"note  : {node['message']}")
+        if node.get("output_schema"):
+            print("contract: " + json.dumps(node["output_schema"], ensure_ascii=False))
+
+    if check_request:
+        print(f"check : 第 {check_request.get('attempt')}/"
+              f"{check_request.get('max_attempts')} 次")
+        for criterion in check_request.get("criteria") or []:
+            print(f"  [ ] {criterion}")
+        if check_request.get("output") is not None:
+            print("artifact: " + json.dumps(check_request["output"], ensure_ascii=False))
+
+    if spec.get("error"):
+        print(f"error : {str(spec['error'])[:300]}")
+    if submit_file:
+        print(f"file  : {_posix(submit_file)}")
+    next_command = _next_for_spec(spec)
+    if next_command:
+        print(f"next  : {next_command['text']}")
+        if next_command.get("note"):
+            print(f"note  : {next_command['note']}")
+
+
 def cmd_status(args, storage: Storage) -> int:
     """One read-only answer to "where is this run, and what do I type next?"."""
     args.run_id = _pick_run(storage, args.run_id, need_running=False)
@@ -930,34 +1123,333 @@ def cmd_status(args, storage: Storage) -> int:
         spec = engine.node_spec(_load_workflow_for_record(storage, record), record)
     workflow, _error = _resolve_definition(record, storage)
     spec["title"] = view_mod.run_title(workflow, record)
-    next_command = _next_for_spec(spec)
+    submit_file = _submit_path(storage, spec["run_id"])
+    if not os.path.isfile(submit_file):
+        submit_file = None
 
     if getattr(args, "json", False):
         payload = dict(spec)
+        payload["submit_file"] = _posix(submit_file) if submit_file else None
+        next_command = _next_for_spec(spec)
         if next_command is not None:
             payload["next"] = next_command
         print(json.dumps(payload, ensure_ascii=False, indent=2))
         return 0
 
-    print(f"run  {record['run_id']}  {spec['title']}  {spec['status']}")
-    node = spec.get("node")
-    if node:
-        print(f"now  [{node['id']}] {node.get('name', node['id'])}")
-    elif spec.get("input_request"):
-        print(f"now  [{spec['input_request']['node_id']}] (awaiting user input)")
-    else:
-        print("now  (none; run finished)")
-    if next_command:
-        print(f"next {next_command['text']}")
-    review = spec.get("review_request")
-    if review:
-        requirements = review.get("requirements")
-        if isinstance(requirements, list) and requirements:
-            print("wait 用户验收：" + " / ".join(map(str, requirements[:3])))
-    reason = spec.get("error") or (node or {}).get("feedback")
-    if reason:
-        print(f"why  {str(reason)[:300]}")
+    _print_status(spec, submit_file)
     return 0
+
+
+def _archive_submission(storage: Storage, spec: Dict[str, Any],
+                        kind: str, payload: Any, seal: bool = False) -> str:
+    record = storage.find_run(spec["run_id"])
+    directory = os.path.join(storage.run_dir_for_record(record), "submissions")
+    os.makedirs(directory, exist_ok=True)
+    existing = [
+        int(name.split("-", 1)[0])
+        for name in os.listdir(directory)
+        if name[:4].isdigit() and name.endswith(".json")
+    ]
+    sequence = (max(existing) if existing else 0) + 1
+    action = spec.get("action") or {}
+    node = action.get("node_id") or "unknown"
+    path = os.path.join(directory, f"{sequence:04d}-{node}.json")
+    entry = {
+        "at": datetime.now().isoformat(timespec="seconds"),
+        "run_id": spec["run_id"],
+        "action": action.get("id"),
+        "node": node,
+        "kind": kind,
+        "output": payload,
+    }
+    if seal:
+        entry["seal"] = True
+    storage.write_json_file(path, entry)
+    return path
+
+
+def _has_submit_flags(args) -> bool:
+    return any((
+        getattr(args, "file", None) is not None,
+        getattr(args, "verdict", None) is not None,
+        getattr(args, "reason", None) is not None,
+        getattr(args, "feedback", None) is not None,
+        getattr(args, "approve", False),
+        getattr(args, "reject", False),
+        bool(getattr(args, "set", None)),
+        bool(getattr(args, "output_file", None)),
+        bool(getattr(args, "empty", False)),
+        getattr(args, "output", None) is not None,
+        bool(getattr(args, "item", None)),
+        bool(getattr(args, "item_file", None)),
+        bool(getattr(args, "seal", False)),
+        getattr(args, "fail_reason", None) is not None,
+        bool(getattr(args, "param", None)),
+        bool(getattr(args, "data_file", None)),
+    ))
+
+
+def _validate_submit_flags(kind: str, args) -> None:
+    """Reject a payload flag that does not belong to this step's kind."""
+    if kind != "items" and (getattr(args, "item", None)
+                            or getattr(args, "item_file", None)):
+        raise UsageError("--item / --item-file only apply to a queue step")
+    if kind != "provide" and (getattr(args, "param", None)
+                              or getattr(args, "data_file", None)):
+        raise UsageError("-p / --data-file only apply to a provide step")
+    if kind != "review" and (getattr(args, "approve", False)
+                             or getattr(args, "reject", False)
+                             or getattr(args, "feedback", None) is not None):
+        raise UsageError("--approve / --reject / --feedback only apply to a review step")
+    if kind != "check" and getattr(args, "reason", None) is not None:
+        raise UsageError("--reason only applies to a check step")
+    if kind in ("check", "review", "provide") and any((
+        getattr(args, "file", None) is not None,
+        bool(getattr(args, "set", None)),
+        bool(getattr(args, "output_file", None)),
+        bool(getattr(args, "empty", False)),
+        getattr(args, "output", None) is not None,
+    )):
+        raise UsageError(f"a {kind} step uses its own payload, not "
+                         "--file/--set/--json-file/--empty/--output")
+    if kind not in ("check", "review") and getattr(args, "verdict", None) is not None:
+        raise UsageError("--verdict only applies to check or review")
+
+
+def _submit_items(args) -> List[Any]:
+    items: List[Any] = []
+    for raw in getattr(args, "item", None) or []:
+        parsed = _json_arg(raw)
+        items.extend(parsed if isinstance(parsed, list) else [parsed])
+    for path in getattr(args, "item_file", None) or []:
+        parsed = _read_json(path)
+        items.extend(parsed if isinstance(parsed, list) else [parsed])
+    return items
+
+
+def cmd_submit(args, storage: Storage) -> int:
+    """The single write verb: report the current step's result.
+
+    Payload precedence: explicit flags > ``submit.json``'s ``output``. The
+    template also carries the action id, which is what restores the staleness
+    guard without asking a caller to copy it.
+    """
+    args.run_id = _pick_run(
+        storage, args.run_id,
+        need_running=not getattr(args, "print_template", False),
+    )
+    engine = WorkflowEngine(storage)
+    spec = engine.action_spec(args.run_id)
+    if not spec.get("action"):
+        status = spec.get("status")
+        if status == "failed":
+            raise UsageError(
+                f"run {args.run_id} is failed; there is no step to submit",
+                hint=f"recover it with `aiwf resume {args.run_id}`",
+                next_command=f"aiwf resume {args.run_id}",
+            )
+        raise UsageError(
+            f"run {args.run_id} is {status}; nothing to submit",
+            hint=f"inspect it with `aiwf runs show {args.run_id}`",
+        )
+
+    template_path = _submit_path(storage, spec["run_id"])
+    if getattr(args, "print_template", False):
+        path = write_submit_template(storage, spec)
+        if not path:
+            raise UsageError("no action to write a template for")
+        if args.json:
+            print(json.dumps({"submit_file": path,
+                              "template": build_submit_template(spec)},
+                             ensure_ascii=False, indent=2))
+        else:
+            print(_posix(path))
+            print(json.dumps(build_submit_template(spec),
+                             ensure_ascii=False, indent=2))
+        return 0
+
+    template = _read_json(template_path) if os.path.isfile(template_path) else None
+    if template is not None:
+        if not isinstance(template, dict) or not template.get("action"):
+            raise UsageError(
+                f"invalid submit template: {template_path}",
+                hint="rebuild it with `aiwf submit --print`",
+            )
+        if template["action"] != spec["action"]["id"]:
+            raise StaleActionError(
+                "submit.json is stale: the run has moved to another action",
+                at=template_path,
+                hint="run `aiwf status` to see the current step, then "
+                     "`aiwf submit --print` to refresh the template",
+                next_command="aiwf status",
+            )
+    elif not _has_submit_flags(args):
+        write_submit_template(storage, spec)
+        raise UsageError(
+            f"submit template created at {template_path}",
+            at=template_path,
+            hint="fill `output` and run `aiwf submit`, or pass a payload flag "
+                 "(e.g. --file PATH / --verdict PASS --reason \"...\")",
+            next_command="aiwf submit",
+        )
+
+    kind = (template or {}).get("kind") or _submit_kind(spec)
+    expected_kind = _submit_kind(spec)
+    if template is not None and template.get("kind") not in (None, expected_kind):
+        raise UsageError(
+            "submit.json kind does not match the current step",
+            at=template_path,
+            hint="refresh it with `aiwf submit --print`",
+        )
+    action_id = spec["action"]["id"]
+    if getattr(args, "approve", False) and getattr(args, "reject", False):
+        raise UsageError("choose --approve or --reject, not both")
+    if getattr(args, "fail_reason", None) is not None:
+        conflicting = any((
+            getattr(args, "file", None), getattr(args, "verdict", None),
+            getattr(args, "reason", None), getattr(args, "feedback", None),
+            getattr(args, "approve", False), getattr(args, "reject", False),
+            getattr(args, "set", None), getattr(args, "output_file", None),
+            getattr(args, "empty", False), getattr(args, "output", None),
+            getattr(args, "item", None), getattr(args, "item_file", None),
+            getattr(args, "param", None), getattr(args, "data_file", None),
+        ))
+        if conflicting:
+            raise UsageError("--fail takes no other payload")
+    if getattr(args, "fail_reason", None) is None:
+        _validate_submit_flags(kind, args)
+
+    if getattr(args, "fail_reason", None) is not None:
+        kind = "fail"
+        payload: Any = args.fail_reason
+        seal = False
+    elif kind == "review":
+        verdict = "APPROVE" if getattr(args, "approve", False) else (
+            "REJECT" if getattr(args, "reject", False) else getattr(args, "verdict", None)
+        )
+        if verdict is None and template is not None and not _has_submit_flags(args):
+            body = template.get("output") or {}
+            verdict = body.get("verdict")
+            feedback = body.get("feedback") or ""
+        else:
+            feedback = getattr(args, "feedback", None) or ""
+        if verdict not in ("APPROVE", "REJECT"):
+            raise UsageError(
+                "review verdict must be APPROVE or REJECT",
+                hint='e.g. aiwf submit --verdict APPROVE --feedback "用户认可"',
+            )
+        payload = {"verdict": verdict, "feedback": feedback}
+    elif kind == "check":
+        if getattr(args, "approve", False) or getattr(args, "reject", False):
+            raise UsageError("a check step uses --verdict PASS|REVISE, not --approve")
+        if _has_submit_flags(args):
+            payload = _read_output(args)
+        else:
+            payload = (template or {}).get("output") or {}
+        verdict = str(payload.get("verdict", ""))
+        reason = str(payload.get("reason", "")).strip()
+        if verdict not in ("PASS", "REVISE") or not reason:
+            raise UsageError(
+                "check needs a verdict and a reason",
+                hint='edit submit.json or run aiwf submit --verdict PASS '
+                     '--reason "实测依据"',
+            )
+        payload = {"verdict": verdict, "reason": reason}
+    elif kind == "provide":
+        if _has_submit_flags(args):
+            payload = _read_data(args)
+        else:
+            payload = (template or {}).get("output") or {}
+        if not isinstance(payload, dict) or not payload:
+            raise UsageError(
+                "provide needs at least one answer",
+                hint="use -p key=value or edit submit.json's output",
+            )
+        required = ((spec.get("input_request") or {}).get("schema") or {}).get(
+            "required") or []
+        missing = [
+            key for key in required
+            if payload.get(key) in (None, "")
+        ]
+        if missing:
+            raise UsageError(
+                "submit.json still has unanswered fields: " + ", ".join(missing),
+                hint="fill them in submit.json, or pass -p key=value",
+            )
+    elif kind == "items":
+        if _has_submit_flags(args):
+            payload = _submit_items(args)
+            seal = bool(getattr(args, "seal", False))
+        else:
+            payload = (template or {}).get("output") or []
+            seal = bool((template or {}).get("seal", False))
+        if not isinstance(payload, list) or (not payload and not seal):
+            raise UsageError(
+                "items submit needs an item array, or seal=true to close",
+                hint="put item objects in submit.json's output, or "
+                     "set seal=true to finish the queue",
+            )
+    elif kind == "empty":
+        if _has_submit_flags(args) and not getattr(args, "empty", False):
+            raise UsageError("an empty step accepts no payload",
+                             hint="just run aiwf submit --empty")
+        payload = None
+        seal = False
+    else:  # complete
+        if getattr(args, "verdict", None) is not None:
+            raise UsageError(
+                "a task step does not take --verdict",
+                hint="use --file / --json-file / --set, or edit submit.json",
+            )
+        if _has_submit_flags(args):
+            payload = _read_output(args)
+        else:
+            payload = (template or {}).get("output")
+        seal = False
+        if isinstance(payload, str) and "|" in payload and payload == (
+            (template or {}).get("output")
+        ):
+            raise UsageError(
+                "submit.json still has a placeholder value: " + payload,
+                hint="replace it with one of the route labels, then rerun",
+            )
+
+    if kind == "items":
+        root = engine.root_record(storage.find_run(args.run_id))
+        leaf = engine._leaf_record(root)
+        node_id = (spec.get("node") or {}).get("id") or spec["action"]["node_id"]
+        if payload:
+            engine.queue_add(leaf["run_id"], node_id, payload)
+        if seal:
+            engine.queue_seal(leaf["run_id"], node_id)
+        engine.settle(root["run_id"])
+        spec2 = engine.action_spec(root["run_id"])
+    else:
+        command = {
+            "check": "complete", "complete": "complete", "empty": "complete",
+            "provide": "provide", "review": "review", "fail": "fail",
+        }[kind]
+        kwargs: Dict[str, Any] = {}
+        if kind in ("check", "complete", "empty"):
+            kwargs["output"] = payload
+        elif kind == "provide":
+            kwargs["values"] = payload
+        elif kind == "review":
+            kwargs["verdict"] = payload["verdict"]
+            kwargs["feedback"] = payload["feedback"]
+        elif kind == "fail":
+            kwargs["error"] = payload
+        spec2 = engine.act(args.run_id, action_id, command, **kwargs)
+
+    _attach_rejection(engine, spec2)
+    if engine.last_rejection:
+        print_spec(spec2, args.json)
+        return 3
+    _archive_submission(storage, spec, kind, payload,
+                        seal=locals().get("seal", False))
+    write_submit_template(storage, spec2)
+    print_spec(spec2, args.json)
+    return 1 if spec2.get("status") == "failed" else 0
 
 
 def _read_output(args) -> Any:
@@ -1074,6 +1566,8 @@ def cmd_complete(args, storage: Storage) -> int:
     spec = engine.node_spec(workflow, record)
     if engine.last_rejection:
         spec["rejected"] = engine.last_rejection
+    else:
+        write_submit_template(storage, spec)
     print_spec(spec, args.json)
     if engine.last_rejection:
         return 3
@@ -1138,7 +1632,9 @@ def cmd_fail(args, storage: Storage) -> int:
         return 1
     record = engine.fail(workflow, args.run_id, args.error)
     workflow = _load_workflow_for_record(storage, record)
-    print_spec(engine.node_spec(workflow, record), args.json)
+    spec = engine.node_spec(workflow, record)
+    write_submit_template(storage, spec)
+    print_spec(spec, args.json)
     return 1
 
 
@@ -1289,6 +1785,7 @@ def cmd_items(args, storage: Storage) -> int:
         else:
             leaf = engine._leaf_record(storage.find_run(root["run_id"]))
             spec = engine.node_spec(storage.load_workflow_for_record(leaf), leaf)
+        write_submit_template(storage, spec)
     if args.json:
         print(json.dumps({"queue": table, "spec": spec}, ensure_ascii=False, indent=2))
     else:
@@ -1590,11 +2087,20 @@ def cmd_wf_index(args, storage: Storage) -> int:
 
 # ---- argparse wiring -----------------------------------------------------
 def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(prog="aiwf", description="Schema-driven AI workflow engine")
+    p = argparse.ArgumentParser(
+        prog="aiwf", description="Schema-driven AI workflow engine",
+        epilog="Run `aiwf` with no arguments for the current step; "
+               "`aiwf --help-all` lists advanced commands.",
+    )
     p.add_argument("--version", action="version", version=f"aiwf {__version__}")
-    sub = p.add_subparsers(dest="command", required=True)
+    p.add_argument("--help-all", action="store_true", help=argparse.SUPPRESS)
+    p.add_argument("--json", action="store_true", help=argparse.SUPPRESS)
+    sub = p.add_subparsers(dest="command", required=False)
 
-    sub.add_parser("init", help="create .aiwf storage dirs and ./bin launchers").set_defaults(func=cmd_init)
+    sub.add_parser(
+        "init", help=argparse.SUPPRESS,
+        description="create .aiwf storage dirs and ./bin launchers",
+    ).set_defaults(func=cmd_init)
 
     pd = sub.add_parser("doctor", help="check the environment the CLI needs")
     pd.add_argument("--library", help="template library dir to inspect")
@@ -1607,7 +2113,8 @@ def build_parser() -> argparse.ArgumentParser:
                     help="validate all definitions and the subflow call graph")
     pv.set_defaults(func=cmd_validate)
 
-    pw = sub.add_parser("workflows", help="list saved workflows")
+    pw = sub.add_parser("workflows", help=argparse.SUPPRESS,
+                        description="list saved workflows")
     pw.add_argument("--json", action="store_true")
     pw.set_defaults(func=cmd_workflows)
 
@@ -1622,7 +2129,8 @@ def build_parser() -> argparse.ArgumentParser:
     pr.add_argument("--json", action="store_true", help="machine-readable spec envelope")
     pr.set_defaults(func=cmd_run)
 
-    pc = sub.add_parser("current", help="print the current spec of a run")
+    pc = sub.add_parser("current", help=argparse.SUPPRESS,
+                        description="print the current spec of a run (JSON)")
     pc.add_argument("run_id", nargs="?",
                     help="run id (prefix ok); default: the sole running run, else the latest")
     pc.add_argument("--json", action="store_true")
@@ -1637,8 +2145,47 @@ def build_parser() -> argparse.ArgumentParser:
     ps.add_argument("--json", action="store_true")
     ps.set_defaults(func=cmd_status)
 
+    psub = sub.add_parser(
+        "submit", help="report the current step's result (the one write verb)",
+        description="Reads submit.json (action + pre-filled output) and "
+                    "dispatches by the current phase: task output, check "
+                    "verdict, human review, user input, or queue items. "
+                    "Explicit payload flags override the template.",
+    )
+    psub.add_argument("run_id", nargs="?")
+    psub.add_argument("--file", metavar="PATH",
+                      help="artifact path; becomes {\"$file\": PATH}")
+    psub.add_argument("--verdict",
+                      help="PASS|REVISE for check, APPROVE|REJECT for review")
+    psub.add_argument("--reason", help="check reason")
+    psub.add_argument("--feedback", help="review feedback")
+    psub.add_argument("--approve", action="store_true", help="review: APPROVE")
+    psub.add_argument("--reject", action="store_true", help="review: REJECT")
+    psub.add_argument("--set", action="append", metavar="KEY=VALUE",
+                      help="one scalar output field (repeatable)")
+    psub.add_argument("--output", help="raw JSON/string output (advanced)")
+    psub.add_argument("--output-file", "--json-file", dest="output_file",
+                      metavar="FILE", help="JSON file with the whole output")
+    psub.add_argument("--empty", action="store_true",
+                      help="no payload (start/end steps)")
+    psub.add_argument("--fail", dest="fail_reason", metavar="REASON",
+                      help="report a failure instead of a result")
+    psub.add_argument("--item", action="append",
+                      help="one queue item as JSON (repeatable)")
+    psub.add_argument("--item-file", action="append", metavar="FILE",
+                      help="JSON file with one item or an array")
+    psub.add_argument("--seal", action="store_true",
+                      help="close the queue after adding items")
+    psub.add_argument("-p", "--param", action="append",
+                      help="user-input answer key=value (provide phase)")
+    psub.add_argument("--data-file", help="JSON file with user answers")
+    psub.add_argument("--print", dest="print_template", action="store_true",
+                      help="rebuild submit.json from the current state")
+    psub.add_argument("--json", action="store_true")
+    psub.set_defaults(func=cmd_submit)
+
     pcomp = sub.add_parser(
-        "complete", help="report task/branch output and advance",
+        "complete", help=argparse.SUPPRESS,
         description="Report the current action's result. Pick exactly one "
                     "payload flag; the task packet's `next` line shows which.",
     )
@@ -1666,7 +2213,8 @@ def build_parser() -> argparse.ArgumentParser:
     pcomp.add_argument("--json", action="store_true")
     pcomp.set_defaults(func=cmd_complete)
 
-    pprov = sub.add_parser("provide", help="supply user input for a task node")
+    pprov = sub.add_parser("provide", help=argparse.SUPPRESS,
+                           description="supply user input for a task node")
     pprov.add_argument("run_id", nargs="?")
     pprov.add_argument("--action", help="action id (default: the current action)")
     pprov.add_argument("--node", help="completed task node whose input is changed")
@@ -1676,7 +2224,8 @@ def build_parser() -> argparse.ArgumentParser:
     pprov.add_argument("--json", action="store_true")
     pprov.set_defaults(func=cmd_provide)
 
-    prev2 = sub.add_parser("review", help="submit human review verdict")
+    prev2 = sub.add_parser("review", help=argparse.SUPPRESS,
+                           description="submit human review verdict")
     prev2.add_argument("run_id", nargs="?")
     prev2.add_argument("--action", help="action id (default: the current action)")
     prev2.add_argument("--verdict", required=True, choices=["APPROVE", "REJECT"],
@@ -1695,7 +2244,8 @@ def build_parser() -> argparse.ArgumentParser:
     prev3.add_argument("--json", action="store_true")
     prev3.set_defaults(func=cmd_revise)
 
-    pf = sub.add_parser("fail", help="report a node failure")
+    pf = sub.add_parser("fail", help=argparse.SUPPRESS,
+                        description="report a node failure")
     pf.add_argument("run_id", nargs="?")
     pf.add_argument("--action", help="action id (default: the current action)")
     pf.add_argument("--error", required=True)
@@ -1712,7 +2262,8 @@ def build_parser() -> argparse.ArgumentParser:
     pres.add_argument("--json", action="store_true")
     pres.set_defaults(func=cmd_resume)
 
-    prd = sub.add_parser("redo", help="redo one subflow/foreach instance")
+    prd = sub.add_parser("redo", help=argparse.SUPPRESS,
+                         description="redo one subflow/foreach instance")
     prd.add_argument("run_id")
     prd.add_argument("--node", required=True, help="subflow/foreach node id")
     prd.add_argument("--instance", required=True, help="instance key (index or id_field)")
@@ -1722,7 +2273,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     pit = sub.add_parser(
         "items",
-        help="engine-owned foreach queue (node declares items: {\"queue\": true})",
+        help=argparse.SUPPRESS,
         description="The queue is run state, not a file: items are validated "
                     "against the fixed schema {id, name, ...extensions} and "
                     "only the engine writes them. Started items are immutable; "
@@ -1802,7 +2353,8 @@ def build_parser() -> argparse.ArgumentParser:
     rse.add_argument("--json", action="store_true")
     rse.set_defaults(func=cmd_runs_search)
 
-    ps = sub.add_parser("skills", help="agent skill packaging")
+    ps = sub.add_parser("skills", help=argparse.SUPPRESS,
+                        description="agent skill packaging")
     ssub = ps.add_subparsers(dest="skills_command", required=True)
     sl = ssub.add_parser("list", help="list bundled skills")
     sl.add_argument("--json", action="store_true")
@@ -1851,10 +2403,45 @@ def build_parser() -> argparse.ArgumentParser:
     wt.set_defaults(func=cmd_wf_status)
 
     wx = wsub.add_parser("index", parents=[wf_parent],
-                         help="regenerate library/INDEX.md from metadata")
+                         help=argparse.SUPPRESS,
+                         description="regenerate library/INDEX.md from metadata")
     wx.set_defaults(func=cmd_wf_index)
 
+    # argparse prints `==SUPPRESS==` for a subparser help set to SUPPRESS, so
+    # drop the hidden entries from the listing and replace the usage metavar.
+    hidden = {"init", "workflows", "current", "complete", "provide",
+              "review", "fail", "redo", "items", "skills"}
+    sub._choices_actions = [
+        action for action in sub._choices_actions if action.dest not in hidden
+    ]
+    sub.metavar = "COMMAND"
+    wsub._choices_actions = [
+        action for action in wsub._choices_actions if action.dest != "index"
+    ]
+    wsub.metavar = "COMMAND"
     return p
+
+
+def _full_help() -> str:
+    return """aiwf — schema-driven workflow engine
+
+  aiwf                      show the current step (same as `aiwf status`)
+  aiwf status [RUN]         task packet: node, materials, artifact, next
+  aiwf submit [RUN]         report the current step's result (one write verb)
+  aiwf run WF --title ...   start a run
+  aiwf runs ...             audit runs
+  aiwf resume RUN           recover a failed run
+  aiwf revise RUN ...       jump back / redo
+  aiwf validate PATH        validate a definition (or --project)
+  aiwf doctor               environment check
+  aiwf wf ...               template library
+
+advanced (hidden from --help, still supported):
+  current  complete  provide  review  fail  redo  items
+
+maintenance:
+  init  workflows  skills  wf index
+"""
 
 
 def _normalize_argv(argv: Optional[List[str]]) -> List[str]:
@@ -1871,7 +2458,28 @@ def main(argv: Optional[List[str]] = None) -> int:
     raw = _normalize_argv(argv)
     as_json = "--json" in raw
     args = build_parser().parse_args(raw)
+    if getattr(args, "help_all", False):
+        print(_full_help())
+        return 0
     storage = Storage()
+    if not getattr(args, "command", None):
+        try:
+            return cmd_status(
+                argparse.Namespace(run_id=None, json=as_json), storage
+            )
+        except AiwfError as e:
+            return _fail(e, as_json)
+
+    _deprecated = {
+        "complete": "aiwf submit",
+        "provide": "aiwf submit",
+        "review": "aiwf submit",
+        "fail": 'aiwf submit --fail "..."',
+    }
+    if args.command in _deprecated and not as_json:
+        print(f"note: `aiwf {args.command}` is deprecated; "
+              f"use `{_deprecated[args.command]}`", file=sys.stderr)
+
     try:
         return args.func(args, storage)
     except AiwfError as e:

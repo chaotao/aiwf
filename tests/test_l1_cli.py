@@ -194,12 +194,12 @@ class L1CliTest(unittest.TestCase):
         payload = json.loads(proc.stdout)
         self.assertEqual(payload["run_id"], spec["run_id"])
         self.assertEqual(payload["title"], "状态测试")
-        self.assertIn("--file", payload["next"]["text"])
+        self.assertEqual(payload["next"]["text"], "aiwf submit")
 
         text = self.cli("status")
         self.assertEqual(text.returncode, 0, text.stderr)
         self.assertIn("状态测试", text.stdout)
-        self.assertIn("next aiwf complete", text.stdout)
+        self.assertIn("next  : aiwf submit", text.stdout)
 
     def test_status_after_completion_says_finished(self):
         self.save(two_step())

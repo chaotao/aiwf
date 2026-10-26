@@ -1864,6 +1864,19 @@ class WorkflowEngine:
                 feedback=record.get("last_feedback"),
                 under_revision=bool(self._active_revision(record)),
             )
+            if node.get("check"):
+                check = node["check"]
+                spec["check"] = {
+                    "criteria": [render(c, ctx) for c in check.get("criteria", [])],
+                    "max_attempts": check.get("max_attempts"),
+                }
+            if node.get("review"):
+                requirements = node["review"].get("requirements")
+                if isinstance(requirements, list):
+                    requirements = [render(item, ctx) for item in requirements]
+                elif isinstance(requirements, str):
+                    requirements = render(requirements, ctx)
+                spec["review"] = {"requirements": requirements}
             if workflow["schema_version"] == "1.1":
                 spec["inputs"] = self._materials(node, ctx)
                 spec["output"] = resolve_data(node.get("output"), ctx)

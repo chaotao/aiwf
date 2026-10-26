@@ -1,8 +1,8 @@
 # 审计 / 检索工作流运行记录
 
-1.1 的 `current <根run_id> --json` 是只读叶子任务包；`runs show` 读取指定 run 的
-完整记录（快照 + 回放增量日志）。`workflow.json` 是该运行的定义快照，修改源定义
-不会改写快照。
+1.1 的 `aiwf status [RUN] --json` 是只读叶子任务包（含标题/当前节点/next）；
+`runs show` 读取指定 run 的完整记录（快照 + 回放增量日志）。`workflow.json` 是该运行的定义快照，
+修改源定义不会改写快照。
 `check_requested/check_decided` 记录 Agent 质检次数、原始输入/输出、理由、起始时间、
 耗时和摘要；`review_decided` 记录人工结论，两者不得混淆。
 

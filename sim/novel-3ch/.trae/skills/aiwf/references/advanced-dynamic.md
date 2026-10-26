@@ -45,8 +45,12 @@
 
 ## 命令
 
+正常投喂不需要这些命令：`awaiting_items` 时改 `submit.json` 的 `output`（条目数组）/
+`seal`，再 `aiwf submit` 即可。下面是队列的排查/精细编辑入口。
+
 | 命令 | 作用 |
 |---|---|
+| `aiwf submit <run_id> [--item-file items.json] [--seal]` | 正常投喂/封口（推荐） |
 | `aiwf items list <run_id> [--node <node>]` | 打印队列与每项的派生状态 |
 | `aiwf items add <run_id> [--node <node>] --item-file items.json` | 追加一项或一批（JSON 数组/对象；`--item '<JSON>'` 仍可用） |
 | `aiwf items update <run_id> [--node <node>] --id <id> --set '<JSON>'` | 改一项**未启动**条目的字段 |

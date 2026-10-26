@@ -171,7 +171,8 @@ class L0CliTest(unittest.TestCase):
         self.assertEqual(payload["rejected"]["node_id"], "write")
         self.assertIn("expected", payload["rejected"])
         # the packet still tells the caller exactly what to do next
-        self.assertIn("--file", payload["next"]["text"])
+        self.assertEqual(payload["next"]["kind"], "submit")
+        self.assertEqual(payload["next"]["text"], "aiwf submit")
 
     def test_file_flag_accepts_a_forward_slash_path(self):
         self.save(file_workflow())
@@ -198,15 +199,15 @@ class L0CliTest(unittest.TestCase):
     def test_packet_json_names_the_next_command(self):
         self.save(file_workflow(with_check=True))
         spec = self.start_json()
-        self.assertEqual(spec["next"]["kind"], "complete")
-        self.assertIn("--file", spec["next"]["text"])
+        self.assertEqual(spec["next"]["kind"], "submit")
+        self.assertEqual(spec["next"]["text"], "aiwf submit")
 
         path = self.artifact(spec)
         after = self.cli("complete", spec["run_id"], "--action",
                          spec["action"]["id"], "--file", path, "--json")
         payload = json.loads(after.stdout)
         self.assertEqual(payload["phase"], "awaiting_check")
-        self.assertEqual(payload["next"]["kind"], "check")
+        self.assertEqual(payload["next"]["kind"], "submit")
         self.assertIn("--verdict", payload["next"]["text"])
 
         review = self.cli("complete", payload["run_id"], "--action",
@@ -214,13 +215,14 @@ class L0CliTest(unittest.TestCase):
                           "--reason", "非空", "--json")
         review_payload = json.loads(review.stdout)
         self.assertEqual(review_payload["phase"], "awaiting_review")
-        self.assertEqual(review_payload["next"]["kind"], "review")
+        self.assertEqual(review_payload["next"]["kind"], "submit")
+        self.assertIn("--verdict", review_payload["next"]["text"])
 
     def test_text_packet_prints_the_next_line(self):
         self.save(file_workflow())
         proc = self.start()
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertIn("next     : aiwf complete", proc.stdout)
+        self.assertIn("next     : aiwf submit", proc.stdout)
 
     # ---- observation -----------------------------------------------------
     def test_json_flag_is_accepted_before_the_subcommand(self):

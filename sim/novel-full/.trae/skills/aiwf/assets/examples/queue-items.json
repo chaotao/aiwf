@@ -2,14 +2,14 @@
   "schema_version": "1.1",
   "id": "queue-items",
   "name": "高阶：引擎维护的章节队列",
-  "description": "队列不是文件，而是 run 状态：`items: {\"queue\": true}` 声明；plan 节点逐条 `aiwf items add <run_id> --node chapters` 投喂、`aiwf items seal` 封口。item 的固定字段是 {id, name}，其余键随调用方拓展。",
+  "description": "队列不是文件，而是 run 状态：`items: {\"queue\": true}` 声明；plan 节点把条目写进 `submit.json` 的 `output`（或 `aiwf submit --item-file items.json`），结束时把 `seal` 设为 true。item 的固定字段是 {id, name}，其余键随调用方拓展。",
   "max_steps": 200,
   "nodes": [
     {
       "id": "plan",
       "type": "task",
       "name": "排章节",
-      "prompt": "把要写的章节排成有序清单，逐条投给引擎队列，不要写清单文件：`aiwf items add <run_id> --node chapters --item '{\"id\": \"CH-001\", \"name\": \"醒来\"}'`（`--item` 可重复），全部投完后 `aiwf items seal <run_id> --node chapters` 封口。`add` 在 run 停在 awaiting_items 时会自动推进，不必额外 resume。最后把同一份清单写成给人看的大纲，输出 {$file, summary}。",
+      "prompt": "把要写的章节排成有序清单，投给引擎队列，不要写清单文件：编辑 `submit.json` 的 `output` 为条目数组（每项至少含 \"id\" 与 \"name\"），并把 `seal` 设为 true；也可以把同样的数组写进 items.json 后执行 `aiwf submit <run_id> --item-file items.json --seal`。条目投完后 run 会自动推进，不必额外 resume。最后把同一份清单写成给人看的大纲，输出 {$file, summary}。",
       "output": {"file": "${run.dir}/outline.md"},
       "output_schema": {
         "type": "object",

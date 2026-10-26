@@ -9,22 +9,20 @@ description: 创建、运行与审计 aiwf 工作流。用户要求创建或修�
 引擎是纯状态机，不调用 LLM 或业务工具。由你获取任务包、执行任务、报告结果，
 引擎负责推进、校验与文件审计。
 
-## 加载顺序
+## 默认只读这一页 + RUN-CARD
 
-只读当前意图对应的指南。创建时先读入门，再从范例目录选最接近的一份；
-遇到字段或能力问题才补读专题。执行时优先读执行指南，不预读全部创作指南。
-修改本 Skill 时更新仓库的 `skills/aiwf` 源目录，再同步项目安装副本。
-
-### 入门与日常使用
+执行已有流程：读 [RUN-CARD](RUN-CARD.md)，只记两条命令 `aiwf` 和 `aiwf submit`。
+出错：读 [TROUBLESHOOT](TROUBLESHOOT.md) 的 `code` 行。
+其余参考只在对应意图下再读，不要预读。
 
 | 意图 | 读取 |
 |---|---|
-| 想找现成流程；不确定要不要自己写 | [模板库](references/templates.md) — 先 `aiwf wf list` 查有没有可装的 |
+| 执行 / 接管 / 续跑 | [RUN-CARD](RUN-CARD.md) |
+| 找现成流程 | [模板库](references/templates.md) — 先 `aiwf wf list` |
 | 新建、修改定义；第一次使用 | [创建入门](references/create-workflow.md) |
-| 找完整范例；小说、短剧、游戏、修代码 | [范例目录](references/examples.md) — 演示件，选中后再读取或复制 assets 中的 JSON；可直接安装的通用模板见模板库 |
-| 启动、执行、接管、临时失败续跑 | [执行指南](references/run-workflow.md) |
-| 查看进度、记录、产物、耗时、失败原因 | [审计与检索](references/inspect-runs.md) |
-| 想知道「做到哪一步、还剩什么」而不是「哪些节点跑完了」 | [业务进展视图](references/view.md) — 定义里声明 `view` 段，`runs show` 按业务阶段渲染并给出下一步命令；`view.dynamic_title` 让 `runs list` 显示作品名而不是启动时的临时名 |
+| 找完整范例 | [范例目录](references/examples.md) — 选中后再读 assets 里的 JSON |
+| 查看进度、记录、产物 | [审计与检索](references/inspect-runs.md) |
+| 业务进展视图 / 标题 | [业务进展视图](references/view.md) |
 
 ### 常用专题
 
@@ -36,33 +34,31 @@ description: 创建、运行与审计 aiwf 工作流。用户要求创建或修�
 | 批量章节 / 资源、上一项结果、复用子工作流 | [批量与子流程](references/patterns.md) |
 | 条件判断、Agent 分类、多出口 | [分支与路由](references/routing.md) |
 
-### 高阶玩法（有需要再读）
+### 高阶玩法（出错或需要时再读）
 
 | 需求 | 读取 |
 |---|---|
-| 数量事先未知、运行中追加章节 / 条目 | [运行时队列](references/advanced-dynamic.md) — `items: {"queue": true}`，用 `aiwf items add/seal` 投喂 |
-| 改已完成任务、依赖级联、局部重做、修改历史输入 | [修订与重做](references/advanced-revisions.md) |
-| SDK 驱动、显式 edges、模型提示、旧 1.0 迁移 | [集成与兼容](references/advanced-integration.md) |
+| 数量事先未知、运行中追加条目 | [运行时队列](references/advanced-dynamic.md) |
+| 改已完成任务、依赖级联、局部重做 | [修订与重做](references/advanced-revisions.md) |
+| SDK 驱动、显式 edges、旧 1.0 迁移 | [集成与兼容](references/advanced-integration.md) |
 
 ## 始终遵守
 
 - 新定义用 `schema_version: "1.1"`；从顺序 task 开始，末任务自然结束。
-- `inputs` 是材料；顶层 `input_schema` 校验启动入参；task `user_input_schema` 收集用户信息。
-- `{"ref":"key"}` 保留数据类型，`${key}` 仅文字插值；大产物落文件，结果回 `$file`。
-- 单节点输出 ≤2000 字符；优先把运行产物放 `${run.dir}`，代码修改仍落实际项目文件。
-- 用根 run_id 驱动；每次照抄任务包的 `next.text`（它已带 action id 与正确参数），
-  不要自己从 `action.kind` 拼命令。`aiwf status` 给一行"当前节点 + next"。
-- run_id 可省略（唯一 running → 用它，否则最近一个），也可只给唯一前缀；
-  `--action` 可省略（用当前 action），也可给唯一前缀或当前节点 id。多个 run 同时跑时必须指定。
-- 交文件用 `--file`，交 check 结论用 `--verdict PASS|REVISE --reason "..."`，
-  结构化结果写 JSON 再 `--json-file`；Windows 上不要用内联 `--output '{"…"}'`。
+- 执行循环只有两条命令：`aiwf`（读任务包）→ 做事 → `aiwf submit`（交结果）。
+  **照 `next` 行做**，不要自己从 `action.kind` 拼命令。
+- 交文件用 `--file`（模板已预填时直接 `aiwf submit`），check 用
+  `--verdict PASS|REVISE --reason "..."`，review 用
+  `--verdict APPROVE|REJECT --feedback "..."`，结构化结果用 `--json-file`。
+- Windows 上不要用内联 `--output '{"…"}'`；shell 会剥掉双引号。
 - 退出码：0 已前进；2 用法/入参错；3 产物被驳回（状态未变）；4 action 过期。
-  非 0 时先读 `error.code` 与 `hint`，不要重试同一条命令。
-- `check` 由 Agent 实际检查；`review` 的结论来自用户，不能自行代批。
-- 当前节点的缺陷走 `check` / `fail` / `revise`，不许绕过质检。
-- `.aiwf/runs/` 保留并纳入版本管理；交接先看 `context.md`，再 `current --json`。
+  非 0 时先读 `error.code` / `hint` / `next`，不要重试同一条命令。
+- check 由 Agent 实际检查；review 的结论来自用户，不能自行代批。
+- 当前节点的缺陷走 `check` / `aiwf submit --fail` / `revise`，不许绕过质检。
+- 大产物写文件、结果回 `$file`；单节点输出 ≤2000 字符。
 
-命令入口优先级：项目内 `./bin/aiwf`（`aiwf init` 生成，固定了解释器与 engine 路径）→
-PATH 的 `aiwf` → 本仓库 `engine/bin/aiwf`（Windows `engine/bin/aiwf.cmd`）→
-`PYTHONPATH=engine python -m aiwf`。拿不准就先跑 `aiwf doctor`；
-下文统一写 `aiwf`，状态变更命令加 `--json`。
+命令入口：项目内 `./bin/aiwf`（Windows `bin\aiwf.cmd`，`aiwf init` 生成，固定
+解释器与 engine 路径）→ PATH 的 `aiwf` → 本仓库 `engine/bin/aiwf`（Windows
+`engine/bin/aiwf.cmd`）→ `PYTHONPATH=engine python -m aiwf`。拿不准先跑 `aiwf doctor`；
+`aiwf --help-all` 列出隐藏命令：`current`（机器可读任务包）、
+`complete/provide/review/fail`（已弃用，统一用 `submit`）、`items`（队列排查/精细编辑）。

@@ -187,12 +187,12 @@ view       :
     [ok  ] 2  第 2 章 定计
     [ok  ] 3  第 3 章 决战
   [wait] 全书合稿
-    -> aiwf review 20261005-101500-a1b2 --action 9f2c1e... --verdict APPROVE|REJECT
+    -> aiwf submit 20261005-101500-a1b2 --verdict APPROVE|REJECT --feedback "..."
 ```
 
-门命令**带 action id**，可以原样复制执行。`--action` 是引擎对"这条指令针对的状态"
-做的指纹：执行前后状态一变，旧 id 立刻失效（报 `missing or stale action`）。
-视图每次读取都按当前状态重算，所以**看到命令就立刻跑**，不要缓存。
+门命令走 `submit`：模板里的 action 指纹负责"看到的是哪一步"，过期会退 4；
+执行前后状态一变，旧模板立刻失效。视图每次读取都按当前状态重算，
+所以**看到命令就立刻跑**，不要缓存。
 
 缩进层级：阶段两格，阶段自己产出的行（队列条目、门命令）四格。
 `--json` 里同一份数据在 `stages[].queue`（只有循环阶段才有该键）。

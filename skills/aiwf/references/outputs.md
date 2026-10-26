@@ -59,10 +59,11 @@
 再上报 `{"$file":"任务包中的实际路径"}`。用 CLI 时直接：
 
 ```bash
-aiwf complete <run_id> --action <id> --file "任务包里的 node.output.file"
+aiwf submit <run_id> --file "任务包里的 node.output.file"
 ```
 
 `--file` 会自动包成 `{"$file": …}`，路径反斜杠/正斜杠都接受。
+`submit.json` 的 `output` 通常已经预填这个路径；写完文件直接 `aiwf submit` 即可。
 不要把 `${run.dir}` 原样放进上报 JSON：引擎不会对实际结果再做模板渲染。
 任务包 `next.text` 已经把这行命令算好，照抄即可。
 
@@ -149,5 +150,5 @@ output_schema 不符、文件契约不符会驳回产物，任务保持开放并
 修正结果或文件，再读取最新动作并上报。声明文件存在不意味着内容通过质检，
 `check` 通过也不等于用户已经验收。
 `--output-file` / `--json-file` 读取的是**上报结果 JSON**，不是正文文件；
-正文用 `--file`。删除 `$hint` 提示键后再交（模板里只有可提交字段时无需处理）。
-**驳回时退出码是 3**：状态没有前进，按 `rejected.want/got` 修产物后重报。
+正文用 `--file`。`submit.json` 的 `hint` 只是说明，不属于 payload——只改 `output`。
+**驳回时退出码是 3**：状态没有前进，按 `rejected.expected/got` 修产物后重报。

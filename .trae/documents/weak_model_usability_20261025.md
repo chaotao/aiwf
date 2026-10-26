@@ -1,7 +1,7 @@
 # 让"不太聪明的模型"也用对 aiwf：易用性诊断与改造建议
 
 日期：2026-10-25
-状态：L0、L1 已于同日实施（见 §9/§10）；L2–L3 仍是待评估建议。
+状态：L0、L1、L2 已实施（见 §9–§11）；L3 仍是待评估建议。
 范围：引擎 / CLI 协议 / 定义格式 / Skill 文档 / 分发。
 方法：通读实现（`cli.py` 1198 行、`engine.py` 2990 行、`schema.py`、`storage.py`、`view.py`、14 份 reference），
 在中文 Windows + PowerShell 5.1 下逐条实跑命令，并让一个只读 Skill 文档的 Agent（环境变量由外部给出）完整跑一遍两步流程。
@@ -534,3 +534,23 @@ L1（协议人机工程）已落地，全量 **196 passed / 20 subtests**，两�
 
 L1 未做（属 L2/L3）：`submit.json` 工作流、`aiwf new`、`use` 简写、文档三件套、弱模型基准。
 
+## 11. L2 实施记录（2026-10-26）
+
+L2（submit 协议）已落地，全量 **216 passed / 20 subtests**，两种编码环境都绿。
+
+| L2 项 | 实施 |
+|---|---|
+| submit.json | 引擎在每次状态变更后写根 run 目录的 `submit.json`：`action`/`action_run_id`/`run_id`/`node`/`kind`/`hint`/`output`（items 另有 `seal`）；run 结束/失败时删除；`current` 只读不写 |
+| `aiwf submit` | 读模板 → 比对 action（过期退 4）→ 按 phase 分派 complete/check/review/provide/items/fail；显式 flag 覆盖模板；成功后归档到 `submissions/NNNN-<node>.json` 并写下一份模板 |
+| 分派与校验 | check 校验 verdict+reason；review 校验 APPROVE/REJECT；provide 校验 required；items 支持数组 + seal；`--fail` 折叠失败；按 kind 拒绝错配 flag |
+| status | 扩成完整任务包：标题/当前节点/材料/产物/check/review/ask/feedback/previous/prompt/contract/`submit.json`/next；`--json` 同内容 |
+| next | 正常路径统一指向 `aiwf submit`；失败 `resume`；完成 `runs show` |
+| 界面收敛 | 默认 `--help` 只列 9 个公共命令；`--help-all` 列全部；`current/complete/provide/review/fail/redo/items/workflows/skills/init` 隐藏（仍可用）；旧动词文本模式打印 `deprecated: use aiwf submit` |
+| 无参 | `aiwf` = `aiwf status`（文本/`--json`） |
+| 文档 | 新增 `RUN-CARD.md`、`TROUBLESHOOT.md`；`SKILL.md` 压到一页；`run-workflow` 改为 submit 主循环；outputs/interaction/inspect/view/advanced-dynamic/routing 同步 |
+| 测试 | 新增 `tests/test_l2_cli.py`（20 项） |
+
+刻意取舍（与提案一致）：单文件 `submit.json`；不提供 `--force` 绕过 stale；review 仍必须由用户给结论
+（`submit --approve` 只是搬运）；items 正常投喂走模板/`--item-file`，`aiwf items` 仅保留为排查/精细编辑。
+
+L2 未做（属 L3）：`aiwf new` 脚手架、`use` 简写、弱模型基准、把 `current` 彻底并入 `status`。
